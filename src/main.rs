@@ -3,6 +3,7 @@
 //! REST API server for interacting with the Option Chain OrderBook library.
 
 use option_chain_orderbook_backend::api::create_router;
+use option_chain_orderbook_backend::config::Config;
 use option_chain_orderbook_backend::db::DatabasePool;
 use option_chain_orderbook_backend::state::AppState;
 use std::sync::Arc;
@@ -115,8 +116,24 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Load configuration
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
+    let config = match Config::load(&config_path) {
+        Ok(c) => {
+            info!("Loaded configuration from {}", config_path);
+            Some(c)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to load config from {}: {}. Using defaults.",
+                config_path, e
+            );
+            None
+        }
+    };
+
     // Try to connect to database if DATABASE_URL is set
-    let state = if let Ok(database_url) = std::env::var("DATABASE_URL") {
+    let db = if let Ok(database_url) = std::env::var("DATABASE_URL") {
         info!("Connecting to database...");
         match DatabasePool::new(&database_url).await {
             Ok(db) => {
@@ -125,37 +142,86 @@ async fn main() -> anyhow::Result<()> {
                     warn!("Failed to run migrations: {}", e);
                 }
                 info!("Database connected successfully");
-                Arc::new(AppState::with_database(db))
+                Some(db)
             }
             Err(e) => {
                 warn!(
                     "Failed to connect to database: {}. Running without persistence.",
                     e
                 );
-                Arc::new(AppState::new())
+                None
             }
         }
     } else {
         info!("DATABASE_URL not set, running without database persistence");
-        Arc::new(AppState::new())
+        None
     };
 
-    // Get host and port from environment or use defaults
-    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse()
-        .expect("PORT must be a valid number");
+    // Create application state
+    let state = if let Some(cfg) = config {
+        let host = cfg.server.host.clone();
+        let port = cfg.server.port;
+        let state = Arc::new(AppState::from_config(cfg, db));
 
-    info!(
-        "Starting Option Chain OrderBook Backend on {}:{}",
-        host, port
-    );
-    info!(
-        "Swagger UI available at http://{}:{}/swagger-ui/",
-        host, port
-    );
-    info!("WebSocket available at ws://{}:{}/ws", host, port);
+        // Start price simulation if enabled
+        if let Some(ref simulator) = state.price_simulator {
+            let sim = Arc::clone(simulator);
+            let mm = Arc::clone(&state.market_maker);
+            tokio::spawn(async move {
+                sim.run(Some(mm)).await;
+            });
+            info!("Price simulation started");
+        }
+
+        info!(
+            "Starting Option Chain OrderBook Backend on {}:{}",
+            host, port
+        );
+        info!(
+            "Swagger UI available at http://{}:{}/swagger-ui/",
+            host, port
+        );
+        info!("WebSocket available at ws://{}:{}/ws", host, port);
+
+        state
+    } else {
+        let state = match db {
+            Some(database) => Arc::new(AppState::with_database(database)),
+            None => Arc::new(AppState::new()),
+        };
+
+        // Get host and port from environment or use defaults
+        let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let port: u16 = std::env::var("PORT")
+            .unwrap_or_else(|_| "8080".to_string())
+            .parse()
+            .expect("PORT must be a valid number");
+
+        info!(
+            "Starting Option Chain OrderBook Backend on {}:{}",
+            host, port
+        );
+        info!(
+            "Swagger UI available at http://{}:{}/swagger-ui/",
+            host, port
+        );
+        info!("WebSocket available at ws://{}:{}/ws", host, port);
+
+        state
+    };
+
+    // Get host and port for server binding
+    let (host, port) = if let Some(ref cfg) = state.config {
+        (cfg.server.host.clone(), cfg.server.port)
+    } else {
+        (
+            std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+            std::env::var("PORT")
+                .unwrap_or_else(|_| "8080".to_string())
+                .parse()
+                .expect("PORT must be a valid number"),
+        )
+    };
 
     // Configure CORS
     let cors = CorsLayer::new()

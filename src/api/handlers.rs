@@ -49,6 +49,28 @@ fn parse_option_style(style: &str) -> Result<OptionStyle, ApiError> {
     }
 }
 
+/// Formats ExpirationDate to YYYYMMDD string for API responses.
+fn format_expiration(exp: &ExpirationDate) -> String {
+    match exp.get_date() {
+        Ok(date) => date.format("%Y%m%d").to_string(),
+        Err(_) => exp.to_string(),
+    }
+}
+
+/// Finds an expiration in the underlying book by matching the formatted date string.
+/// This is needed because ExpirationDate comparison uses get_days() which depends on current time.
+fn find_expiration_by_str(
+    underlying_book: &std::sync::Arc<option_chain_orderbook::orderbook::UnderlyingOrderBook>,
+    exp_str: &str,
+) -> Option<ExpirationDate> {
+    for entry in underlying_book.expirations().iter() {
+        if format_expiration(entry.key()) == exp_str {
+            return Some(*entry.key());
+        }
+    }
+    None
+}
+
 /// Parses expiration string to ExpirationDate.
 fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
     // Try parsing as days first
@@ -65,11 +87,11 @@ fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
             exp_str[6..8].parse::<u32>(),
         )
     {
-        use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+        use chrono::{NaiveDate, Utc};
         if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
-            let time = NaiveTime::from_hms_opt(16, 0, 0).unwrap();
-            let datetime = NaiveDateTime::new(date, time);
-            let utc_datetime = Utc.from_utc_datetime(&datetime);
+            let datetime = date.and_hms_opt(16, 0, 0).unwrap();
+            let utc_datetime =
+                chrono::DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc);
             return Ok(ExpirationDate::DateTime(utc_datetime));
         }
     }
@@ -252,7 +274,7 @@ pub async fn list_expirations(
     let expirations: Vec<String> = book
         .expirations()
         .iter()
-        .map(|e| e.key().to_string())
+        .map(|e| format_expiration(e.key()))
         .collect();
 
     Ok(Json(ExpirationsListResponse { expirations }))
@@ -305,19 +327,20 @@ pub async fn get_expiration(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str)): Path<(String, String)>,
 ) -> Result<Json<ExpirationSummary>, ApiError> {
-    let expiration = parse_expiration(&exp_str)?;
-
     let underlying_book = state
         .manager
         .get(&underlying)
         .map_err(|_| ApiError::UnderlyingNotFound(underlying))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
 
     let exp_book = underlying_book
         .get_expiration(&expiration)
         .map_err(|_| ApiError::ExpirationNotFound(exp_str))?;
 
     Ok(Json(ExpirationSummary {
-        expiration: exp_book.expiration().to_string(),
+        expiration: format_expiration(&exp_book.expiration()),
         strike_count: exp_book.strike_count(),
         total_order_count: exp_book.chain().total_order_count(),
     }))
@@ -345,12 +368,13 @@ pub async fn list_strikes(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str)): Path<(String, String)>,
 ) -> Result<Json<StrikesListResponse>, ApiError> {
-    let expiration = parse_expiration(&exp_str)?;
-
     let underlying_book = state
         .manager
         .get(&underlying)
-        .map_err(|_| ApiError::UnderlyingNotFound(underlying))?;
+        .map_err(|_| ApiError::UnderlyingNotFound(underlying.clone()))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
 
     let exp_book = underlying_book
         .get_expiration(&expiration)
@@ -413,12 +437,13 @@ pub async fn get_strike(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str, strike)): Path<(String, String, u64)>,
 ) -> Result<Json<StrikeSummary>, ApiError> {
-    let expiration = parse_expiration(&exp_str)?;
-
     let underlying_book = state
         .manager
         .get(&underlying)
         .map_err(|_| ApiError::UnderlyingNotFound(underlying))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
 
     let exp_book = underlying_book
         .get_expiration(&expiration)
@@ -461,13 +486,15 @@ pub async fn get_option_book(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
 ) -> Result<Json<OrderBookSnapshotResponse>, ApiError> {
-    let expiration = parse_expiration(&exp_str)?;
     let option_style = parse_option_style(&style)?;
 
     let underlying_book = state
         .manager
         .get(&underlying)
         .map_err(|_| ApiError::UnderlyingNotFound(underlying))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
 
     let exp_book = underlying_book
         .get_expiration(&expiration)
@@ -561,13 +588,15 @@ pub async fn cancel_order(
         String,
     )>,
 ) -> Result<Json<CancelOrderResponse>, ApiError> {
-    let expiration = parse_expiration(&exp_str)?;
     let option_style = parse_option_style(&style)?;
 
     let underlying_book = state
         .manager
         .get(&underlying)
         .map_err(|_| ApiError::UnderlyingNotFound(underlying))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
 
     let exp_book = underlying_book
         .get_expiration(&expiration)
@@ -618,13 +647,15 @@ pub async fn get_option_quote(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
 ) -> Result<Json<QuoteResponse>, ApiError> {
-    let expiration = parse_expiration(&exp_str)?;
     let option_style = parse_option_style(&style)?;
 
     let underlying_book = state
         .manager
         .get(&underlying)
         .map_err(|_| ApiError::UnderlyingNotFound(underlying))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
 
     let exp_book = underlying_book
         .get_expiration(&expiration)

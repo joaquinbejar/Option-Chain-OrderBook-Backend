@@ -1,0 +1,54 @@
+# Option Chain OrderBook Backend Configuration
+# This file configures the available assets, expirations, and strikes
+
+[server]
+host = "0.0.0.0"
+port = 8080
+
+# Price simulation settings
+[simulation]
+# Enable price simulation (generates random price movements)
+enabled = true
+# Update interval in milliseconds
+interval_ms = 1000
+# Walk type: "geometric_brownian", "mean_reverting", "jump_diffusion"
+walk_type = "geometric_brownian"
+
+# Asset configurations
+# Each asset has a symbol, initial price, volatility, and option chain settings
+
+[[assets]]
+symbol = "BTC"
+name = "Bitcoin"
+# Initial price in dollars
+initial_price = 87946.0
+# Annualized volatility (0.0 to 1.0)
+volatility = 0.65
+# Drift (expected annual return, can be negative)
+drift = 0.05
+# Available expiration dates (YYYYMMDD format)
+expirations = ["20251225", "20251231", "20260102", "20260115", "20260131"]
+# Number of strikes per expiration
+num_strikes = 50
+# Strike spacing in dollars
+strike_spacing = 1000.0
+
+[[assets]]
+symbol = "ETH"
+name = "Ethereum"
+initial_price = 2959.0
+volatility = 0.70
+drift = 0.08
+expirations = ["20251225", "20251231", "20260102", "20260115"]
+num_strikes = 50
+strike_spacing = 50.0
+
+[[assets]]
+symbol = "GOLD"
+name = "Gold"
+initial_price = 4463.0
+volatility = 0.15
+drift = 0.02
+expirations = ["20251231", "20260131", "20260228", "20260331"]
+num_strikes = 50
+strike_spacing = 25.0
