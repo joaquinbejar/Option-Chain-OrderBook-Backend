@@ -7,19 +7,18 @@ RUN apk add --no-cache \
     pkgconfig \
     openssl-dev \
     openssl-libs-static \
+    curl \
     git
 
 # Set working directory
 WORKDIR /app
 
-# Copy the Option-Chain-OrderBook library first (dependency)
-COPY Option-Chain-OrderBook /app/Option-Chain-OrderBook
-
-# Copy the backend project
-COPY Option-Chain-OrderBook-Backend /app/Option-Chain-OrderBook-Backend
+# Copy the backend project files
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY migrations ./migrations
 
 # Build the application in release mode
-WORKDIR /app/Option-Chain-OrderBook-Backend
 RUN cargo build --release
 
 # Stage 2: Create minimal runtime image
@@ -37,7 +36,7 @@ RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 WORKDIR /app
 
 # Copy the compiled binary from builder stage
-COPY --from=builder /app/Option-Chain-OrderBook-Backend/target/release/option-chain-orderbook-backend /app/option-chain-orderbook-backend
+COPY --from=builder /app/target/release/option-chain-orderbook-backend /app/option-chain-orderbook-backend
 
 # Change ownership to non-root user
 RUN chown -R appuser:appgroup /app

@@ -22,53 +22,53 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/controls/parameters", post(controls::update_parameters))
         .route("/api/v1/controls/instruments", get(controls::list_instruments))
         .route(
-            "/api/v1/controls/instrument/:symbol/toggle",
+            "/api/v1/controls/instrument/{symbol}/toggle",
             post(controls::toggle_instrument),
         )
         // Prices
         .route("/api/v1/prices", get(controls::get_all_prices).post(controls::insert_price))
-        .route("/api/v1/prices/:symbol", get(controls::get_latest_price))
+        .route("/api/v1/prices/{symbol}", get(controls::get_latest_price))
         // Underlyings
         .route("/api/v1/underlyings", get(handlers::list_underlyings))
         .route(
-            "/api/v1/underlyings/:underlying",
+            "/api/v1/underlyings/{underlying}",
             post(handlers::create_underlying)
                 .get(handlers::get_underlying)
                 .delete(handlers::delete_underlying),
         )
         // Expirations
         .route(
-            "/api/v1/underlyings/:underlying/expirations",
+            "/api/v1/underlyings/{underlying}/expirations",
             get(handlers::list_expirations),
         )
         .route(
-            "/api/v1/underlyings/:underlying/expirations/:expiration",
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}",
             post(handlers::create_expiration).get(handlers::get_expiration),
         )
         // Strikes
         .route(
-            "/api/v1/underlyings/:underlying/expirations/:expiration/strikes",
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes",
             get(handlers::list_strikes),
         )
         .route(
-            "/api/v1/underlyings/:underlying/expirations/:expiration/strikes/:strike",
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}",
             post(handlers::create_strike).get(handlers::get_strike),
         )
         // Options
         .route(
-            "/api/v1/underlyings/:underlying/expirations/:expiration/strikes/:strike/options/:style",
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}",
             get(handlers::get_option_book),
         )
         .route(
-            "/api/v1/underlyings/:underlying/expirations/:expiration/strikes/:strike/options/:style/orders",
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/orders",
             post(handlers::add_order),
         )
         .route(
-            "/api/v1/underlyings/:underlying/expirations/:expiration/strikes/:strike/options/:style/orders/:order_id",
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/orders/{order_id}",
             delete(handlers::cancel_order),
         )
         .route(
-            "/api/v1/underlyings/:underlying/expirations/:expiration/strikes/:strike/options/:style/quote",
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/quote",
             get(handlers::get_option_quote),
         )
         .with_state(state)
