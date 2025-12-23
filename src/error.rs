@@ -1,0 +1,69 @@
+//! Error types for the REST API.
+
+use axum::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::Serialize;
+
+/// API error response body.
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    /// Error message.
+    pub error: String,
+    /// Error code.
+    pub code: String,
+}
+
+/// API error types.
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    /// Underlying not found.
+    #[error("Underlying not found: {0}")]
+    UnderlyingNotFound(String),
+
+    /// Expiration not found.
+    #[error("Expiration not found: {0}")]
+    ExpirationNotFound(String),
+
+    /// Strike not found.
+    #[error("Strike not found: {0}")]
+    StrikeNotFound(u64),
+
+    /// Invalid request.
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+
+    /// Internal server error.
+    #[error("Internal server error: {0}")]
+    Internal(String),
+
+    /// OrderBook error.
+    #[error("OrderBook error: {0}")]
+    OrderBook(String),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code) = match &self {
+            ApiError::UnderlyingNotFound(_) => (StatusCode::NOT_FOUND, "UNDERLYING_NOT_FOUND"),
+            ApiError::ExpirationNotFound(_) => (StatusCode::NOT_FOUND, "EXPIRATION_NOT_FOUND"),
+            ApiError::StrikeNotFound(_) => (StatusCode::NOT_FOUND, "STRIKE_NOT_FOUND"),
+            ApiError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "INVALID_REQUEST"),
+            ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+            ApiError::OrderBook(_) => (StatusCode::BAD_REQUEST, "ORDERBOOK_ERROR"),
+        };
+
+        let body = Json(ErrorResponse {
+            error: self.to_string(),
+            code: code.to_string(),
+        });
+
+        (status, body).into_response()
+    }
+}
+
+impl From<option_chain_orderbook::Error> for ApiError {
+    fn from(err: option_chain_orderbook::Error) -> Self {
+        ApiError::OrderBook(err.to_string())
+    }
+}

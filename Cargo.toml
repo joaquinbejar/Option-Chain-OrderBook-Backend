@@ -1,0 +1,52 @@
+[package]
+name = "option-chain-orderbook-backend"
+version = "0.1.0"
+edition = "2024"
+authors = ["Joaquin Bejar <jb@taunais.com>"]
+description = "REST API backend for Option Chain OrderBook"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/joaquinbejar/Option-Chain-OrderBook-Backend.git"
+
+[dependencies]
+# Web framework
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Option Chain OrderBook library
+option-chain-orderbook = { path = "../Option-Chain-OrderBook" }
+optionstratlib = "0.13"
+orderbook-rs = "0.4"
+
+# Async runtime
+tokio = { version = "1.48", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# OpenAPI documentation
+utoipa = { version = "5.4", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "option-chain-orderbook-backend"
+path = "src/main.rs"
+
+[lib]
+name = "option_chain_orderbook_backend"
+path = "src/lib.rs"
