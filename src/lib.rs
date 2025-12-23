@@ -149,6 +149,8 @@
 //! - **tracing** (0.1): Structured logging
 
 pub mod api;
+pub mod db;
 pub mod error;
+pub mod market_maker;
 pub mod models;
 pub mod state;

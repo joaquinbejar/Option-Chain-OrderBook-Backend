@@ -1,6 +1,6 @@
 //! Route configuration.
 
-use crate::api::handlers;
+use crate::api::{controls, handlers, websocket};
 use crate::state::AppState;
 use axum::Router;
 use axum::routing::{delete, get, post};
@@ -11,8 +11,23 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         // Health check
         .route("/health", get(handlers::health_check))
+        // WebSocket
+        .route("/ws", get(websocket::ws_handler))
         // Statistics
         .route("/api/v1/stats", get(handlers::get_global_stats))
+        // Controls
+        .route("/api/v1/controls", get(controls::get_controls))
+        .route("/api/v1/controls/kill-switch", post(controls::kill_switch))
+        .route("/api/v1/controls/enable", post(controls::enable_quoting))
+        .route("/api/v1/controls/parameters", post(controls::update_parameters))
+        .route("/api/v1/controls/instruments", get(controls::list_instruments))
+        .route(
+            "/api/v1/controls/instrument/:symbol/toggle",
+            post(controls::toggle_instrument),
+        )
+        // Prices
+        .route("/api/v1/prices", get(controls::get_all_prices).post(controls::insert_price))
+        .route("/api/v1/prices/:symbol", get(controls::get_latest_price))
         // Underlyings
         .route("/api/v1/underlyings", get(handlers::list_underlyings))
         .route(

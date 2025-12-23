@@ -40,6 +40,14 @@ pub enum ApiError {
     /// OrderBook error.
     #[error("OrderBook error: {0}")]
     OrderBook(String),
+
+    /// Database error.
+    #[error("Database error: {0}")]
+    Database(String),
+
+    /// Resource not found.
+    #[error("Not found: {0}")]
+    NotFound(String),
 }
 
 impl IntoResponse for ApiError {
@@ -51,6 +59,8 @@ impl IntoResponse for ApiError {
             ApiError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "INVALID_REQUEST"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
             ApiError::OrderBook(_) => (StatusCode::BAD_REQUEST, "ORDERBOOK_ERROR"),
+            ApiError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
+            ApiError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
         };
 
         let body = Json(ErrorResponse {

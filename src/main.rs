@@ -3,16 +3,22 @@
 //! REST API server for interacting with the Option Chain OrderBook library.
 
 use option_chain_orderbook_backend::api::create_router;
+use option_chain_orderbook_backend::db::DatabasePool;
 use option_chain_orderbook_backend::state::AppState;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+use option_chain_orderbook_backend::api::controls::{
+    InsertPriceResponse, InstrumentStatus, InstrumentToggleResponse, InstrumentsListResponse,
+    KillSwitchResponse, LatestPriceResponse, SystemControlResponse, UpdateParametersResponse,
+};
+use option_chain_orderbook_backend::db::{InsertPriceRequest, UpdateParametersRequest};
 use option_chain_orderbook_backend::models::{
     AddOrderRequest, AddOrderResponse, CancelOrderResponse, ExpirationSummary,
     ExpirationsListResponse, GlobalStatsResponse, HealthResponse, OrderBookSnapshotResponse,
@@ -39,6 +45,16 @@ use option_chain_orderbook_backend::models::{
         option_chain_orderbook_backend::api::handlers::add_order,
         option_chain_orderbook_backend::api::handlers::cancel_order,
         option_chain_orderbook_backend::api::handlers::get_option_quote,
+        option_chain_orderbook_backend::api::controls::get_controls,
+        option_chain_orderbook_backend::api::controls::kill_switch,
+        option_chain_orderbook_backend::api::controls::enable_quoting,
+        option_chain_orderbook_backend::api::controls::update_parameters,
+        option_chain_orderbook_backend::api::controls::toggle_instrument,
+        option_chain_orderbook_backend::api::controls::list_instruments,
+        option_chain_orderbook_backend::api::controls::insert_price,
+        option_chain_orderbook_backend::api::controls::get_latest_price,
+        option_chain_orderbook_backend::api::controls::get_all_prices,
+        option_chain_orderbook_backend::api::websocket::ws_handler,
     ),
     components(
         schemas(
@@ -55,11 +71,24 @@ use option_chain_orderbook_backend::models::{
             AddOrderRequest,
             AddOrderResponse,
             CancelOrderResponse,
+            SystemControlResponse,
+            KillSwitchResponse,
+            UpdateParametersResponse,
+            UpdateParametersRequest,
+            InstrumentToggleResponse,
+            InstrumentsListResponse,
+            InstrumentStatus,
+            InsertPriceRequest,
+            InsertPriceResponse,
+            LatestPriceResponse,
         )
     ),
     tags(
         (name = "Health", description = "Health check endpoints"),
         (name = "Statistics", description = "Global statistics"),
+        (name = "Controls", description = "Market maker control endpoints"),
+        (name = "Prices", description = "Underlying price management"),
+        (name = "WebSocket", description = "Real-time WebSocket connection"),
         (name = "Underlyings", description = "Underlying asset management"),
         (name = "Expirations", description = "Expiration date management"),
         (name = "Strikes", description = "Strike price management"),
@@ -68,7 +97,7 @@ use option_chain_orderbook_backend::models::{
     info(
         title = "Option Chain OrderBook API",
         version = "0.1.0",
-        description = "REST API for managing option chain order books",
+        description = "REST API for managing option chain order books with market maker support",
         license(name = "MIT"),
         contact(name = "Joaquin Bejar", email = "jb@taunais.com")
     )
@@ -86,8 +115,30 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Create application state
-    let state = Arc::new(AppState::new());
+    // Try to connect to database if DATABASE_URL is set
+    let state = if let Ok(database_url) = std::env::var("DATABASE_URL") {
+        info!("Connecting to database...");
+        match DatabasePool::new(&database_url).await {
+            Ok(db) => {
+                // Run migrations
+                if let Err(e) = db.run_migrations().await {
+                    warn!("Failed to run migrations: {}", e);
+                }
+                info!("Database connected successfully");
+                Arc::new(AppState::with_database(db))
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to connect to database: {}. Running without persistence.",
+                    e
+                );
+                Arc::new(AppState::new())
+            }
+        }
+    } else {
+        info!("DATABASE_URL not set, running without database persistence");
+        Arc::new(AppState::new())
+    };
 
     // Get host and port from environment or use defaults
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
@@ -104,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
         "Swagger UI available at http://{}:{}/swagger-ui/",
         host, port
     );
+    info!("WebSocket available at ws://{}:{}/ws", host, port);
 
     // Configure CORS
     let cors = CorsLayer::new()
