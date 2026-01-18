@@ -64,6 +64,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             post(handlers::add_order),
         )
         .route(
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/orders/market",
+            post(handlers::submit_market_order),
+        )
+        .route(
             "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/orders/{order_id}",
             delete(handlers::cancel_order),
         )

@@ -147,3 +147,38 @@ pub struct HealthResponse {
     /// Service version.
     pub version: String,
 }
+
+/// Request to submit a market order.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct MarketOrderRequest {
+    /// Order side: "buy" or "sell".
+    pub side: String,
+    /// Order quantity in smallest units.
+    pub quantity: u64,
+}
+
+/// Information about a single fill in a market order execution.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FillInfo {
+    /// Execution price in smallest units.
+    pub price: u64,
+    /// Executed quantity in smallest units.
+    pub quantity: u64,
+}
+
+/// Response after submitting a market order.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MarketOrderResponse {
+    /// The generated order ID.
+    pub order_id: String,
+    /// Order status: "filled", "partial", or "rejected".
+    pub status: String,
+    /// Total quantity that was filled.
+    pub filled_quantity: u64,
+    /// Remaining quantity that was not filled.
+    pub remaining_quantity: u64,
+    /// Average execution price (None if no fills).
+    pub average_price: Option<f64>,
+    /// List of individual fills.
+    pub fills: Vec<FillInfo>,
+}
