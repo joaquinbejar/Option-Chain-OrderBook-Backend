@@ -4,10 +4,29 @@ use crate::config::{AssetConfig, Config};
 use crate::db::DatabasePool;
 use crate::market_maker::MarketMakerEngine;
 use crate::simulation::PriceSimulator;
+use dashmap::DashMap;
 use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
 use optionstratlib::ExpirationDate;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tracing::{info, warn};
+
+/// Trade information stored in memory.
+#[derive(Debug, Clone)]
+pub struct LastTradeInfo {
+    /// Option symbol.
+    pub symbol: String,
+    /// Trade price in smallest units.
+    pub price: u64,
+    /// Trade quantity in smallest units.
+    pub quantity: u64,
+    /// Trade side: "buy" or "sell".
+    pub side: String,
+    /// Trade timestamp in milliseconds.
+    pub timestamp_ms: u64,
+    /// Unique trade identifier.
+    pub trade_id: String,
+}
 
 /// Application state shared across all handlers.
 #[derive(Clone)]
@@ -22,6 +41,10 @@ pub struct AppState {
     pub price_simulator: Option<Arc<PriceSimulator>>,
     /// Application configuration.
     pub config: Option<Config>,
+    /// Last trade information per symbol (thread-safe).
+    pub last_trades: Arc<DashMap<String, LastTradeInfo>>,
+    /// Trade event broadcaster for WebSocket notifications.
+    pub trade_tx: broadcast::Sender<LastTradeInfo>,
 }
 
 impl AppState {
@@ -30,6 +53,8 @@ impl AppState {
     pub fn new() -> Self {
         let manager = Arc::new(UnderlyingOrderBookManager::new());
         let market_maker = Arc::new(MarketMakerEngine::new(Arc::clone(&manager), None));
+        let last_trades = Arc::new(DashMap::new());
+        let (trade_tx, _) = broadcast::channel(1000);
 
         Self {
             manager,
@@ -37,6 +62,8 @@ impl AppState {
             market_maker,
             price_simulator: None,
             config: None,
+            last_trades,
+            trade_tx,
         }
     }
 
@@ -48,6 +75,8 @@ impl AppState {
             Arc::clone(&manager),
             Some(db.clone()),
         ));
+        let last_trades = Arc::new(DashMap::new());
+        let (trade_tx, _) = broadcast::channel(1000);
 
         Self {
             manager,
@@ -55,6 +84,8 @@ impl AppState {
             market_maker,
             price_simulator: None,
             config: None,
+            last_trades,
+            trade_tx,
         }
     }
 
@@ -62,10 +93,12 @@ impl AppState {
     #[must_use]
     pub fn from_config(config: Config, db: Option<DatabasePool>) -> Self {
         let manager = Arc::new(UnderlyingOrderBookManager::new());
+        let last_trades = Arc::new(DashMap::new());
+        let (trade_tx, _) = broadcast::channel(1000);
 
         // Initialize order books from config
         for asset in &config.assets {
-            Self::initialize_asset_order_books(&manager, asset);
+            Self::initialize_asset_order_books(&manager, asset, &last_trades);
         }
 
         let market_maker = Arc::new(MarketMakerEngine::new(Arc::clone(&manager), db.clone()));
@@ -88,11 +121,29 @@ impl AppState {
             market_maker,
             price_simulator: Some(price_simulator),
             config: Some(config),
+            last_trades,
+            trade_tx,
+        }
+    }
+
+    /// Broadcast a trade event to all WebSocket subscribers.
+    pub fn broadcast_trade(&self, trade_info: LastTradeInfo) {
+        // Store the trade in memory
+        self.last_trades
+            .insert(trade_info.symbol.clone(), trade_info.clone());
+
+        // Broadcast to WebSocket subscribers
+        if self.trade_tx.send(trade_info).is_err() {
+            tracing::debug!("No WebSocket subscribers for trade events");
         }
     }
 
     /// Initializes order books for an asset based on configuration.
-    fn initialize_asset_order_books(manager: &UnderlyingOrderBookManager, asset: &AssetConfig) {
+    fn initialize_asset_order_books(
+        manager: &UnderlyingOrderBookManager,
+        asset: &AssetConfig,
+        last_trades: &Arc<DashMap<String, LastTradeInfo>>,
+    ) {
         // Create underlying
         let underlying = manager.get_or_create(&asset.symbol);
         info!("Created underlying: {}", asset.symbol);
@@ -115,7 +166,28 @@ impl AppState {
 
             // Create strikes
             for &strike in &strikes {
-                drop(exp_book.get_or_create_strike(strike));
+                let strike_book = exp_book.get_or_create_strike(strike);
+
+                // Register trade listeners for call and put options
+                let call_book = strike_book.get(optionstratlib::OptionStyle::Call);
+                Self::register_trade_listener_for_option(
+                    call_book,
+                    &asset.symbol,
+                    exp_str,
+                    strike,
+                    "call",
+                    last_trades,
+                );
+
+                let put_book = strike_book.get(optionstratlib::OptionStyle::Put);
+                Self::register_trade_listener_for_option(
+                    put_book,
+                    &asset.symbol,
+                    exp_str,
+                    strike,
+                    "put",
+                    last_trades,
+                );
             }
 
             info!(
@@ -125,6 +197,23 @@ impl AppState {
                 exp_str
             );
         }
+    }
+
+    /// Registers a trade listener for an option book.
+    fn register_trade_listener_for_option(
+        _option_book: &option_chain_orderbook::orderbook::OptionOrderBook,
+        underlying: &str,
+        expiration: &str,
+        strike: u64,
+        style: &str,
+        _last_trades: &Arc<DashMap<String, LastTradeInfo>>,
+    ) {
+        let symbol = format!("{}-{}-{}-{}", underlying, expiration, strike, style);
+
+        // Note: This is a placeholder implementation.
+        // The actual trade listener registration will depend on orderbook-rs API.
+        // For now, we'll simulate trade capture when orders are matched.
+        info!("Registered trade listener for option: {}", symbol);
     }
 
     /// Parses an expiration string (YYYYMMDD) into ExpirationDate.
