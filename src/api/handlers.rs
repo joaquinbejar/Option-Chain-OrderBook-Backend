@@ -75,8 +75,8 @@ fn find_expiration_by_str(
 fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
     // Try parsing as days first
     if let Ok(days) = exp_str.parse::<i32>() {
-        use optionstratlib::pos;
-        return Ok(ExpirationDate::Days(pos!(days as f64)));
+        use optionstratlib::prelude::pos_or_panic;
+        return Ok(ExpirationDate::Days(pos_or_panic!(days as f64)));
     }
 
     // Try parsing as YYYYMMDD format
@@ -90,8 +90,7 @@ fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
         use chrono::{NaiveDate, Utc};
         if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
             let datetime = date.and_hms_opt(16, 0, 0).unwrap();
-            let utc_datetime =
-                chrono::DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc);
+            let utc_datetime = chrono::DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc);
             return Ok(ExpirationDate::DateTime(utc_datetime));
         }
     }
@@ -340,7 +339,7 @@ pub async fn get_expiration(
         .map_err(|_| ApiError::ExpirationNotFound(exp_str))?;
 
     Ok(Json(ExpirationSummary {
-        expiration: format_expiration(&exp_book.expiration()),
+        expiration: format_expiration(exp_book.expiration()),
         strike_count: exp_book.strike_count(),
         total_order_count: exp_book.chain().total_order_count(),
     }))

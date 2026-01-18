@@ -243,12 +243,12 @@ impl Default for OptionPricer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use optionstratlib::pos;
+    use optionstratlib::prelude::Positive;
 
     #[test]
     fn test_call_price() {
         let pricer = OptionPricer::default();
-        let exp = ExpirationDate::Days(pos!(30.0));
+        let exp = ExpirationDate::Days(Positive::THIRTY);
         let price = pricer.theoretical_value(100.0, 100.0, &exp, OptionStyle::Call, Some(0.20));
         assert!(price > 0.0);
         assert!(price < 10.0); // ATM 30-day call should be reasonable
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn test_put_price() {
         let pricer = OptionPricer::default();
-        let exp = ExpirationDate::Days(pos!(30.0));
+        let exp = ExpirationDate::Days(Positive::THIRTY);
         let price = pricer.theoretical_value(100.0, 100.0, &exp, OptionStyle::Put, Some(0.20));
         assert!(price > 0.0);
     }
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn test_delta() {
         let pricer = OptionPricer::default();
-        let exp = ExpirationDate::Days(pos!(30.0));
+        let exp = ExpirationDate::Days(Positive::THIRTY);
 
         let call_delta = pricer.delta(100.0, 100.0, &exp, OptionStyle::Call, Some(0.20));
         assert!(call_delta > 0.4 && call_delta < 0.6); // ATM call delta ~0.5

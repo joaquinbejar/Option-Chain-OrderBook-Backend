@@ -153,12 +153,12 @@ impl Default for Quoter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use optionstratlib::pos;
+    use optionstratlib::prelude::Positive;
 
     #[test]
     fn test_generate_quote() {
         let quoter = Quoter::default();
-        let exp = ExpirationDate::Days(pos!(30.0));
+        let exp = ExpirationDate::Days(Positive::THIRTY);
 
         let input = QuoteInput {
             spot_cents: 10000,   // $100 spot
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn test_bullish_skew() {
         let quoter = Quoter::default();
-        let exp = ExpirationDate::Days(pos!(30.0));
+        let exp = ExpirationDate::Days(Positive::THIRTY);
 
         let neutral_input = QuoteInput {
             spot_cents: 10000,

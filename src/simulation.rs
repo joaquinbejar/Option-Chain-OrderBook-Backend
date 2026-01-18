@@ -2,11 +2,12 @@
 
 use crate::config::{AssetConfig, SimulationConfig, WalkTypeConfig};
 use crate::market_maker::MarketMakerEngine;
-use optionstratlib::simulation::steps::{Step, Xstep, Ystep};
-use optionstratlib::simulation::{WalkParams, WalkType, WalkTypeAble};
-use optionstratlib::utils::TimeFrame;
-use optionstratlib::utils::time::convert_time_frame;
-use optionstratlib::{ExpirationDate, Positive, pos};
+use optionstratlib::prelude::ExpirationDate;
+use optionstratlib::prelude::TimeFrame;
+use optionstratlib::prelude::convert_time_frame;
+use optionstratlib::prelude::{Positive, pos_or_panic};
+use optionstratlib::prelude::{Step, Xstep, Ystep};
+use optionstratlib::prelude::{WalkParams, WalkType, WalkTypeAble};
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -57,30 +58,30 @@ fn generate_price_path(
     walk_type_config: &WalkTypeConfig,
     n_steps: usize,
 ) -> Vec<f64> {
-    let initial = pos!(initial_price);
-    let vol = pos!(volatility);
+    let initial = pos_or_panic!(initial_price);
+    let vol = pos_or_panic!(volatility);
     let drift_dec = Decimal::try_from(drift).unwrap_or(dec!(0.0));
-    let days = pos!(30.0);
+    let days = Positive::THIRTY;
 
     let walk_type = match walk_type_config {
         WalkTypeConfig::GeometricBrownian => WalkType::GeometricBrownian {
-            dt: convert_time_frame(pos!(1.0) / days, &TimeFrame::Minute, &TimeFrame::Day),
+            dt: convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day),
             drift: drift_dec,
             volatility: vol,
         },
         WalkTypeConfig::MeanReverting => WalkType::MeanReverting {
-            dt: convert_time_frame(pos!(1.0) / days, &TimeFrame::Minute, &TimeFrame::Day),
+            dt: convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day),
             volatility: vol,
-            speed: pos!(0.5),
+            speed: pos_or_panic!(0.5),
             mean: initial,
         },
         WalkTypeConfig::JumpDiffusion => WalkType::JumpDiffusion {
-            dt: convert_time_frame(pos!(1.0) / days, &TimeFrame::Minute, &TimeFrame::Day),
+            dt: convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day),
             drift: drift_dec,
             volatility: vol,
-            intensity: pos!(0.1),
+            intensity: pos_or_panic!(0.1),
             jump_mean: dec!(0.0),
-            jump_volatility: pos!(0.05),
+            jump_volatility: pos_or_panic!(0.05),
         },
     };
 
@@ -125,7 +126,7 @@ fn generate_price_path(
     };
 
     // Convert Positive values to f64
-    y_steps.into_iter().map(|p| p.to_f64()).collect()
+    y_steps.into_iter().map(|p: Positive| p.to_f64()).collect()
 }
 
 /// State for each asset's random walk simulation (thread-safe).

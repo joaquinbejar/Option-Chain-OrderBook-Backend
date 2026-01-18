@@ -456,11 +456,12 @@ impl MarketMakerEngine {
     /// Parses an expiration string.
     fn parse_expiration(&self, exp_str: &str) -> Result<optionstratlib::ExpirationDate, ()> {
         use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-        use optionstratlib::{ExpirationDate, pos};
+        use optionstratlib::ExpirationDate;
+        use optionstratlib::prelude::pos_or_panic;
 
         // Try parsing as days first
         if let Ok(days) = exp_str.parse::<i32>() {
-            return Ok(ExpirationDate::Days(pos!(days as f64)));
+            return Ok(ExpirationDate::Days(pos_or_panic!(days as f64)));
         }
 
         // Try parsing as YYYYMMDD format
