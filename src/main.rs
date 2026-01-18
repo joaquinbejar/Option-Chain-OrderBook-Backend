@@ -22,8 +22,9 @@ use option_chain_orderbook_backend::api::controls::{
 use option_chain_orderbook_backend::db::{InsertPriceRequest, UpdateParametersRequest};
 use option_chain_orderbook_backend::models::{
     AddOrderRequest, AddOrderResponse, CancelOrderResponse, ExpirationSummary,
-    ExpirationsListResponse, GlobalStatsResponse, HealthResponse, OrderBookSnapshotResponse,
-    QuoteResponse, StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
+    ExpirationsListResponse, GlobalStatsResponse, HealthResponse, LastTradeResponse,
+    OrderBookSnapshotResponse, QuoteResponse, StrikeSummary, StrikesListResponse,
+    UnderlyingSummary, UnderlyingsListResponse,
 };
 
 /// OpenAPI documentation.
@@ -46,6 +47,7 @@ use option_chain_orderbook_backend::models::{
         option_chain_orderbook_backend::api::handlers::add_order,
         option_chain_orderbook_backend::api::handlers::cancel_order,
         option_chain_orderbook_backend::api::handlers::get_option_quote,
+        option_chain_orderbook_backend::api::handlers::get_last_trade,
         option_chain_orderbook_backend::api::controls::get_controls,
         option_chain_orderbook_backend::api::controls::kill_switch,
         option_chain_orderbook_backend::api::controls::enable_quoting,
@@ -72,6 +74,7 @@ use option_chain_orderbook_backend::models::{
             AddOrderRequest,
             AddOrderResponse,
             CancelOrderResponse,
+            LastTradeResponse,
             SystemControlResponse,
             KillSwitchResponse,
             UpdateParametersResponse,

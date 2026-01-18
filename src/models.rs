@@ -147,3 +147,20 @@ pub struct HealthResponse {
     /// Service version.
     pub version: String,
 }
+
+/// Last trade information response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LastTradeResponse {
+    /// Option symbol.
+    pub symbol: String,
+    /// Trade price in smallest units.
+    pub price: u64,
+    /// Trade quantity in smallest units.
+    pub quantity: u64,
+    /// Trade side: "buy" or "sell".
+    pub side: String,
+    /// Trade timestamp in milliseconds.
+    pub timestamp_ms: u64,
+    /// Unique trade identifier.
+    pub trade_id: String,
+}

@@ -20,6 +20,10 @@ provides OpenAPI/Swagger documentation via [utoipa](https://crates.io/crates/uto
 
 - **RESTful API**: Full CRUD operations for the option chain orderbook hierarchy.
 
+- **Last Trade Data**: Retrieve the most recent trade information for any option contract.
+
+- **Real-time WebSocket Events**: Live trade notifications broadcast to connected clients.
+
 - **Hierarchical Access**: Navigate from underlying assets down to individual
   option order books through a clean URL structure.
 
@@ -99,6 +103,7 @@ The API follows the hierarchical structure of the Option Chain OrderBook library
 | POST | `.../strikes/{strike}/options/{style}/orders` | Add order |
 | DELETE | `.../strikes/{strike}/options/{style}/orders/{id}` | Cancel order |
 | GET | `.../strikes/{strike}/options/{style}/quote` | Get quote |
+| GET | `.../strikes/{strike}/options/{style}/last-trade` | Get last trade information |
 
 ### Example Usage
 
@@ -133,8 +138,11 @@ curl -X POST http://localhost:8080/api/v1/underlyings/BTC/expirations/20240329/s
   -H "Content-Type: application/json" \
   -d '{"side": "buy", "price": 100, "quantity": 10}'
 
-# Get the call option quote
+# Get call option quote
 curl http://localhost:8080/api/v1/underlyings/BTC/expirations/20240329/strikes/50000/options/call/quote
+
+# Get last trade information
+curl http://localhost:8080/api/v1/underlyings/BTC/expirations/20240329/strikes/50000/options/call/last-trade
 
 # Get global statistics
 curl http://localhost:8080/api/v1/stats

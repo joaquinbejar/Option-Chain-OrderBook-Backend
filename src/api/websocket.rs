@@ -52,6 +52,22 @@ pub enum WsMessage {
         /// Edge captured in cents.
         edge: i64,
     },
+    /// Trade execution notification.
+    #[serde(rename = "trade")]
+    Trade {
+        /// Option symbol.
+        symbol: String,
+        /// Trade price in smallest units.
+        price: u64,
+        /// Trade quantity in smallest units.
+        quantity: u64,
+        /// Trade side: "buy" or "sell".
+        side: String,
+        /// Trade timestamp in milliseconds.
+        timestamp_ms: u64,
+        /// Unique trade identifier.
+        trade_id: String,
+    },
     /// Configuration change.
     #[serde(rename = "config")]
     Config {
@@ -107,7 +123,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
 
     // Subscribe to market maker events
-    let mut event_rx = state.market_maker.subscribe();
+    let mut market_maker_rx = state.market_maker.subscribe();
+
+    // Subscribe to trade events
+    let mut trade_rx = state.trade_tx.subscribe();
 
     // Send connection confirmation
     let connected_msg = WsMessage::Connected {
@@ -151,7 +170,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         loop {
             tokio::select! {
                 // Handle market maker events
-                event = event_rx.recv() => {
+                event = market_maker_rx.recv() => {
                     match event {
                         Ok(event) => {
                             if let Some(msg) = event_to_ws_message(event)
@@ -161,7 +180,32 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            debug!("WebSocket lagged {} messages", n);
+                            debug!("WebSocket lagged {} market maker messages", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                    }
+                }
+                // Handle trade events
+                trade_info = trade_rx.recv() => {
+                    match trade_info {
+                        Ok(trade_info) => {
+                            let msg = WsMessage::Trade {
+                                symbol: trade_info.symbol.clone(),
+                                price: trade_info.price,
+                                quantity: trade_info.quantity,
+                                side: trade_info.side.clone(),
+                                timestamp_ms: trade_info.timestamp_ms,
+                                trade_id: trade_info.trade_id.clone(),
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg)
+                                && sender.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("WebSocket lagged {} trade messages", n);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             break;

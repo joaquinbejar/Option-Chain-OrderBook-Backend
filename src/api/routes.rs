@@ -71,5 +71,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/quote",
             get(handlers::get_option_quote),
         )
+        .route(
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/last-trade",
+            get(handlers::get_last_trade),
+        )
         .with_state(state)
 }
