@@ -2,13 +2,15 @@
 
 use crate::error::ApiError;
 use crate::models::{
-    AddOrderRequest, AddOrderResponse, CancelOrderResponse, ExpirationSummary,
-    ExpirationsListResponse, FillInfo, GlobalStatsResponse, HealthResponse, MarketOrderRequest,
-    MarketOrderResponse, MarketOrderStatus, OrderBookSnapshotResponse, OrderSide, QuoteResponse,
+    AddOrderRequest, AddOrderResponse, CancelOrderResponse, EnrichedSnapshotResponse,
+    ExpirationSummary, ExpirationsListResponse, FillInfo, GlobalStatsResponse, HealthResponse,
+    MarketOrderRequest, MarketOrderResponse, MarketOrderStatus, OrderBookSnapshotResponse,
+    OrderSide, PriceLevelInfo, QuoteResponse, SnapshotDepth, SnapshotQuery, SnapshotStats,
     StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
+use axum::extract::Query;
 use axum::extract::{Path, State};
 use option_chain_orderbook::orderbook::Quote;
 use optionstratlib::{ExpirationDate, OptionStyle};
@@ -668,6 +670,120 @@ pub async fn get_option_quote(
 }
 
 // ============================================================================
+// Enriched Snapshot
+// ============================================================================
+
+/// Get enriched order book snapshot with configurable depth.
+///
+/// Returns a snapshot of the order book with pre-calculated metrics including
+/// mid price, spread, depth totals, imbalance, and VWAP.
+#[utoipa::path(
+    get,
+    path = "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/snapshot",
+    params(
+        ("underlying" = String, Path, description = "Underlying symbol"),
+        ("expiration" = String, Path, description = "Expiration date"),
+        ("strike" = u64, Path, description = "Strike price"),
+        ("style" = String, Path, description = "Option style: 'call' or 'put'"),
+        ("depth" = Option<String>, Query, description = "Depth: 'top' (default), '10', '20', or 'full'")
+    ),
+    responses(
+        (status = 200, description = "Enriched order book snapshot", body = EnrichedSnapshotResponse),
+        (status = 404, description = "Not found")
+    ),
+    tag = "Options"
+)]
+pub async fn get_option_snapshot(
+    State(state): State<Arc<AppState>>,
+    Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<EnrichedSnapshotResponse>, ApiError> {
+    let option_style = parse_option_style(&style)?;
+
+    // Parse depth parameter
+    let depth = query
+        .depth
+        .as_deref()
+        .unwrap_or("top")
+        .parse::<SnapshotDepth>()
+        .map_err(ApiError::InvalidRequest)?;
+
+    let underlying_book = state
+        .manager
+        .get(&underlying)
+        .map_err(|_| ApiError::UnderlyingNotFound(underlying.clone()))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
+
+    let exp_book = underlying_book
+        .get_expiration(&expiration)
+        .map_err(|_| ApiError::ExpirationNotFound(exp_str))?;
+
+    let strike_book = exp_book
+        .get_strike(strike)
+        .map_err(|_| ApiError::StrikeNotFound(strike))?;
+
+    let option_book = strike_book.get(option_style);
+
+    // Get enriched snapshot from the inner orderbook
+    let enriched = option_book.inner().enriched_snapshot(depth.to_usize());
+
+    // Build symbol string
+    let style_str = match option_style {
+        OptionStyle::Call => "C",
+        OptionStyle::Put => "P",
+    };
+    let symbol = format!(
+        "{}_{}_{}_{}",
+        underlying,
+        format_expiration(&expiration),
+        strike,
+        style_str
+    );
+
+    // Convert price levels
+    let bids: Vec<PriceLevelInfo> = enriched
+        .bids
+        .iter()
+        .map(|level| PriceLevelInfo {
+            price: level.price,
+            quantity: level.visible_quantity,
+            order_count: level.order_count,
+        })
+        .collect();
+
+    let asks: Vec<PriceLevelInfo> = enriched
+        .asks
+        .iter()
+        .map(|level| PriceLevelInfo {
+            price: level.price,
+            quantity: level.visible_quantity,
+            order_count: level.order_count,
+        })
+        .collect();
+
+    let stats = SnapshotStats {
+        mid_price: enriched.mid_price,
+        spread_bps: enriched.spread_bps,
+        bid_depth_total: enriched.bid_depth_total,
+        ask_depth_total: enriched.ask_depth_total,
+        imbalance: enriched.order_book_imbalance,
+        vwap_bid: enriched.vwap_bid,
+        vwap_ask: enriched.vwap_ask,
+    };
+
+    Ok(Json(EnrichedSnapshotResponse {
+        symbol,
+        sequence: enriched.timestamp,
+        timestamp_ms: enriched.timestamp,
+        bids,
+        asks,
+        stats,
+    }))
+}
+
+// ============================================================================
 // Market Order Execution
 // ============================================================================
 
@@ -1047,5 +1163,175 @@ mod tests {
         assert_eq!(response.fills[1].quantity, 30);
         // Average price should be (30*150 + 30*155) / 60 = 152.5
         assert!((response.average_price.unwrap() - 152.5).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // Snapshot Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_snapshot_depth_parsing() {
+        use std::str::FromStr;
+
+        assert_eq!(SnapshotDepth::from_str("top").unwrap(), SnapshotDepth::Top);
+        assert_eq!(SnapshotDepth::from_str("1").unwrap(), SnapshotDepth::Top);
+        assert_eq!(
+            SnapshotDepth::from_str("10").unwrap(),
+            SnapshotDepth::Levels(10)
+        );
+        assert_eq!(
+            SnapshotDepth::from_str("20").unwrap(),
+            SnapshotDepth::Levels(20)
+        );
+        assert_eq!(
+            SnapshotDepth::from_str("full").unwrap(),
+            SnapshotDepth::Full
+        );
+        assert_eq!(SnapshotDepth::from_str("all").unwrap(), SnapshotDepth::Full);
+        assert!(SnapshotDepth::from_str("invalid").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_depth_to_usize() {
+        assert_eq!(SnapshotDepth::Top.to_usize(), 1);
+        assert_eq!(SnapshotDepth::Levels(10).to_usize(), 10);
+        assert_eq!(SnapshotDepth::Full.to_usize(), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_empty_book() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, strike (no orders)
+        let underlying_book = state.manager.get_or_create("SNAP");
+        let expiration = parse_expiration("20251231").unwrap();
+        let exp_book = underlying_book.get_or_create_expiration(expiration);
+        let _strike_book = exp_book.get_or_create_strike(100);
+
+        // Use the formatted expiration string that matches what find_expiration_by_str expects
+        let exp_str = format_expiration(&expiration);
+
+        let result = get_option_snapshot(
+            State(state.clone()),
+            Path(("SNAP".to_string(), exp_str, 100u64, "call".to_string())),
+            Query(SnapshotQuery { depth: None }),
+        )
+        .await;
+
+        assert!(result.is_ok(), "Error: {:?}", result.err());
+        let response = result.unwrap().0;
+        assert!(response.bids.is_empty());
+        assert!(response.asks.is_empty());
+        assert!(response.stats.mid_price.is_none());
+        assert!(response.stats.spread_bps.is_none());
+        assert_eq!(response.stats.bid_depth_total, 0);
+        assert_eq!(response.stats.ask_depth_total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_with_orders() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, strike
+        let underlying_book = state.manager.get_or_create("SNAP2");
+        let expiration = parse_expiration("20251231").unwrap();
+        let exp_book = underlying_book.get_or_create_expiration(expiration);
+        let strike_book = exp_book.get_or_create_strike(100);
+        let option_book = strike_book.get(OptionStyle::Call);
+
+        // Add bid and ask orders
+        option_book
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 50)
+            .unwrap();
+        option_book
+            .add_limit_order(OrderId::new(), Side::Sell, 110, 30)
+            .unwrap();
+
+        // Use the formatted expiration string that matches what find_expiration_by_str expects
+        let exp_str = format_expiration(&expiration);
+
+        let result = get_option_snapshot(
+            State(state.clone()),
+            Path(("SNAP2".to_string(), exp_str, 100u64, "call".to_string())),
+            Query(SnapshotQuery {
+                depth: Some("full".to_string()),
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+
+        // Check bids
+        assert_eq!(response.bids.len(), 1);
+        assert_eq!(response.bids[0].price, 100);
+        assert_eq!(response.bids[0].quantity, 50);
+        assert_eq!(response.bids[0].order_count, 1);
+
+        // Check asks
+        assert_eq!(response.asks.len(), 1);
+        assert_eq!(response.asks[0].price, 110);
+        assert_eq!(response.asks[0].quantity, 30);
+        assert_eq!(response.asks[0].order_count, 1);
+
+        // Check stats
+        assert!(response.stats.mid_price.is_some());
+        let mid = response.stats.mid_price.unwrap();
+        assert!((mid - 105.0).abs() < 0.01); // (100 + 110) / 2 = 105
+
+        assert!(response.stats.spread_bps.is_some());
+        assert_eq!(response.stats.bid_depth_total, 50);
+        assert_eq!(response.stats.ask_depth_total, 30);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_multiple_levels() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, strike
+        let underlying_book = state.manager.get_or_create("SNAP3");
+        let expiration = parse_expiration("20251231").unwrap();
+        let exp_book = underlying_book.get_or_create_expiration(expiration);
+        let strike_book = exp_book.get_or_create_strike(100);
+        let option_book = strike_book.get(OptionStyle::Call);
+
+        // Add multiple bid levels
+        option_book
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 50)
+            .unwrap();
+        option_book
+            .add_limit_order(OrderId::new(), Side::Buy, 99, 40)
+            .unwrap();
+        option_book
+            .add_limit_order(OrderId::new(), Side::Buy, 98, 30)
+            .unwrap();
+
+        // Add multiple ask levels
+        option_book
+            .add_limit_order(OrderId::new(), Side::Sell, 110, 25)
+            .unwrap();
+        option_book
+            .add_limit_order(OrderId::new(), Side::Sell, 111, 35)
+            .unwrap();
+
+        // Use the formatted expiration string that matches what find_expiration_by_str expects
+        let exp_str = format_expiration(&expiration);
+
+        // Test with depth=2
+        let result = get_option_snapshot(
+            State(state.clone()),
+            Path(("SNAP3".to_string(), exp_str, 100u64, "call".to_string())),
+            Query(SnapshotQuery {
+                depth: Some("2".to_string()),
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+
+        // Should have exactly 2 levels per side (3 bids added, 2 asks added, depth=2)
+        assert_eq!(response.bids.len(), 2);
+        assert_eq!(response.asks.len(), 2);
     }
 }

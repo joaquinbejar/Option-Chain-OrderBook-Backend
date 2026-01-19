@@ -322,6 +322,30 @@ impl OrderbookClient {
         self.handle_response(resp).await
     }
 
+    /// Gets an enriched order book snapshot with configurable depth.
+    ///
+    /// # Arguments
+    /// * `path` - Option path (underlying, expiration, strike, style)
+    /// * `depth` - Depth parameter: "top" (default), "10", "20", or "full"
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_option_snapshot(
+        &self,
+        path: &OptionPath,
+        depth: Option<&str>,
+    ) -> Result<EnrichedSnapshotResponse, Error> {
+        let mut url = format!(
+            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/snapshot",
+            self.base_url, path.underlying, path.expiration, path.strike, path.style
+        );
+        if let Some(d) = depth {
+            url.push_str(&format!("?depth={}", d));
+        }
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
     // ========================================================================
     // Controls
     // ========================================================================

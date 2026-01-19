@@ -223,3 +223,101 @@ pub struct MarketOrderResponse {
     /// List of individual fills.
     pub fills: Vec<FillInfo>,
 }
+
+// ============================================================================
+// Enriched Snapshot Types
+// ============================================================================
+
+/// Depth parameter for snapshot requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapshotDepth {
+    /// Only top of book (best bid/ask).
+    #[default]
+    Top,
+    /// Specific number of levels.
+    Levels(usize),
+    /// Full depth (all levels).
+    Full,
+}
+
+impl std::str::FromStr for SnapshotDepth {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "top" | "1" => Ok(Self::Top),
+            "full" | "all" => Ok(Self::Full),
+            other => other
+                .parse::<usize>()
+                .map(Self::Levels)
+                .map_err(|_| format!("invalid depth: {}", other)),
+        }
+    }
+}
+
+impl SnapshotDepth {
+    /// Converts depth to usize for API calls.
+    #[must_use]
+    pub fn to_usize(self) -> usize {
+        match self {
+            Self::Top => 1,
+            Self::Levels(n) => n,
+            Self::Full => usize::MAX,
+        }
+    }
+}
+
+/// Price level information in a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PriceLevelInfo {
+    /// Price in smallest units.
+    pub price: u64,
+    /// Total visible quantity at this level.
+    pub quantity: u64,
+    /// Number of orders at this level.
+    pub order_count: usize,
+}
+
+/// Statistics for an enriched snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SnapshotStats {
+    /// Mid price (average of best bid and ask).
+    pub mid_price: Option<f64>,
+    /// Spread in basis points.
+    pub spread_bps: Option<f64>,
+    /// Total depth on bid side.
+    pub bid_depth_total: u64,
+    /// Total depth on ask side.
+    pub ask_depth_total: u64,
+    /// Order book imbalance (-1.0 to 1.0).
+    pub imbalance: f64,
+    /// Volume-weighted average price for bids.
+    pub vwap_bid: Option<f64>,
+    /// Volume-weighted average price for asks.
+    pub vwap_ask: Option<f64>,
+}
+
+/// Enriched order book snapshot response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EnrichedSnapshotResponse {
+    /// Symbol identifier.
+    pub symbol: String,
+    /// Sequence number for incremental updates.
+    pub sequence: u64,
+    /// Timestamp in milliseconds since epoch.
+    pub timestamp_ms: u64,
+    /// Bid price levels (sorted by price descending).
+    pub bids: Vec<PriceLevelInfo>,
+    /// Ask price levels (sorted by price ascending).
+    pub asks: Vec<PriceLevelInfo>,
+    /// Pre-calculated statistics.
+    pub stats: SnapshotStats,
+}
+
+/// Query parameters for snapshot endpoint.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SnapshotQuery {
+    /// Depth parameter: "top" (default), "10", "20", or "full".
+    #[serde(default)]
+    pub depth: Option<String>,
+}
