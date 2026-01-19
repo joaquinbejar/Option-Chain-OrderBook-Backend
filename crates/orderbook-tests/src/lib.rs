@@ -26,10 +26,16 @@ pub fn create_test_client() -> Result<OrderbookClient, orderbook_client::Error> 
 /// Generates a unique test symbol to avoid conflicts between tests.
 #[must_use]
 pub fn unique_symbol(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
-    format!("{}_{}", prefix, ts % 1_000_000)
+        .as_millis() as u64;
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    format!("{}_{}_{}", prefix, ts, counter)
 }

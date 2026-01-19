@@ -4,8 +4,8 @@ use crate::error::ApiError;
 use crate::models::{
     AddOrderRequest, AddOrderResponse, CancelOrderResponse, ExpirationSummary,
     ExpirationsListResponse, FillInfo, GlobalStatsResponse, HealthResponse, MarketOrderRequest,
-    MarketOrderResponse, OrderBookSnapshotResponse, QuoteResponse, StrikeSummary,
-    StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
+    MarketOrderResponse, MarketOrderStatus, OrderBookSnapshotResponse, OrderSide, QuoteResponse,
+    StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -26,15 +26,11 @@ fn quote_to_response(quote: &Quote) -> QuoteResponse {
     }
 }
 
-/// Parses side string to Side enum.
-fn parse_side(side: &str) -> Result<Side, ApiError> {
-    match side.to_lowercase().as_str() {
-        "buy" | "bid" => Ok(Side::Buy),
-        "sell" | "ask" => Ok(Side::Sell),
-        _ => Err(ApiError::InvalidRequest(format!(
-            "Invalid side: {}. Use 'buy' or 'sell'",
-            side
-        ))),
+/// Converts OrderSide to orderbook_rs::Side.
+fn order_side_to_side(side: OrderSide) -> Side {
+    match side {
+        OrderSide::Buy => Side::Buy,
+        OrderSide::Sell => Side::Sell,
     }
 }
 
@@ -543,7 +539,7 @@ pub async fn add_order(
 ) -> Result<Json<AddOrderResponse>, ApiError> {
     let expiration = parse_expiration(&exp_str)?;
     let option_style = parse_option_style(&style)?;
-    let side = parse_side(&body.side)?;
+    let side = order_side_to_side(body.side);
 
     let underlying_book = state.manager.get_or_create(&underlying);
     let exp_book = underlying_book.get_or_create_expiration(expiration);
@@ -702,9 +698,15 @@ pub async fn submit_market_order(
     Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
     Json(body): Json<MarketOrderRequest>,
 ) -> Result<Json<MarketOrderResponse>, ApiError> {
+    if body.quantity == 0 {
+        return Err(ApiError::InvalidRequest(
+            "quantity must be greater than zero".to_string(),
+        ));
+    }
+
     let expiration = parse_expiration(&exp_str)?;
     let option_style = parse_option_style(&style)?;
-    let side = parse_side(&body.side)?;
+    let side = order_side_to_side(body.side);
 
     let underlying_book = state.manager.get_or_create(&underlying);
     let exp_book = underlying_book.get_or_create_expiration(expiration);
@@ -733,16 +735,16 @@ pub async fn submit_market_order(
                 .collect();
 
             let status = if match_result.is_complete {
-                "filled"
+                MarketOrderStatus::Filled
             } else if filled_quantity > 0 {
-                "partial"
+                MarketOrderStatus::Partial
             } else {
-                "rejected"
+                MarketOrderStatus::Rejected
             };
 
             Ok(Json(MarketOrderResponse {
                 order_id: order_id.to_string(),
-                status: status.to_string(),
+                status,
                 filled_quantity,
                 remaining_quantity,
                 average_price,
@@ -781,7 +783,7 @@ mod tests {
 
         // Submit market buy order for 50
         let request = MarketOrderRequest {
-            side: "buy".to_string(),
+            side: OrderSide::Buy,
             quantity: 50,
         };
 
@@ -799,7 +801,7 @@ mod tests {
 
         assert!(result.is_ok());
         let response = result.unwrap().0;
-        assert_eq!(response.status, "filled");
+        assert_eq!(response.status, MarketOrderStatus::Filled);
         assert_eq!(response.filled_quantity, 50);
         assert_eq!(response.remaining_quantity, 0);
         assert!(response.average_price.is_some());
@@ -830,7 +832,7 @@ mod tests {
         // orderbook-rs returns InsufficientLiquidity error for market orders
         // that cannot be fully filled
         let request = MarketOrderRequest {
-            side: "buy".to_string(),
+            side: OrderSide::Buy,
             quantity: 50,
         };
 
@@ -851,7 +853,7 @@ mod tests {
         // Based on the test passing for full fill, we check the actual behavior
         if let Ok(Json(response)) = result {
             // If it returns Ok, it should be a partial fill
-            assert_eq!(response.status, "partial");
+            assert_eq!(response.status, MarketOrderStatus::Partial);
             assert_eq!(response.filled_quantity, 30);
             assert_eq!(response.remaining_quantity, 20);
         }
@@ -870,7 +872,7 @@ mod tests {
 
         // Submit market buy order with no liquidity
         let request = MarketOrderRequest {
-            side: "buy".to_string(),
+            side: OrderSide::Buy,
             quantity: 50,
         };
 
@@ -887,36 +889,6 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_market_order_invalid_side() {
-        let state = create_test_state();
-
-        let request = MarketOrderRequest {
-            side: "invalid".to_string(),
-            quantity: 50,
-        };
-
-        let result = submit_market_order(
-            State(state.clone()),
-            Path((
-                "TEST".to_string(),
-                "20251231".to_string(),
-                100u64,
-                "call".to_string(),
-            )),
-            Json(request),
-        )
-        .await;
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ApiError::InvalidRequest(msg) => {
-                assert!(msg.contains("Invalid side"));
-            }
-            _ => panic!("Expected InvalidRequest error"),
-        }
     }
 
     #[tokio::test]
@@ -924,7 +896,7 @@ mod tests {
         let state = create_test_state();
 
         let request = MarketOrderRequest {
-            side: "buy".to_string(),
+            side: OrderSide::Buy,
             quantity: 50,
         };
 
@@ -968,7 +940,7 @@ mod tests {
 
         // Submit market sell order for 50
         let request = MarketOrderRequest {
-            side: "sell".to_string(),
+            side: OrderSide::Sell,
             quantity: 50,
         };
 
@@ -986,7 +958,7 @@ mod tests {
 
         assert!(result.is_ok());
         let response = result.unwrap().0;
-        assert_eq!(response.status, "filled");
+        assert_eq!(response.status, MarketOrderStatus::Filled);
         assert_eq!(response.filled_quantity, 50);
         assert_eq!(response.remaining_quantity, 0);
         assert_eq!(response.average_price.unwrap(), 120.0);
@@ -1021,7 +993,7 @@ mod tests {
 
         // Submit market buy order for 60 (should fill 30@150 + 30@155)
         let request = MarketOrderRequest {
-            side: "buy".to_string(),
+            side: OrderSide::Buy,
             quantity: 60,
         };
 
@@ -1039,7 +1011,7 @@ mod tests {
 
         assert!(result.is_ok());
         let response = result.unwrap().0;
-        assert_eq!(response.status, "filled");
+        assert_eq!(response.status, MarketOrderStatus::Filled);
         assert_eq!(response.filled_quantity, 60);
         assert_eq!(response.remaining_quantity, 0);
         assert_eq!(response.fills.len(), 2);

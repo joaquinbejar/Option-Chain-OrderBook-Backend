@@ -1,6 +1,8 @@
 //! Orderbook CRUD operation tests.
 
-use orderbook_client::{AddOrderRequest, MarketOrderRequest, OptionPath};
+use orderbook_client::{
+    AddOrderRequest, MarketOrderRequest, MarketOrderStatus, OptionPath, OrderSide,
+};
 use orderbook_tests::{create_test_client, unique_symbol};
 
 #[tokio::test]
@@ -106,7 +108,7 @@ async fn test_add_and_cancel_order() {
         .add_order(
             &option,
             &AddOrderRequest {
-                side: "buy".to_string(),
+                side: OrderSide::Buy,
                 price: 1500,
                 quantity: 10,
             },
@@ -157,7 +159,7 @@ async fn test_get_option_quote() {
         .add_order(
             &option,
             &AddOrderRequest {
-                side: "buy".to_string(),
+                side: OrderSide::Buy,
                 price: 1400,
                 quantity: 10,
             },
@@ -169,7 +171,7 @@ async fn test_get_option_quote() {
         .add_order(
             &option,
             &AddOrderRequest {
-                side: "sell".to_string(),
+                side: OrderSide::Sell,
                 price: 1600,
                 quantity: 10,
             },
@@ -214,7 +216,7 @@ async fn test_market_order_execution() {
         .add_order(
             &option,
             &AddOrderRequest {
-                side: "sell".to_string(),
+                side: OrderSide::Sell,
                 price: 1500,
                 quantity: 100,
             },
@@ -227,14 +229,14 @@ async fn test_market_order_execution() {
         .submit_market_order(
             &option,
             &MarketOrderRequest {
-                side: "buy".to_string(),
+                side: OrderSide::Buy,
                 quantity: 50,
             },
         )
         .await
         .expect("Failed to submit market order");
 
-    assert_eq!(result.status, "filled");
+    assert_eq!(result.status, MarketOrderStatus::Filled);
     assert_eq!(result.filled_quantity, 50);
     assert_eq!(result.remaining_quantity, 0);
     assert!(result.average_price.is_some());
@@ -266,7 +268,7 @@ async fn test_market_order_no_liquidity() {
         .submit_market_order(
             &option,
             &MarketOrderRequest {
-                side: "buy".to_string(),
+                side: OrderSide::Buy,
                 quantity: 50,
             },
         )
@@ -301,7 +303,7 @@ async fn test_put_option_operations() {
         .add_order(
             &option,
             &AddOrderRequest {
-                side: "buy".to_string(),
+                side: OrderSide::Buy,
                 price: 500,
                 quantity: 20,
             },
