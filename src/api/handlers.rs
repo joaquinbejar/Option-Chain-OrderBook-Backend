@@ -829,8 +829,6 @@ mod tests {
             .unwrap();
 
         // Submit market buy order for 50 (only 30 available)
-        // orderbook-rs returns InsufficientLiquidity error for market orders
-        // that cannot be fully filled
         let request = MarketOrderRequest {
             side: OrderSide::Buy,
             quantity: 50,
@@ -848,16 +846,42 @@ mod tests {
         )
         .await;
 
-        // The behavior depends on orderbook-rs implementation
-        // It may return an error or a partial fill
-        // Based on the test passing for full fill, we check the actual behavior
-        if let Ok(Json(response)) = result {
-            // If it returns Ok, it should be a partial fill
-            assert_eq!(response.status, MarketOrderStatus::Partial);
-            assert_eq!(response.filled_quantity, 30);
-            assert_eq!(response.remaining_quantity, 20);
+        // orderbook-rs returns a partial fill for insufficient liquidity
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.status, MarketOrderStatus::Partial);
+        assert_eq!(response.filled_quantity, 30);
+        assert_eq!(response.remaining_quantity, 20);
+    }
+
+    #[tokio::test]
+    async fn test_market_order_zero_quantity() {
+        let state = create_test_state();
+
+        let request = MarketOrderRequest {
+            side: OrderSide::Buy,
+            quantity: 0,
+        };
+
+        let result = submit_market_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Json(request),
+        )
+        .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::InvalidRequest(msg) => {
+                assert!(msg.contains("quantity must be greater than zero"));
+            }
+            _ => panic!("Expected InvalidRequest error"),
         }
-        // If it returns Err, that's also acceptable behavior for insufficient liquidity
     }
 
     #[tokio::test]

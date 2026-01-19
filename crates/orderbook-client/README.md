@@ -23,7 +23,7 @@ orderbook-client = "0.1.0"
 ### REST API
 
 ```rust
-use orderbook_client::{OrderbookClient, ClientConfig, OptionPath, AddOrderRequest};
+use orderbook_client::{OrderbookClient, ClientConfig, OptionPath, AddOrderRequest, OrderSide};
 use std::time::Duration;
 
 #[tokio::main]
@@ -49,7 +49,7 @@ async fn main() -> Result<(), orderbook_client::Error> {
     // Add an order
     let option = OptionPath::call("BTC", "20251231", 100000);
     let order = client.add_order(&option, &AddOrderRequest {
-        side: "buy".into(),
+        side: OrderSide::Buy,
         price: 1500,
         quantity: 10,
     }).await?;
