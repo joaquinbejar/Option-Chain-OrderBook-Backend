@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.8"
 
 services:
   # PostgreSQL 18 database
@@ -15,7 +15,11 @@ services:
     volumes:
       - postgres_data_orderbook:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-orderbook} -d ${POSTGRES_DB:-orderbook}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-orderbook} -d ${POSTGRES_DB:-orderbook}",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -41,11 +45,37 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:8080/health",
+        ]
       interval: 30s
       timeout: 3s
       retries: 3
       start_period: 10s
+    networks:
+      - orderbook-network
+
+  # Integration tests runner
+  integration-tests:
+    build:
+      context: ../..
+      dockerfile: Option-Chain-OrderBook-Backend/Docker/Dockerfile
+    container_name: option-chain-orderbook-tests
+    command: cargo test -p orderbook-tests
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://api:8080
+      RUST_LOG: ${RUST_LOG:-info}
+    profiles:
+      - test
     networks:
       - orderbook-network
 

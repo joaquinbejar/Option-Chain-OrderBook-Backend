@@ -16,10 +16,24 @@ build:
 release:
 	cargo build --release
 
-# Run tests
+# Run unit tests (main crate only)
 .PHONY: test
 test:
-	LOGLEVEL=WARN cargo test
+	LOGLEVEL=WARN cargo test --lib
+
+# Run integration tests (requires API running)
+.PHONY: test-integration
+test-integration:
+	cargo test -p orderbook-tests
+
+# Run all tests
+.PHONY: test-all
+test-all: test test-integration
+
+# Run unit tests for all workspace members
+.PHONY: test-workspace
+test-workspace:
+	LOGLEVEL=WARN cargo test --workspace --lib
 
 # Format the code
 .PHONY: fmt
@@ -53,6 +67,11 @@ check: test fmt-check lint
 .PHONY: run
 run:
 	cargo run
+
+# Start API for testing (release mode)
+.PHONY: run-test-server
+run-test-server:
+	cargo run --release
 
 .PHONY: fix
 fix:

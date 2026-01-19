@@ -8,6 +8,13 @@ license = "MIT"
 readme = "README.md"
 repository = "https://github.com/joaquinbejar/Option-Chain-OrderBook-Backend.git"
 
+[workspace]
+members = [
+    ".",
+    "crates/orderbook-client",
+    "crates/orderbook-tests",
+]
+
 [dependencies]
 # Web framework
 axum = { version = "0.8", features = ["ws"] }
