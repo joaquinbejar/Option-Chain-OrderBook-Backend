@@ -3,11 +3,52 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// Order side for trading operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderSide {
+    /// Buy order.
+    Buy,
+    /// Sell order.
+    Sell,
+}
+
+impl std::fmt::Display for OrderSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Buy => write!(f, "buy"),
+            Self::Sell => write!(f, "sell"),
+        }
+    }
+}
+
+/// Market order execution status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketOrderStatus {
+    /// The order was fully filled.
+    Filled,
+    /// The order was partially filled.
+    Partial,
+    /// The order was rejected (no liquidity).
+    Rejected,
+}
+
+impl std::fmt::Display for MarketOrderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Filled => write!(f, "filled"),
+            Self::Partial => write!(f, "partial"),
+            Self::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
 /// Request to add a limit order.
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct AddOrderRequest {
-    /// Order side: "buy" or "sell".
-    pub side: String,
+    /// Order side.
+    pub side: OrderSide,
     /// Limit price in smallest units.
     pub price: u64,
     /// Order quantity in smallest units.
@@ -146,4 +187,39 @@ pub struct HealthResponse {
     pub status: String,
     /// Service version.
     pub version: String,
+}
+
+/// Request to submit a market order.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct MarketOrderRequest {
+    /// Order side.
+    pub side: OrderSide,
+    /// Order quantity in smallest units.
+    pub quantity: u64,
+}
+
+/// Information about a single fill in a market order execution.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FillInfo {
+    /// Execution price in smallest units.
+    pub price: u64,
+    /// Executed quantity in smallest units.
+    pub quantity: u64,
+}
+
+/// Response after submitting a market order.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MarketOrderResponse {
+    /// The generated order ID.
+    pub order_id: String,
+    /// Order execution status.
+    pub status: MarketOrderStatus,
+    /// Total quantity that was filled.
+    pub filled_quantity: u64,
+    /// Remaining quantity that was not filled.
+    pub remaining_quantity: u64,
+    /// Average execution price (None if no fills).
+    pub average_price: Option<f64>,
+    /// List of individual fills.
+    pub fills: Vec<FillInfo>,
 }

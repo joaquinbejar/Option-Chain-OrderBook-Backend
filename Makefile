@@ -16,10 +16,24 @@ build:
 release:
 	cargo build --release
 
-# Run tests
+# Run unit tests (main crate only)
 .PHONY: test
 test:
-	LOGLEVEL=WARN cargo test
+	LOGLEVEL=WARN cargo test --lib
+
+# Run integration tests (requires API running)
+.PHONY: test-integration
+test-integration:
+	cargo test -p orderbook-tests
+
+# Run all tests
+.PHONY: test-all
+test-all: test test-integration
+
+# Run unit tests for all workspace members
+.PHONY: test-workspace
+test-workspace:
+	LOGLEVEL=WARN cargo test --workspace --lib
 
 # Format the code
 .PHONY: fmt
@@ -54,6 +68,11 @@ check: test fmt-check lint
 run:
 	cargo run
 
+# Start API for testing (release mode)
+.PHONY: run-test-server
+run-test-server:
+	cargo run --release
+
 .PHONY: fix
 fix:
 	cargo fix --allow-staged --allow-dirty
@@ -80,14 +99,14 @@ coverage:
 	export LOGLEVEL=WARN
 	cargo install cargo-tarpaulin
 	mkdir -p coverage
-	cargo tarpaulin --verbose --all-features --workspace --timeout 0 --out Xml --output-dir coverage
+	cargo tarpaulin --verbose --all-features --timeout 0 --out Xml --output-dir coverage --packages option-chain-orderbook-backend --packages orderbook-client
 
 .PHONY: coverage-html
 coverage-html:
 	export LOGLEVEL=WARN
 	cargo install cargo-tarpaulin
 	mkdir -p coverage
-	cargo tarpaulin --color Always --tests --all-targets --all-features --workspace --timeout 0 --out Html --output-dir coverage
+	cargo tarpaulin --color Always --tests --all-targets --all-features --timeout 0 --out Html --output-dir coverage --packages option-chain-orderbook-backend --packages orderbook-client
 
 .PHONY: open-coverage
 open-coverage:
