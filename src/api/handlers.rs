@@ -4,11 +4,13 @@ use crate::error::ApiError;
 use crate::models::{
     AddOrderRequest, AddOrderResponse, CancelOrderResponse, ExpirationSummary,
     ExpirationsListResponse, FillInfo, GlobalStatsResponse, HealthResponse, MarketOrderRequest,
-    MarketOrderResponse, MarketOrderStatus, OrderBookSnapshotResponse, OrderSide, QuoteResponse,
-    StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
+    MarketOrderResponse, MarketOrderStatus, OrderBookSnapshotResponse, OrderInfo, OrderListQuery,
+    OrderListResponse, OrderSide, QuoteResponse, StrikeSummary, StrikesListResponse,
+    UnderlyingSummary, UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
+use axum::extract::Query;
 use axum::extract::{Path, State};
 use option_chain_orderbook::orderbook::Quote;
 use optionstratlib::{ExpirationDate, OptionStyle};
@@ -551,6 +553,18 @@ pub async fn add_order(
         .add_limit_order(order_id, side, body.price, body.quantity)
         .map_err(|e| ApiError::OrderBook(e.to_string()))?;
 
+    // Track order in memory
+    state.order_tracker.create_order(
+        &order_id.to_string(),
+        &underlying,
+        &exp_str,
+        strike,
+        &style,
+        body.side,
+        body.price,
+        body.quantity,
+    );
+
     Ok(Json(AddOrderResponse {
         order_id: order_id.to_string(),
         message: "Order added successfully".to_string(),
@@ -753,6 +767,56 @@ pub async fn submit_market_order(
         }
         Err(e) => Err(ApiError::OrderBook(e.to_string())),
     }
+}
+
+// ============================================================================
+// Order Status & Listing
+// ============================================================================
+
+/// Get order status by order ID.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orders/{order_id}",
+    params(
+        ("order_id" = String, Path, description = "Order ID")
+    ),
+    responses(
+        (status = 200, description = "Order details", body = OrderInfo),
+        (status = 404, description = "Order not found")
+    ),
+    tag = "Orders"
+)]
+pub async fn get_order_status(
+    State(state): State<Arc<AppState>>,
+    Path(order_id): Path<String>,
+) -> Result<Json<OrderInfo>, ApiError> {
+    match state.order_tracker.get_order(&order_id) {
+        Some(info) => Ok(Json(info)),
+        None => Err(ApiError::OrderNotFound(order_id)),
+    }
+}
+
+/// List orders with optional filters and pagination.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orders",
+    params(
+        ("underlying" = Option<String>, Query, description = "Filter by underlying symbol"),
+        ("status" = Option<String>, Query, description = "Filter by status (active, partial, filled, canceled)"),
+        ("side" = Option<String>, Query, description = "Filter by side (buy, sell)"),
+        ("limit" = Option<u32>, Query, description = "Maximum results (default: 100)"),
+        ("offset" = Option<u32>, Query, description = "Pagination offset (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "List of orders", body = OrderListResponse)
+    ),
+    tag = "Orders"
+)]
+pub async fn list_orders(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OrderListQuery>,
+) -> Json<OrderListResponse> {
+    Json(state.order_tracker.list_orders(&query))
 }
 
 #[cfg(test)]

@@ -29,6 +29,10 @@ pub enum ApiError {
     #[error("Strike not found: {0}")]
     StrikeNotFound(u64),
 
+    /// Order not found.
+    #[error("Order not found: {0}")]
+    OrderNotFound(String),
+
     /// Invalid request.
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
@@ -56,6 +60,7 @@ impl IntoResponse for ApiError {
             ApiError::UnderlyingNotFound(_) => (StatusCode::NOT_FOUND, "UNDERLYING_NOT_FOUND"),
             ApiError::ExpirationNotFound(_) => (StatusCode::NOT_FOUND, "EXPIRATION_NOT_FOUND"),
             ApiError::StrikeNotFound(_) => (StatusCode::NOT_FOUND, "STRIKE_NOT_FOUND"),
+            ApiError::OrderNotFound(_) => (StatusCode::NOT_FOUND, "ORDER_NOT_FOUND"),
             ApiError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "INVALID_REQUEST"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
             ApiError::OrderBook(_) => (StatusCode::BAD_REQUEST, "ORDERBOOK_ERROR"),

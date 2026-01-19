@@ -3,6 +3,7 @@
 use crate::config::{AssetConfig, Config};
 use crate::db::DatabasePool;
 use crate::market_maker::MarketMakerEngine;
+use crate::order_tracker::{CleanupConfig, OrderTracker};
 use crate::simulation::PriceSimulator;
 use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
 use optionstratlib::ExpirationDate;
@@ -20,6 +21,8 @@ pub struct AppState {
     pub market_maker: Arc<MarketMakerEngine>,
     /// Price simulator.
     pub price_simulator: Option<Arc<PriceSimulator>>,
+    /// In-memory order tracker.
+    pub order_tracker: Arc<OrderTracker>,
     /// Application configuration.
     pub config: Option<Config>,
 }
@@ -36,6 +39,7 @@ impl AppState {
             db: None,
             market_maker,
             price_simulator: None,
+            order_tracker: Arc::new(OrderTracker::new()),
             config: None,
         }
     }
@@ -54,6 +58,7 @@ impl AppState {
             db: Some(db),
             market_maker,
             price_simulator: None,
+            order_tracker: Arc::new(OrderTracker::new()),
             config: None,
         }
     }
@@ -87,6 +92,8 @@ impl AppState {
             db,
             market_maker,
             price_simulator: Some(price_simulator),
+            // Use OrderTracker with cleanup for production
+            order_tracker: Arc::new(OrderTracker::with_cleanup(CleanupConfig::default())),
             config: Some(config),
         }
     }

@@ -223,3 +223,120 @@ pub struct MarketOrderResponse {
     /// List of individual fills.
     pub fills: Vec<FillInfo>,
 }
+
+// ============================================================================
+// Order Lifecycle Tracking
+// ============================================================================
+
+/// Order lifecycle status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderStatus {
+    /// Order is active in the order book.
+    Active,
+    /// Order is partially filled.
+    Partial,
+    /// Order is completely filled.
+    Filled,
+    /// Order was canceled.
+    Canceled,
+}
+
+impl std::fmt::Display for OrderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Partial => write!(f, "partial"),
+            Self::Filled => write!(f, "filled"),
+            Self::Canceled => write!(f, "canceled"),
+        }
+    }
+}
+
+impl std::str::FromStr for OrderStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "active" => Ok(Self::Active),
+            "partial" => Ok(Self::Partial),
+            "filled" => Ok(Self::Filled),
+            "canceled" => Ok(Self::Canceled),
+            _ => Err(format!("Invalid order status: {}", s)),
+        }
+    }
+}
+
+/// Record of a single fill for an order.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrderFillRecord {
+    /// Execution price in smallest units.
+    pub price: u64,
+    /// Executed quantity in smallest units.
+    pub quantity: u64,
+    /// Timestamp of the fill (ISO 8601).
+    pub timestamp: String,
+}
+
+/// Complete order information for status queries.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrderInfo {
+    /// The order ID.
+    pub order_id: String,
+    /// Option symbol (e.g., "BTC-20251231-100000-C").
+    pub symbol: String,
+    /// Order side.
+    pub side: OrderSide,
+    /// Limit price in smallest units.
+    pub price: u64,
+    /// Original order quantity.
+    pub original_quantity: u64,
+    /// Remaining quantity not yet filled.
+    pub remaining_quantity: u64,
+    /// Quantity that has been filled.
+    pub filled_quantity: u64,
+    /// Current order status.
+    pub status: OrderStatus,
+    /// Time in force (e.g., "GTC").
+    pub time_in_force: String,
+    /// Order creation timestamp (ISO 8601).
+    pub created_at: String,
+    /// Last update timestamp (ISO 8601).
+    pub updated_at: String,
+    /// List of fills for this order.
+    pub fills: Vec<OrderFillRecord>,
+}
+
+/// Query parameters for listing orders.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct OrderListQuery {
+    /// Filter by underlying symbol.
+    pub underlying: Option<String>,
+    /// Filter by order status.
+    pub status: Option<String>,
+    /// Filter by side (buy/sell).
+    pub side: Option<String>,
+    /// Maximum number of results (default: 100).
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    /// Offset for pagination (default: 0).
+    #[serde(default)]
+    pub offset: u32,
+}
+
+fn default_limit() -> u32 {
+    100
+}
+
+/// Response for listing orders with pagination.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OrderListResponse {
+    /// List of orders.
+    pub orders: Vec<OrderInfo>,
+    /// Total number of matching orders.
+    pub total: usize,
+    /// Limit used in query.
+    pub limit: u32,
+    /// Offset used in query.
+    pub offset: u32,
+}
