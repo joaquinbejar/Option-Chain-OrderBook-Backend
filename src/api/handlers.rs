@@ -627,6 +627,10 @@ pub async fn cancel_order(
         .cancel_order(order_id)
         .map_err(|e| ApiError::OrderBook(e.to_string()))?;
 
+    if success {
+        state.order_tracker.cancel_order(&order_id_str);
+    }
+
     Ok(Json(CancelOrderResponse {
         success,
         message: if success {
