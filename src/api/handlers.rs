@@ -6,8 +6,10 @@ use crate::models::{
     ExpirationSummary, ExpirationsListResponse, FillInfo, GlobalStatsResponse, HealthResponse,
     LastTradeResponse, MarketOrderRequest, MarketOrderResponse, MarketOrderStatus,
     OrderBookSnapshotResponse, OrderInfo, OrderListQuery, OrderListResponse, OrderSide,
-    OrderStatus, OrderStatusResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth, SnapshotQuery,
-    SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
+    OrderStatus, OrderStatusResponse, PositionInfo, PositionQuery, PositionResponse,
+    PositionSummary, PositionsListResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth,
+    SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary,
+    UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -1053,6 +1055,202 @@ pub async fn list_orders(
     }))
 }
 
+// ============================================================================
+// Position and Inventory Tracking
+// ============================================================================
+
+/// Get a specific position by symbol.
+///
+/// Returns detailed information about the position including P&L calculations.
+#[utoipa::path(
+    get,
+    path = "/api/v1/positions/{symbol}",
+    params(
+        ("symbol" = String, Path, description = "Option symbol (e.g., AAPL-20240329-150-C)")
+    ),
+    responses(
+        (status = 200, description = "Position details", body = PositionResponse),
+        (status = 404, description = "Position not found")
+    ),
+    tag = "Positions"
+)]
+pub async fn get_position(
+    State(state): State<Arc<AppState>>,
+    Path(symbol): Path<String>,
+) -> Result<Json<PositionResponse>, ApiError> {
+    match state.positions.get(&symbol) {
+        Some(position) => {
+            // Get current market price from quote
+            let current_price = get_current_price_for_symbol(&state, &symbol).unwrap_or(0);
+            let unrealized_pnl = position.unrealized_pnl(current_price);
+            let notional_value = position.notional_value(current_price);
+
+            // TODO: Calculate delta from option pricer when available
+            let delta_exposure = 0.0;
+
+            Ok(Json(PositionResponse {
+                symbol: position.symbol.clone(),
+                underlying: position.underlying.clone(),
+                quantity: position.quantity,
+                average_price: position.average_price,
+                current_price,
+                unrealized_pnl,
+                realized_pnl: position.realized_pnl,
+                delta_exposure,
+                notional_value,
+            }))
+        }
+        None => Err(ApiError::NotFound(format!(
+            "Position not found: {}",
+            symbol
+        ))),
+    }
+}
+
+/// List all positions with optional filtering.
+///
+/// Returns all positions with aggregate summary statistics.
+#[utoipa::path(
+    get,
+    path = "/api/v1/positions",
+    params(
+        ("underlying" = Option<String>, Query, description = "Filter by underlying symbol")
+    ),
+    responses(
+        (status = 200, description = "List of positions", body = PositionsListResponse)
+    ),
+    tag = "Positions"
+)]
+pub async fn list_positions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PositionQuery>,
+) -> Result<Json<PositionsListResponse>, ApiError> {
+    let mut total_unrealized_pnl = 0i64;
+    let mut total_realized_pnl = 0i64;
+    let mut net_delta = 0.0f64;
+
+    let positions: Vec<PositionResponse> = state
+        .positions
+        .iter()
+        .filter(|entry| {
+            if let Some(ref underlying) = query.underlying {
+                &entry.value().underlying == underlying
+            } else {
+                true
+            }
+        })
+        .filter(|entry| entry.value().quantity != 0) // Only include open positions
+        .map(|entry| {
+            let position = entry.value();
+            let current_price = get_current_price_for_symbol(&state, &position.symbol).unwrap_or(0);
+            let unrealized_pnl = position.unrealized_pnl(current_price);
+            let notional_value = position.notional_value(current_price);
+
+            // TODO: Calculate delta from option pricer when available
+            let delta_exposure = 0.0;
+
+            total_unrealized_pnl += unrealized_pnl;
+            total_realized_pnl += position.realized_pnl;
+            net_delta += delta_exposure;
+
+            PositionResponse {
+                symbol: position.symbol.clone(),
+                underlying: position.underlying.clone(),
+                quantity: position.quantity,
+                average_price: position.average_price,
+                current_price,
+                unrealized_pnl,
+                realized_pnl: position.realized_pnl,
+                delta_exposure,
+                notional_value,
+            }
+        })
+        .collect();
+
+    let position_count = positions.len();
+
+    Ok(Json(PositionsListResponse {
+        positions,
+        summary: PositionSummary {
+            total_unrealized_pnl,
+            total_realized_pnl,
+            net_delta,
+            position_count,
+        },
+    }))
+}
+
+/// Helper function to get current market price for a symbol.
+fn get_current_price_for_symbol(state: &AppState, symbol: &str) -> Option<u128> {
+    // Parse symbol to get underlying, expiration, strike, style
+    let parts: Vec<&str> = symbol.split('-').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+
+    let underlying = parts[0];
+    let exp_str = parts[1];
+    let strike: u64 = parts[2].parse().ok()?;
+    let style_str = parts[3];
+
+    let style = match style_str.to_uppercase().as_str() {
+        "C" | "CALL" => OptionStyle::Call,
+        "P" | "PUT" => OptionStyle::Put,
+        _ => return None,
+    };
+
+    let expiration = parse_expiration(exp_str).ok()?;
+
+    // Get the order book and quote
+    let underlying_book = state.manager.get(underlying).ok()?;
+    let exp_book = underlying_book.get_expiration(&expiration).ok()?;
+    let strike_book = exp_book.get_strike(strike).ok()?;
+    let option_book = strike_book.get(style);
+    let quote = option_book.best_quote();
+
+    // Use mid price if available, otherwise best bid or ask
+    match (quote.bid_price(), quote.ask_price()) {
+        (Some(bid), Some(ask)) => Some((bid + ask) / 2),
+        (Some(bid), None) => Some(bid),
+        (None, Some(ask)) => Some(ask),
+        (None, None) => None,
+    }
+}
+
+/// Updates position based on a fill.
+///
+/// This function should be called after each fill to update position tracking.
+pub fn update_position_on_fill(
+    state: &AppState,
+    symbol: &str,
+    underlying: &str,
+    side: OrderSide,
+    quantity: u64,
+    price: u128,
+    timestamp_ms: u64,
+) {
+    let fill_quantity = match side {
+        OrderSide::Buy => quantity as i64,
+        OrderSide::Sell => -(quantity as i64),
+    };
+
+    state
+        .positions
+        .entry(symbol.to_string())
+        .and_modify(|pos| {
+            pos.update(fill_quantity, price, timestamp_ms);
+        })
+        .or_insert_with(|| {
+            PositionInfo::new(
+                symbol.to_string(),
+                underlying.to_string(),
+                fill_quantity,
+                price,
+                timestamp_ms,
+            )
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1916,5 +2114,194 @@ mod tests {
             }
             _ => panic!("Expected InvalidRequest error"),
         }
+    }
+
+    // ========================================================================
+    // Position Tracking Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_position_not_found() {
+        let state = create_test_state();
+
+        let result = get_position(
+            State(state.clone()),
+            Path("AAPL-20251231-150-C".to_string()),
+        )
+        .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::NotFound(msg) => {
+                assert!(msg.contains("Position not found"));
+            }
+            _ => panic!("Expected NotFound error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_position_success() {
+        let state = create_test_state();
+
+        // Insert a position
+        let symbol = "AAPL-20251231-150-C".to_string();
+        let position =
+            PositionInfo::new(symbol.clone(), "AAPL".to_string(), 100, 500, 1704067200000);
+        state.positions.insert(symbol.clone(), position);
+
+        let result = get_position(State(state.clone()), Path(symbol)).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.symbol, "AAPL-20251231-150-C");
+        assert_eq!(response.underlying, "AAPL");
+        assert_eq!(response.quantity, 100);
+        assert_eq!(response.average_price, 500);
+    }
+
+    #[tokio::test]
+    async fn test_list_positions_empty() {
+        let state = create_test_state();
+
+        let result = list_positions(
+            State(state.clone()),
+            Query(PositionQuery { underlying: None }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.positions.len(), 0);
+        assert_eq!(response.summary.position_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_positions_with_filter() {
+        let state = create_test_state();
+
+        // Insert positions for different underlyings
+        state.positions.insert(
+            "AAPL-20251231-150-C".to_string(),
+            PositionInfo::new(
+                "AAPL-20251231-150-C".to_string(),
+                "AAPL".to_string(),
+                100,
+                500,
+                1704067200000,
+            ),
+        );
+        state.positions.insert(
+            "GOOG-20251231-100-C".to_string(),
+            PositionInfo::new(
+                "GOOG-20251231-100-C".to_string(),
+                "GOOG".to_string(),
+                50,
+                1000,
+                1704067200000,
+            ),
+        );
+
+        // Filter by AAPL
+        let result = list_positions(
+            State(state.clone()),
+            Query(PositionQuery {
+                underlying: Some("AAPL".to_string()),
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.positions.len(), 1);
+        assert_eq!(response.positions[0].underlying, "AAPL");
+    }
+
+    #[tokio::test]
+    async fn test_position_update_on_buy() {
+        let state = create_test_state();
+
+        // Update position with a buy
+        update_position_on_fill(
+            &state,
+            "AAPL-20251231-150-C",
+            "AAPL",
+            OrderSide::Buy,
+            100,
+            500,
+            1704067200000,
+        );
+
+        let position = state.positions.get("AAPL-20251231-150-C").unwrap();
+        assert_eq!(position.quantity, 100);
+        assert_eq!(position.average_price, 500);
+    }
+
+    #[tokio::test]
+    async fn test_position_update_on_sell() {
+        let state = create_test_state();
+
+        // First buy
+        update_position_on_fill(
+            &state,
+            "AAPL-20251231-150-C",
+            "AAPL",
+            OrderSide::Buy,
+            100,
+            500,
+            1704067200000,
+        );
+
+        // Then sell (close position)
+        update_position_on_fill(
+            &state,
+            "AAPL-20251231-150-C",
+            "AAPL",
+            OrderSide::Sell,
+            50,
+            600,
+            1704067300000,
+        );
+
+        let position = state.positions.get("AAPL-20251231-150-C").unwrap();
+        assert_eq!(position.quantity, 50); // 100 - 50
+        assert_eq!(position.realized_pnl, 5000); // (600 - 500) * 50
+    }
+
+    #[tokio::test]
+    async fn test_position_pnl_calculation() {
+        let position = PositionInfo::new(
+            "AAPL-20251231-150-C".to_string(),
+            "AAPL".to_string(),
+            100,
+            500,
+            1704067200000,
+        );
+
+        // Current price is 600, so unrealized P&L = (600 - 500) * 100 = 10000
+        let unrealized = position.unrealized_pnl(600);
+        assert_eq!(unrealized, 10000);
+
+        // Notional value = 600 * 100 = 60000
+        let notional = position.notional_value(600);
+        assert_eq!(notional, 60000);
+    }
+
+    #[tokio::test]
+    async fn test_position_short_pnl() {
+        let position = PositionInfo::new(
+            "AAPL-20251231-150-C".to_string(),
+            "AAPL".to_string(),
+            -100, // Short position
+            500,
+            1704067200000,
+        );
+
+        // Current price is 400, so unrealized P&L = (400 - 500) * -100 = 10000 (profit)
+        let unrealized = position.unrealized_pnl(400);
+        assert_eq!(unrealized, 10000);
+
+        // Current price is 600, so unrealized P&L = (600 - 500) * -100 = -10000 (loss)
+        let unrealized_loss = position.unrealized_pnl(600);
+        assert_eq!(unrealized_loss, -10000);
     }
 }

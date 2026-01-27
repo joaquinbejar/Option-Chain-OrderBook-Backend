@@ -586,3 +586,162 @@ pub struct OrderListQuery {
 fn default_limit() -> usize {
     100
 }
+
+// ============================================================================
+// Position and Inventory Tracking Types
+// ============================================================================
+
+/// Internal storage for position information.
+#[derive(Debug, Clone)]
+pub struct PositionInfo {
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
+    pub symbol: String,
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Position quantity (positive = long, negative = short).
+    pub quantity: i64,
+    /// Average entry price in smallest units.
+    pub average_price: u128,
+    /// Realized P&L in smallest units.
+    pub realized_pnl: i64,
+    /// Creation timestamp in milliseconds.
+    pub created_at_ms: u64,
+    /// Last update timestamp in milliseconds.
+    pub updated_at_ms: u64,
+}
+
+impl PositionInfo {
+    /// Creates a new position from a fill.
+    #[must_use]
+    pub fn new(
+        symbol: String,
+        underlying: String,
+        quantity: i64,
+        price: u128,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            symbol,
+            underlying,
+            quantity,
+            average_price: price,
+            realized_pnl: 0,
+            created_at_ms: timestamp_ms,
+            updated_at_ms: timestamp_ms,
+        }
+    }
+
+    /// Updates the position with a new fill.
+    ///
+    /// Returns the realized P&L from this fill (if closing a position).
+    pub fn update(&mut self, fill_quantity: i64, fill_price: u128, timestamp_ms: u64) -> i64 {
+        let mut realized = 0i64;
+
+        // Check if this fill is closing or opening
+        let same_direction =
+            (self.quantity > 0 && fill_quantity > 0) || (self.quantity < 0 && fill_quantity < 0);
+
+        if same_direction || self.quantity == 0 {
+            // Opening or adding to position - update average price
+            let old_value = self.average_price as i128 * self.quantity.abs() as i128;
+            let new_value = fill_price as i128 * fill_quantity.abs() as i128;
+            let total_quantity = self.quantity.abs() + fill_quantity.abs();
+
+            if total_quantity > 0 {
+                self.average_price = ((old_value + new_value) / total_quantity as i128) as u128;
+            }
+            self.quantity += fill_quantity;
+        } else {
+            // Closing position (opposite direction)
+            let close_quantity = fill_quantity.abs().min(self.quantity.abs());
+
+            // Calculate realized P&L
+            let price_diff = fill_price as i128 - self.average_price as i128;
+            if self.quantity > 0 {
+                // Long position being closed by sell
+                realized = (price_diff * close_quantity as i128) as i64;
+            } else {
+                // Short position being closed by buy
+                realized = (-price_diff * close_quantity as i128) as i64;
+            }
+
+            self.realized_pnl += realized;
+            self.quantity += fill_quantity;
+
+            // If position flipped, reset average price to fill price
+            if (self.quantity > 0 && fill_quantity > 0) || (self.quantity < 0 && fill_quantity < 0)
+            {
+                self.average_price = fill_price;
+            }
+        }
+
+        self.updated_at_ms = timestamp_ms;
+        realized
+    }
+
+    /// Calculates unrealized P&L given current market price.
+    #[must_use]
+    pub fn unrealized_pnl(&self, current_price: u128) -> i64 {
+        let price_diff = current_price as i128 - self.average_price as i128;
+        (price_diff * self.quantity as i128) as i64
+    }
+
+    /// Calculates notional value given current market price.
+    #[must_use]
+    pub fn notional_value(&self, current_price: u128) -> u128 {
+        current_price * self.quantity.unsigned_abs() as u128
+    }
+}
+
+/// Response for a single position.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PositionResponse {
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
+    pub symbol: String,
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Position quantity (positive = long, negative = short).
+    pub quantity: i64,
+    /// Average entry price in smallest units.
+    pub average_price: u128,
+    /// Current market price in smallest units.
+    pub current_price: u128,
+    /// Unrealized P&L in smallest units.
+    pub unrealized_pnl: i64,
+    /// Realized P&L in smallest units.
+    pub realized_pnl: i64,
+    /// Delta exposure (quantity * delta).
+    pub delta_exposure: f64,
+    /// Notional value (current_price * abs(quantity)).
+    pub notional_value: u128,
+}
+
+/// Summary of all positions.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PositionSummary {
+    /// Total unrealized P&L across all positions.
+    pub total_unrealized_pnl: i64,
+    /// Total realized P&L across all positions.
+    pub total_realized_pnl: i64,
+    /// Net delta exposure across all positions.
+    pub net_delta: f64,
+    /// Number of open positions.
+    pub position_count: usize,
+}
+
+/// Response for listing all positions.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PositionsListResponse {
+    /// List of positions.
+    pub positions: Vec<PositionResponse>,
+    /// Aggregate summary.
+    pub summary: PositionSummary,
+}
+
+/// Query parameters for listing positions.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PositionQuery {
+    /// Filter by underlying symbol.
+    #[serde(default)]
+    pub underlying: Option<String>,
+}

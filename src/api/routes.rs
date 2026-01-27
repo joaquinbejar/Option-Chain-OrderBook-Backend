@@ -86,5 +86,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Order status and query
         .route("/api/v1/orders", get(handlers::list_orders))
         .route("/api/v1/orders/{order_id}", get(handlers::get_order_status))
+        // Position tracking
+        .route("/api/v1/positions", get(handlers::list_positions))
+        .route("/api/v1/positions/{symbol}", get(handlers::get_position))
         .with_state(state)
 }
