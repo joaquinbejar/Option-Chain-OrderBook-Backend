@@ -173,6 +173,31 @@ async fn main() -> anyhow::Result<()> {
             info!("Price simulation started");
         }
 
+        // Start order cleanup task
+        if let Some(ref config) = state.config {
+            let state_clone = Arc::clone(&state);
+            let interval_secs = config.cleanup.interval_seconds;
+            let retention_secs = config.cleanup.retention_seconds;
+
+            if interval_secs > 0 {
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+                    // Skip the first immediate tick
+                    interval.tick().await;
+
+                    loop {
+                        interval.tick().await;
+                        state_clone.cleanup_old_orders(retention_secs);
+                    }
+                });
+                info!(
+                    "Order cleanup task started (interval: {}s, retention: {}s)",
+                    interval_secs, retention_secs
+                );
+            }
+        }
+
         info!(
             "Starting Option Chain OrderBook Backend on {}:{}",
             host, port
