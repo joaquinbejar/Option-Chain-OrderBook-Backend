@@ -49,12 +49,13 @@ utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.19", features = ["v4", "serde"] }
+uuid = { version = "1.20", features = ["v4", "serde"] }
 futures = "0.3"
 parking_lot = "0.12"
 toml = "0.9"
 rust_decimal = "1.40"
 rust_decimal_macros = "1.40"
+dashmap = "6.1"
 
 [dev-dependencies]
 
