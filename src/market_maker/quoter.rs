@@ -7,9 +7,9 @@ use optionstratlib::{ExpirationDate, OptionStyle};
 #[derive(Debug, Clone)]
 pub struct QuoteParams {
     /// Bid price in cents.
-    pub bid_price: u64,
+    pub bid_price: u128,
     /// Ask price in cents.
-    pub ask_price: u64,
+    pub ask_price: u128,
     /// Bid size.
     pub bid_size: u64,
     /// Ask size.
@@ -96,9 +96,9 @@ impl Quoter {
         };
 
         let bid_price =
-            (theo_cents as i64 - half_spread_cents as i64 + bid_adjustment).max(1) as u64;
+            (theo_cents as i64 - half_spread_cents as i64 + bid_adjustment).max(1) as u128;
         let ask_price = (theo_cents as i64 + half_spread_cents as i64 + ask_adjustment)
-            .max(bid_price as i64 + 1) as u64;
+            .max(bid_price as i64 + 1) as u128;
 
         // Calculate sizes with scalar
         let base_size = (self.base_size as f64 * input.size_scalar).max(1.0) as u64;

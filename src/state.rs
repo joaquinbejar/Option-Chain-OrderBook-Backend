@@ -3,7 +3,7 @@
 use crate::config::{AssetConfig, Config};
 use crate::db::DatabasePool;
 use crate::market_maker::MarketMakerEngine;
-use crate::models::LastTradeInfo;
+use crate::models::{LastTradeInfo, OrderInfo};
 use crate::simulation::PriceSimulator;
 use dashmap::DashMap;
 use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
@@ -26,6 +26,8 @@ pub struct AppState {
     pub config: Option<Config>,
     /// Storage for last trade information per symbol.
     pub last_trades: Arc<DashMap<String, LastTradeInfo>>,
+    /// Storage for order information by order ID.
+    pub orders: Arc<DashMap<String, OrderInfo>>,
 }
 
 impl AppState {
@@ -42,6 +44,7 @@ impl AppState {
             price_simulator: None,
             config: None,
             last_trades: Arc::new(DashMap::new()),
+            orders: Arc::new(DashMap::new()),
         }
     }
 
@@ -61,6 +64,7 @@ impl AppState {
             price_simulator: None,
             config: None,
             last_trades: Arc::new(DashMap::new()),
+            orders: Arc::new(DashMap::new()),
         }
     }
 
@@ -95,6 +99,7 @@ impl AppState {
             price_simulator: Some(price_simulator),
             config: Some(config),
             last_trades: Arc::new(DashMap::new()),
+            orders: Arc::new(DashMap::new()),
         }
     }
 

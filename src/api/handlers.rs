@@ -5,9 +5,9 @@ use crate::models::{
     AddOrderRequest, AddOrderResponse, CancelOrderResponse, EnrichedSnapshotResponse,
     ExpirationSummary, ExpirationsListResponse, FillInfo, GlobalStatsResponse, HealthResponse,
     LastTradeResponse, MarketOrderRequest, MarketOrderResponse, MarketOrderStatus,
-    OrderBookSnapshotResponse, OrderSide, PriceLevelInfo, QuoteResponse, SnapshotDepth,
-    SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary,
-    UnderlyingsListResponse,
+    OrderBookSnapshotResponse, OrderInfo, OrderListQuery, OrderListResponse, OrderSide,
+    OrderStatus, OrderStatusResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth, SnapshotQuery,
+    SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -918,6 +918,141 @@ pub async fn get_last_trade(
     }
 }
 
+// ============================================================================
+// Order Status and Query
+// ============================================================================
+
+/// Get the status of a single order by its ID.
+///
+/// Returns detailed information about the order including its current status,
+/// fill history, and timestamps.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orders/{order_id}",
+    params(
+        ("order_id" = String, Path, description = "Order identifier")
+    ),
+    responses(
+        (status = 200, description = "Order status", body = OrderStatusResponse),
+        (status = 404, description = "Order not found")
+    ),
+    tag = "Orders"
+)]
+pub async fn get_order_status(
+    State(state): State<Arc<AppState>>,
+    Path(order_id): Path<String>,
+) -> Result<Json<OrderStatusResponse>, ApiError> {
+    match state.orders.get(&order_id) {
+        Some(order_info) => Ok(Json(OrderStatusResponse::from(order_info.clone()))),
+        None => Err(ApiError::NotFound(format!("Order not found: {}", order_id))),
+    }
+}
+
+/// List orders with optional filters and pagination.
+///
+/// Supports filtering by underlying symbol, order status, and side.
+/// Results are paginated with configurable limit and offset.
+#[utoipa::path(
+    get,
+    path = "/api/v1/orders",
+    params(
+        ("underlying" = Option<String>, Query, description = "Filter by underlying symbol"),
+        ("status" = Option<String>, Query, description = "Filter by order status"),
+        ("side" = Option<String>, Query, description = "Filter by order side"),
+        ("limit" = Option<usize>, Query, description = "Pagination limit (default: 100)"),
+        ("offset" = Option<usize>, Query, description = "Pagination offset (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "List of orders", body = OrderListResponse),
+        (status = 400, description = "Invalid query parameters")
+    ),
+    tag = "Orders"
+)]
+pub async fn list_orders(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OrderListQuery>,
+) -> Result<Json<OrderListResponse>, ApiError> {
+    // Parse status filter if provided
+    let status_filter: Option<OrderStatus> = if let Some(ref status_str) = query.status {
+        Some(
+            status_str
+                .parse()
+                .map_err(|e: String| ApiError::InvalidRequest(e))?,
+        )
+    } else {
+        None
+    };
+
+    // Parse side filter if provided
+    let side_filter: Option<OrderSide> = if let Some(ref side_str) = query.side {
+        match side_str.to_lowercase().as_str() {
+            "buy" => Some(OrderSide::Buy),
+            "sell" => Some(OrderSide::Sell),
+            _ => {
+                return Err(ApiError::InvalidRequest(format!(
+                    "Invalid side: {}. Use 'buy' or 'sell'",
+                    side_str
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Collect and filter orders
+    let mut filtered_orders: Vec<OrderInfo> = state
+        .orders
+        .iter()
+        .filter(|entry| {
+            let order = entry.value();
+
+            // Filter by underlying
+            if let Some(ref underlying) = query.underlying
+                && &order.underlying != underlying
+            {
+                return false;
+            }
+
+            // Filter by status
+            if let Some(status) = status_filter
+                && order.status != status
+            {
+                return false;
+            }
+
+            // Filter by side
+            if let Some(side) = side_filter
+                && order.side != side
+            {
+                return false;
+            }
+
+            true
+        })
+        .map(|entry| entry.value().clone())
+        .collect();
+
+    // Sort by creation time (newest first)
+    filtered_orders.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+
+    let total = filtered_orders.len();
+
+    // Apply pagination
+    let paginated: Vec<OrderStatusResponse> = filtered_orders
+        .into_iter()
+        .skip(query.offset)
+        .take(query.limit)
+        .map(OrderStatusResponse::from)
+        .collect();
+
+    Ok(Json(OrderListResponse {
+        orders: paginated,
+        total,
+        limit: query.limit,
+        offset: query.offset,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,6 +1662,257 @@ mod tests {
         match result.unwrap_err() {
             ApiError::InvalidRequest(msg) => {
                 assert!(msg.contains("Invalid option style"));
+            }
+            _ => panic!("Expected InvalidRequest error"),
+        }
+    }
+
+    // ========================================================================
+    // Order Status Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_order_status_not_found() {
+        let state = create_test_state();
+
+        let result = get_order_status(
+            State(state.clone()),
+            Path("nonexistent-order-id".to_string()),
+        )
+        .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::NotFound(msg) => {
+                assert!(msg.contains("Order not found"));
+            }
+            _ => panic!("Expected NotFound error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_order_status_success() {
+        use crate::models::{OrderInfo, OrderStatus, OrderTimeInForce};
+
+        let state = create_test_state();
+
+        // Insert an order into the state
+        let order_id = "test-order-123".to_string();
+        let order_info = OrderInfo {
+            order_id: order_id.clone(),
+            symbol: "AAPL-20251231-150-C".to_string(),
+            underlying: "AAPL".to_string(),
+            expiration: "20251231".to_string(),
+            strike: 150,
+            style: "call".to_string(),
+            side: OrderSide::Buy,
+            price: 100,
+            original_quantity: 100,
+            remaining_quantity: 60,
+            filled_quantity: 40,
+            status: OrderStatus::Partial,
+            time_in_force: OrderTimeInForce::Gtc,
+            created_at_ms: 1704067200000,
+            updated_at_ms: 1704067500000,
+            fills: vec![],
+        };
+        state.orders.insert(order_id.clone(), order_info);
+
+        let result = get_order_status(State(state.clone()), Path(order_id.clone())).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.order_id, "test-order-123");
+        assert_eq!(response.symbol, "AAPL-20251231-150-C");
+        assert_eq!(response.side, OrderSide::Buy);
+        assert_eq!(response.original_quantity, 100);
+        assert_eq!(response.remaining_quantity, 60);
+        assert_eq!(response.filled_quantity, 40);
+        assert_eq!(response.status, OrderStatus::Partial);
+    }
+
+    #[tokio::test]
+    async fn test_list_orders_empty() {
+        let state = create_test_state();
+
+        let result = list_orders(
+            State(state.clone()),
+            Query(OrderListQuery {
+                underlying: None,
+                status: None,
+                side: None,
+                limit: 100,
+                offset: 0,
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.orders.len(), 0);
+        assert_eq!(response.total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_orders_with_filters() {
+        use crate::models::{OrderInfo, OrderStatus, OrderTimeInForce};
+
+        let state = create_test_state();
+
+        // Insert multiple orders
+        for i in 0..5 {
+            let order_info = OrderInfo {
+                order_id: format!("order-{}", i),
+                symbol: format!("AAPL-20251231-{}-C", 150 + i * 5),
+                underlying: if i < 3 {
+                    "AAPL".to_string()
+                } else {
+                    "GOOG".to_string()
+                },
+                expiration: "20251231".to_string(),
+                strike: 150 + i * 5,
+                style: "call".to_string(),
+                side: if i % 2 == 0 {
+                    OrderSide::Buy
+                } else {
+                    OrderSide::Sell
+                },
+                price: 100,
+                original_quantity: 100,
+                remaining_quantity: 100,
+                filled_quantity: 0,
+                status: OrderStatus::Active,
+                time_in_force: OrderTimeInForce::Gtc,
+                created_at_ms: 1704067200000 + i * 1000,
+                updated_at_ms: 1704067200000 + i * 1000,
+                fills: vec![],
+            };
+            state.orders.insert(format!("order-{}", i), order_info);
+        }
+
+        // Filter by underlying
+        let result = list_orders(
+            State(state.clone()),
+            Query(OrderListQuery {
+                underlying: Some("AAPL".to_string()),
+                status: None,
+                side: None,
+                limit: 100,
+                offset: 0,
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.total, 3);
+
+        // Filter by side
+        let result = list_orders(
+            State(state.clone()),
+            Query(OrderListQuery {
+                underlying: None,
+                status: None,
+                side: Some("buy".to_string()),
+                limit: 100,
+                offset: 0,
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.total, 3); // orders 0, 2, 4 are buy
+    }
+
+    #[tokio::test]
+    async fn test_list_orders_pagination() {
+        use crate::models::{OrderInfo, OrderStatus, OrderTimeInForce};
+
+        let state = create_test_state();
+
+        // Insert 10 orders
+        for i in 0..10 {
+            let order_info = OrderInfo {
+                order_id: format!("order-{}", i),
+                symbol: format!("AAPL-20251231-{}-C", 150 + i * 5),
+                underlying: "AAPL".to_string(),
+                expiration: "20251231".to_string(),
+                strike: 150 + i * 5,
+                style: "call".to_string(),
+                side: OrderSide::Buy,
+                price: 100,
+                original_quantity: 100,
+                remaining_quantity: 100,
+                filled_quantity: 0,
+                status: OrderStatus::Active,
+                time_in_force: OrderTimeInForce::Gtc,
+                created_at_ms: 1704067200000 + i * 1000,
+                updated_at_ms: 1704067200000 + i * 1000,
+                fills: vec![],
+            };
+            state.orders.insert(format!("order-{}", i), order_info);
+        }
+
+        // Get first page (limit 3)
+        let result = list_orders(
+            State(state.clone()),
+            Query(OrderListQuery {
+                underlying: None,
+                status: None,
+                side: None,
+                limit: 3,
+                offset: 0,
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.orders.len(), 3);
+        assert_eq!(response.total, 10);
+        assert_eq!(response.limit, 3);
+        assert_eq!(response.offset, 0);
+
+        // Get second page
+        let result = list_orders(
+            State(state.clone()),
+            Query(OrderListQuery {
+                underlying: None,
+                status: None,
+                side: None,
+                limit: 3,
+                offset: 3,
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.orders.len(), 3);
+        assert_eq!(response.offset, 3);
+    }
+
+    #[tokio::test]
+    async fn test_list_orders_invalid_side() {
+        let state = create_test_state();
+
+        let result = list_orders(
+            State(state.clone()),
+            Query(OrderListQuery {
+                underlying: None,
+                status: None,
+                side: Some("invalid".to_string()),
+                limit: 100,
+                offset: 0,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::InvalidRequest(msg) => {
+                assert!(msg.contains("Invalid side"));
             }
             _ => panic!("Expected InvalidRequest error"),
         }

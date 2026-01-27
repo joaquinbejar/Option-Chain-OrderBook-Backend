@@ -50,7 +50,7 @@ pub struct AddOrderRequest {
     /// Order side.
     pub side: OrderSide,
     /// Limit price in smallest units.
-    pub price: u64,
+    pub price: u128,
     /// Order quantity in smallest units.
     pub quantity: u64,
 }
@@ -77,11 +77,11 @@ pub struct CancelOrderResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuoteResponse {
     /// Best bid price.
-    pub bid_price: Option<u64>,
+    pub bid_price: Option<u128>,
     /// Best bid size.
     pub bid_size: u64,
     /// Best ask price.
-    pub ask_price: Option<u64>,
+    pub ask_price: Option<u128>,
     /// Best ask size.
     pub ask_size: u64,
     /// Timestamp in milliseconds.
@@ -202,7 +202,7 @@ pub struct MarketOrderRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FillInfo {
     /// Execution price in smallest units.
-    pub price: u64,
+    pub price: u128,
     /// Executed quantity in smallest units.
     pub quantity: u64,
 }
@@ -271,7 +271,7 @@ impl SnapshotDepth {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PriceLevelInfo {
     /// Price in smallest units.
-    pub price: u64,
+    pub price: u128,
     /// Total visible quantity at this level.
     pub quantity: u64,
     /// Number of orders at this level.
@@ -371,4 +371,218 @@ impl From<LastTradeInfo> for LastTradeResponse {
             trade_id: info.trade_id,
         }
     }
+}
+
+// ============================================================================
+// Order Status and Query Types
+// ============================================================================
+
+/// Order status in the lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderStatus {
+    /// Order is pending (not yet in the book).
+    Pending,
+    /// Order is active in the book.
+    Active,
+    /// Order is partially filled.
+    Partial,
+    /// Order is completely filled.
+    Filled,
+    /// Order was canceled.
+    Canceled,
+}
+
+impl std::fmt::Display for OrderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Active => write!(f, "active"),
+            Self::Partial => write!(f, "partial"),
+            Self::Filled => write!(f, "filled"),
+            Self::Canceled => write!(f, "canceled"),
+        }
+    }
+}
+
+impl std::str::FromStr for OrderStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
+            "active" => Ok(Self::Active),
+            "partial" => Ok(Self::Partial),
+            "filled" => Ok(Self::Filled),
+            "canceled" | "cancelled" => Ok(Self::Canceled),
+            _ => Err(format!("Invalid order status: {}", s)),
+        }
+    }
+}
+
+/// Time in force for orders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum OrderTimeInForce {
+    /// Good till canceled.
+    Gtc,
+    /// Immediate or cancel.
+    Ioc,
+    /// Fill or kill.
+    Fok,
+    /// Good till date.
+    Gtd,
+}
+
+impl std::fmt::Display for OrderTimeInForce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gtc => write!(f, "GTC"),
+            Self::Ioc => write!(f, "IOC"),
+            Self::Fok => write!(f, "FOK"),
+            Self::Gtd => write!(f, "GTD"),
+        }
+    }
+}
+
+/// Information about a fill in an order.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrderFillInfo {
+    /// Execution price in smallest units.
+    pub price: u128,
+    /// Executed quantity.
+    pub quantity: u64,
+    /// Timestamp of the fill in milliseconds.
+    pub timestamp_ms: u64,
+}
+
+/// Internal storage for order information.
+#[derive(Debug, Clone)]
+pub struct OrderInfo {
+    /// Unique order identifier.
+    pub order_id: String,
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
+    pub symbol: String,
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Expiration date string.
+    pub expiration: String,
+    /// Strike price.
+    pub strike: u64,
+    /// Option style (call/put).
+    pub style: String,
+    /// Order side.
+    pub side: OrderSide,
+    /// Limit price in smallest units.
+    pub price: u128,
+    /// Original order quantity.
+    pub original_quantity: u64,
+    /// Remaining quantity.
+    pub remaining_quantity: u64,
+    /// Filled quantity.
+    pub filled_quantity: u64,
+    /// Current order status.
+    pub status: OrderStatus,
+    /// Time in force.
+    pub time_in_force: OrderTimeInForce,
+    /// Creation timestamp in milliseconds.
+    pub created_at_ms: u64,
+    /// Last update timestamp in milliseconds.
+    pub updated_at_ms: u64,
+    /// Fill history.
+    pub fills: Vec<OrderFillInfo>,
+}
+
+/// Response for single order status query.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrderStatusResponse {
+    /// Unique order identifier.
+    pub order_id: String,
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
+    pub symbol: String,
+    /// Order side.
+    pub side: OrderSide,
+    /// Limit price in smallest units.
+    pub price: u128,
+    /// Original order quantity.
+    pub original_quantity: u64,
+    /// Remaining quantity.
+    pub remaining_quantity: u64,
+    /// Filled quantity.
+    pub filled_quantity: u64,
+    /// Current order status.
+    pub status: OrderStatus,
+    /// Time in force.
+    pub time_in_force: OrderTimeInForce,
+    /// Creation timestamp (ISO 8601).
+    pub created_at: String,
+    /// Last update timestamp (ISO 8601).
+    pub updated_at: String,
+    /// Fill history.
+    pub fills: Vec<OrderFillInfo>,
+}
+
+impl From<OrderInfo> for OrderStatusResponse {
+    fn from(info: OrderInfo) -> Self {
+        use chrono::{TimeZone, Utc};
+        Self {
+            order_id: info.order_id,
+            symbol: info.symbol,
+            side: info.side,
+            price: info.price,
+            original_quantity: info.original_quantity,
+            remaining_quantity: info.remaining_quantity,
+            filled_quantity: info.filled_quantity,
+            status: info.status,
+            time_in_force: info.time_in_force,
+            created_at: Utc
+                .timestamp_millis_opt(info.created_at_ms as i64)
+                .single()
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+            updated_at: Utc
+                .timestamp_millis_opt(info.updated_at_ms as i64)
+                .single()
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+            fills: info.fills,
+        }
+    }
+}
+
+/// Response for listing orders.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrderListResponse {
+    /// List of orders.
+    pub orders: Vec<OrderStatusResponse>,
+    /// Total number of matching orders.
+    pub total: usize,
+    /// Limit used for pagination.
+    pub limit: usize,
+    /// Offset used for pagination.
+    pub offset: usize,
+}
+
+/// Query parameters for listing orders.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct OrderListQuery {
+    /// Filter by underlying symbol.
+    #[serde(default)]
+    pub underlying: Option<String>,
+    /// Filter by order status.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Filter by order side.
+    #[serde(default)]
+    pub side: Option<String>,
+    /// Pagination limit (default: 100).
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Pagination offset (default: 0).
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_limit() -> usize {
+    100
 }
