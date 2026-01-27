@@ -4,9 +4,10 @@ use crate::error::ApiError;
 use crate::models::{
     AddOrderRequest, AddOrderResponse, CancelOrderResponse, EnrichedSnapshotResponse,
     ExpirationSummary, ExpirationsListResponse, FillInfo, GlobalStatsResponse, HealthResponse,
-    MarketOrderRequest, MarketOrderResponse, MarketOrderStatus, OrderBookSnapshotResponse,
-    OrderSide, PriceLevelInfo, QuoteResponse, SnapshotDepth, SnapshotQuery, SnapshotStats,
-    StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
+    LastTradeResponse, MarketOrderRequest, MarketOrderResponse, MarketOrderStatus,
+    OrderBookSnapshotResponse, OrderSide, PriceLevelInfo, QuoteResponse, SnapshotDepth,
+    SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary,
+    UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -871,6 +872,52 @@ pub async fn submit_market_order(
     }
 }
 
+// ============================================================================
+// Last Trade Information
+// ============================================================================
+
+/// Get the last trade information for an option.
+///
+/// Returns the most recent trade that occurred for the specified option contract.
+/// If no trades have occurred, returns a 404 Not Found error.
+#[utoipa::path(
+    get,
+    path = "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/last-trade",
+    params(
+        ("underlying" = String, Path, description = "Underlying symbol"),
+        ("expiration" = String, Path, description = "Expiration date"),
+        ("strike" = u64, Path, description = "Strike price"),
+        ("style" = String, Path, description = "Option style: 'call' or 'put'")
+    ),
+    responses(
+        (status = 200, description = "Last trade information", body = LastTradeResponse),
+        (status = 404, description = "No trades found for this option")
+    ),
+    tag = "Options"
+)]
+pub async fn get_last_trade(
+    State(state): State<Arc<AppState>>,
+    Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
+) -> Result<Json<LastTradeResponse>, ApiError> {
+    let option_style = parse_option_style(&style)?;
+
+    // Build the symbol key to look up in the last trades map
+    let style_char = match option_style {
+        OptionStyle::Call => "C",
+        OptionStyle::Put => "P",
+    };
+    let symbol = format!("{}-{}-{}-{}", underlying, exp_str, strike, style_char);
+
+    // Look up the last trade for this symbol
+    match state.last_trades.get(&symbol) {
+        Some(trade_info) => Ok(Json(LastTradeResponse::from(trade_info.clone()))),
+        None => Err(ApiError::NotFound(format!(
+            "No trades found for option {}",
+            symbol
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1333,5 +1380,155 @@ mod tests {
         // Should have exactly 2 levels per side (3 bids added, 2 asks added, depth=2)
         assert_eq!(response.bids.len(), 2);
         assert_eq!(response.asks.len(), 2);
+    }
+
+    // ========================================================================
+    // Last Trade Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_last_trade_not_found() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, strike (but no trades)
+        let underlying_book = state.manager.get_or_create("TRADE1");
+        let expiration = parse_expiration("20251231").unwrap();
+        let exp_book = underlying_book.get_or_create_expiration(expiration);
+        drop(exp_book.get_or_create_strike(100));
+
+        // Try to get last trade - should return 404
+        let result = get_last_trade(
+            State(state.clone()),
+            Path((
+                "TRADE1".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+        )
+        .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::NotFound(msg) => {
+                assert!(msg.contains("No trades found"));
+            }
+            _ => panic!("Expected NotFound error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_last_trade_success() {
+        use crate::models::{LastTradeInfo, OrderSide};
+
+        let state = create_test_state();
+
+        // Create underlying, expiration, strike
+        let underlying_book = state.manager.get_or_create("TRADE2");
+        let expiration = parse_expiration("20251231").unwrap();
+        let exp_book = underlying_book.get_or_create_expiration(expiration);
+        drop(exp_book.get_or_create_strike(100));
+
+        // Manually insert a last trade into the state
+        let symbol = "TRADE2-20251231-100-C".to_string();
+        let trade_info = LastTradeInfo {
+            symbol: symbol.clone(),
+            price: 150,
+            quantity: 50,
+            side: OrderSide::Buy,
+            timestamp_ms: 1234567890,
+            trade_id: "test-trade-id".to_string(),
+        };
+        state.last_trades.insert(symbol, trade_info);
+
+        // Get last trade - should succeed
+        let result = get_last_trade(
+            State(state.clone()),
+            Path((
+                "TRADE2".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.symbol, "TRADE2-20251231-100-C");
+        assert_eq!(response.price, 150);
+        assert_eq!(response.quantity, 50);
+        assert_eq!(response.side, OrderSide::Buy);
+        assert_eq!(response.timestamp_ms, 1234567890);
+        assert_eq!(response.trade_id, "test-trade-id");
+    }
+
+    #[tokio::test]
+    async fn test_get_last_trade_put_option() {
+        use crate::models::{LastTradeInfo, OrderSide};
+
+        let state = create_test_state();
+
+        // Create underlying, expiration, strike
+        let underlying_book = state.manager.get_or_create("TRADE3");
+        let expiration = parse_expiration("20251231").unwrap();
+        let exp_book = underlying_book.get_or_create_expiration(expiration);
+        drop(exp_book.get_or_create_strike(100));
+
+        // Manually insert a last trade for a put option
+        let symbol = "TRADE3-20251231-100-P".to_string();
+        let trade_info = LastTradeInfo {
+            symbol: symbol.clone(),
+            price: 200,
+            quantity: 75,
+            side: OrderSide::Sell,
+            timestamp_ms: 9876543210,
+            trade_id: "put-trade-id".to_string(),
+        };
+        state.last_trades.insert(symbol, trade_info);
+
+        // Get last trade for put option - should succeed
+        let result = get_last_trade(
+            State(state.clone()),
+            Path((
+                "TRADE3".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "put".to_string(),
+            )),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.symbol, "TRADE3-20251231-100-P");
+        assert_eq!(response.price, 200);
+        assert_eq!(response.quantity, 75);
+        assert_eq!(response.side, OrderSide::Sell);
+    }
+
+    #[tokio::test]
+    async fn test_get_last_trade_invalid_style() {
+        let state = create_test_state();
+
+        // Try to get last trade with invalid style
+        let result = get_last_trade(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "invalid".to_string(),
+            )),
+        )
+        .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::InvalidRequest(msg) => {
+                assert!(msg.contains("Invalid option style"));
+            }
+            _ => panic!("Expected InvalidRequest error"),
+        }
     }
 }

@@ -321,3 +321,54 @@ pub struct SnapshotQuery {
     #[serde(default)]
     pub depth: Option<String>,
 }
+
+// ============================================================================
+// Last Trade Types
+// ============================================================================
+
+/// Response containing the last trade information for an option.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LastTradeResponse {
+    /// The option symbol (e.g., "BTC-20240329-50000-C").
+    pub symbol: String,
+    /// Execution price in smallest units.
+    pub price: u64,
+    /// Executed quantity in smallest units.
+    pub quantity: u64,
+    /// The side of the taker (aggressor) in the trade.
+    pub side: OrderSide,
+    /// Timestamp in milliseconds since epoch.
+    pub timestamp_ms: u64,
+    /// Unique trade identifier.
+    pub trade_id: String,
+}
+
+/// Internal storage for last trade information.
+#[derive(Debug, Clone)]
+pub struct LastTradeInfo {
+    /// The option symbol.
+    pub symbol: String,
+    /// Execution price in smallest units.
+    pub price: u64,
+    /// Executed quantity in smallest units.
+    pub quantity: u64,
+    /// The side of the taker (aggressor) in the trade.
+    pub side: OrderSide,
+    /// Timestamp in milliseconds since epoch.
+    pub timestamp_ms: u64,
+    /// Unique trade identifier.
+    pub trade_id: String,
+}
+
+impl From<LastTradeInfo> for LastTradeResponse {
+    fn from(info: LastTradeInfo) -> Self {
+        Self {
+            symbol: info.symbol,
+            price: info.price,
+            quantity: info.quantity,
+            side: info.side,
+            timestamp_ms: info.timestamp_ms,
+            trade_id: info.trade_id,
+        }
+    }
+}
