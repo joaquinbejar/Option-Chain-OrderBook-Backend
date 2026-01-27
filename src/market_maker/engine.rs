@@ -52,9 +52,9 @@ pub enum MarketMakerEvent {
         /// Option style (call/put).
         style: String,
         /// Bid price in cents.
-        bid_price: u64,
+        bid_price: u128,
         /// Ask price in cents.
-        ask_price: u64,
+        ask_price: u128,
         /// Bid size.
         bid_size: u64,
         /// Ask size.
@@ -73,7 +73,7 @@ pub enum MarketMakerEvent {
         /// Filled quantity.
         quantity: u64,
         /// Fill price in cents.
-        price: u64,
+        price: u128,
         /// Edge captured in cents.
         edge: i64,
     },

@@ -248,6 +248,57 @@ pub struct MarketOrderResponse {
 }
 
 // ============================================================================
+// Enriched Snapshot
+// ============================================================================
+
+/// Price level information in a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceLevelInfo {
+    /// Price in smallest units.
+    pub price: u64,
+    /// Total visible quantity at this level.
+    pub quantity: u64,
+    /// Number of orders at this level.
+    pub order_count: usize,
+}
+
+/// Statistics for an enriched snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotStats {
+    /// Mid price (average of best bid and ask).
+    pub mid_price: Option<f64>,
+    /// Spread in basis points.
+    pub spread_bps: Option<f64>,
+    /// Total depth on bid side.
+    pub bid_depth_total: u64,
+    /// Total depth on ask side.
+    pub ask_depth_total: u64,
+    /// Order book imbalance (-1.0 to 1.0).
+    pub imbalance: f64,
+    /// Volume-weighted average price for bids.
+    pub vwap_bid: Option<f64>,
+    /// Volume-weighted average price for asks.
+    pub vwap_ask: Option<f64>,
+}
+
+/// Enriched order book snapshot response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichedSnapshotResponse {
+    /// Symbol identifier.
+    pub symbol: String,
+    /// Sequence number for incremental updates.
+    pub sequence: u64,
+    /// Timestamp in milliseconds since epoch.
+    pub timestamp_ms: u64,
+    /// Bid price levels (sorted by price descending).
+    pub bids: Vec<PriceLevelInfo>,
+    /// Ask price levels (sorted by price ascending).
+    pub asks: Vec<PriceLevelInfo>,
+    /// Pre-calculated statistics.
+    pub stats: SnapshotStats,
+}
+
+// ============================================================================
 // Controls
 // ============================================================================
 

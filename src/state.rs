@@ -3,8 +3,9 @@
 use crate::config::{AssetConfig, Config};
 use crate::db::DatabasePool;
 use crate::market_maker::MarketMakerEngine;
-use crate::order_tracker::{CleanupConfig, OrderTracker};
+use crate::models::{LastTradeInfo, OrderInfo, PositionInfo};
 use crate::simulation::PriceSimulator;
+use dashmap::DashMap;
 use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
 use optionstratlib::ExpirationDate;
 use std::sync::Arc;
@@ -21,10 +22,14 @@ pub struct AppState {
     pub market_maker: Arc<MarketMakerEngine>,
     /// Price simulator.
     pub price_simulator: Option<Arc<PriceSimulator>>,
-    /// In-memory order tracker.
-    pub order_tracker: Arc<OrderTracker>,
     /// Application configuration.
     pub config: Option<Config>,
+    /// Storage for last trade information per symbol.
+    pub last_trades: Arc<DashMap<String, LastTradeInfo>>,
+    /// Storage for order information by order ID.
+    pub orders: Arc<DashMap<String, OrderInfo>>,
+    /// Storage for position information by symbol.
+    pub positions: Arc<DashMap<String, PositionInfo>>,
 }
 
 impl AppState {
@@ -39,8 +44,10 @@ impl AppState {
             db: None,
             market_maker,
             price_simulator: None,
-            order_tracker: Arc::new(OrderTracker::new()),
             config: None,
+            last_trades: Arc::new(DashMap::new()),
+            orders: Arc::new(DashMap::new()),
+            positions: Arc::new(DashMap::new()),
         }
     }
 
@@ -58,8 +65,10 @@ impl AppState {
             db: Some(db),
             market_maker,
             price_simulator: None,
-            order_tracker: Arc::new(OrderTracker::new()),
             config: None,
+            last_trades: Arc::new(DashMap::new()),
+            orders: Arc::new(DashMap::new()),
+            positions: Arc::new(DashMap::new()),
         }
     }
 
@@ -92,9 +101,10 @@ impl AppState {
             db,
             market_maker,
             price_simulator: Some(price_simulator),
-            // Use OrderTracker with cleanup for production
-            order_tracker: Arc::new(OrderTracker::with_cleanup(CleanupConfig::default())),
             config: Some(config),
+            last_trades: Arc::new(DashMap::new()),
+            orders: Arc::new(DashMap::new()),
+            positions: Arc::new(DashMap::new()),
         }
     }
 

@@ -50,7 +50,7 @@ pub struct AddOrderRequest {
     /// Order side.
     pub side: OrderSide,
     /// Limit price in smallest units.
-    pub price: u64,
+    pub price: u128,
     /// Order quantity in smallest units.
     pub quantity: u64,
 }
@@ -77,11 +77,11 @@ pub struct CancelOrderResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuoteResponse {
     /// Best bid price.
-    pub bid_price: Option<u64>,
+    pub bid_price: Option<u128>,
     /// Best bid size.
     pub bid_size: u64,
     /// Best ask price.
-    pub ask_price: Option<u64>,
+    pub ask_price: Option<u128>,
     /// Best ask size.
     pub ask_size: u64,
     /// Timestamp in milliseconds.
@@ -202,7 +202,7 @@ pub struct MarketOrderRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FillInfo {
     /// Execution price in smallest units.
-    pub price: u64,
+    pub price: u128,
     /// Executed quantity in smallest units.
     pub quantity: u64,
 }
@@ -225,14 +225,165 @@ pub struct MarketOrderResponse {
 }
 
 // ============================================================================
-// Order Lifecycle Tracking
+// Enriched Snapshot Types
 // ============================================================================
 
-/// Order lifecycle status.
+/// Depth parameter for snapshot requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapshotDepth {
+    /// Only top of book (best bid/ask).
+    #[default]
+    Top,
+    /// Specific number of levels.
+    Levels(usize),
+    /// Full depth (all levels).
+    Full,
+}
+
+impl std::str::FromStr for SnapshotDepth {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "top" | "1" => Ok(Self::Top),
+            "full" | "all" => Ok(Self::Full),
+            other => other
+                .parse::<usize>()
+                .map(Self::Levels)
+                .map_err(|_| format!("invalid depth: {}", other)),
+        }
+    }
+}
+
+impl SnapshotDepth {
+    /// Converts depth to usize for API calls.
+    #[must_use]
+    pub fn to_usize(self) -> usize {
+        match self {
+            Self::Top => 1,
+            Self::Levels(n) => n,
+            Self::Full => usize::MAX,
+        }
+    }
+}
+
+/// Price level information in a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PriceLevelInfo {
+    /// Price in smallest units.
+    pub price: u128,
+    /// Total visible quantity at this level.
+    pub quantity: u64,
+    /// Number of orders at this level.
+    pub order_count: usize,
+}
+
+/// Statistics for an enriched snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SnapshotStats {
+    /// Mid price (average of best bid and ask).
+    pub mid_price: Option<f64>,
+    /// Spread in basis points.
+    pub spread_bps: Option<f64>,
+    /// Total depth on bid side.
+    pub bid_depth_total: u64,
+    /// Total depth on ask side.
+    pub ask_depth_total: u64,
+    /// Order book imbalance (-1.0 to 1.0).
+    pub imbalance: f64,
+    /// Volume-weighted average price for bids.
+    pub vwap_bid: Option<f64>,
+    /// Volume-weighted average price for asks.
+    pub vwap_ask: Option<f64>,
+}
+
+/// Enriched order book snapshot response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EnrichedSnapshotResponse {
+    /// Symbol identifier.
+    pub symbol: String,
+    /// Sequence number for incremental updates.
+    pub sequence: u64,
+    /// Timestamp in milliseconds since epoch.
+    pub timestamp_ms: u64,
+    /// Bid price levels (sorted by price descending).
+    pub bids: Vec<PriceLevelInfo>,
+    /// Ask price levels (sorted by price ascending).
+    pub asks: Vec<PriceLevelInfo>,
+    /// Pre-calculated statistics.
+    pub stats: SnapshotStats,
+}
+
+/// Query parameters for snapshot endpoint.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SnapshotQuery {
+    /// Depth parameter: "top" (default), "10", "20", or "full".
+    #[serde(default)]
+    pub depth: Option<String>,
+}
+
+// ============================================================================
+// Last Trade Types
+// ============================================================================
+
+/// Response containing the last trade information for an option.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LastTradeResponse {
+    /// The option symbol (e.g., "BTC-20240329-50000-C").
+    pub symbol: String,
+    /// Execution price in smallest units.
+    pub price: u64,
+    /// Executed quantity in smallest units.
+    pub quantity: u64,
+    /// The side of the taker (aggressor) in the trade.
+    pub side: OrderSide,
+    /// Timestamp in milliseconds since epoch.
+    pub timestamp_ms: u64,
+    /// Unique trade identifier.
+    pub trade_id: String,
+}
+
+/// Internal storage for last trade information.
+#[derive(Debug, Clone)]
+pub struct LastTradeInfo {
+    /// The option symbol.
+    pub symbol: String,
+    /// Execution price in smallest units.
+    pub price: u64,
+    /// Executed quantity in smallest units.
+    pub quantity: u64,
+    /// The side of the taker (aggressor) in the trade.
+    pub side: OrderSide,
+    /// Timestamp in milliseconds since epoch.
+    pub timestamp_ms: u64,
+    /// Unique trade identifier.
+    pub trade_id: String,
+}
+
+impl From<LastTradeInfo> for LastTradeResponse {
+    fn from(info: LastTradeInfo) -> Self {
+        Self {
+            symbol: info.symbol,
+            price: info.price,
+            quantity: info.quantity,
+            side: info.side,
+            timestamp_ms: info.timestamp_ms,
+            trade_id: info.trade_id,
+        }
+    }
+}
+
+// ============================================================================
+// Order Status and Query Types
+// ============================================================================
+
+/// Order status in the lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OrderStatus {
-    /// Order is active in the order book.
+    /// Order is pending (not yet in the book).
+    Pending,
+    /// Order is active in the book.
     Active,
     /// Order is partially filled.
     Partial,
@@ -245,6 +396,7 @@ pub enum OrderStatus {
 impl std::fmt::Display for OrderStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Pending => write!(f, "pending"),
             Self::Active => write!(f, "active"),
             Self::Partial => write!(f, "partial"),
             Self::Filled => write!(f, "filled"),
@@ -258,85 +410,338 @@ impl std::str::FromStr for OrderStatus {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
             "active" => Ok(Self::Active),
             "partial" => Ok(Self::Partial),
             "filled" => Ok(Self::Filled),
-            "canceled" => Ok(Self::Canceled),
+            "canceled" | "cancelled" => Ok(Self::Canceled),
             _ => Err(format!("Invalid order status: {}", s)),
         }
     }
 }
 
-/// Record of a single fill for an order.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrderFillRecord {
-    /// Execution price in smallest units.
-    pub price: u64,
-    /// Executed quantity in smallest units.
-    pub quantity: u64,
-    /// Timestamp of the fill (ISO 8601).
-    pub timestamp: String,
+/// Time in force for orders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum OrderTimeInForce {
+    /// Good till canceled.
+    Gtc,
+    /// Immediate or cancel.
+    Ioc,
+    /// Fill or kill.
+    Fok,
+    /// Good till date.
+    Gtd,
 }
 
-/// Complete order information for status queries.
+impl std::fmt::Display for OrderTimeInForce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gtc => write!(f, "GTC"),
+            Self::Ioc => write!(f, "IOC"),
+            Self::Fok => write!(f, "FOK"),
+            Self::Gtd => write!(f, "GTD"),
+        }
+    }
+}
+
+/// Information about a fill in an order.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrderFillInfo {
+    /// Execution price in smallest units.
+    pub price: u128,
+    /// Executed quantity.
+    pub quantity: u64,
+    /// Timestamp of the fill in milliseconds.
+    pub timestamp_ms: u64,
+}
+
+/// Internal storage for order information.
+#[derive(Debug, Clone)]
 pub struct OrderInfo {
-    /// The order ID.
+    /// Unique order identifier.
     pub order_id: String,
-    /// Option symbol (e.g., "BTC-20251231-100000-C").
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
+    pub symbol: String,
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Expiration date string.
+    pub expiration: String,
+    /// Strike price.
+    pub strike: u64,
+    /// Option style (call/put).
+    pub style: String,
+    /// Order side.
+    pub side: OrderSide,
+    /// Limit price in smallest units.
+    pub price: u128,
+    /// Original order quantity.
+    pub original_quantity: u64,
+    /// Remaining quantity.
+    pub remaining_quantity: u64,
+    /// Filled quantity.
+    pub filled_quantity: u64,
+    /// Current order status.
+    pub status: OrderStatus,
+    /// Time in force.
+    pub time_in_force: OrderTimeInForce,
+    /// Creation timestamp in milliseconds.
+    pub created_at_ms: u64,
+    /// Last update timestamp in milliseconds.
+    pub updated_at_ms: u64,
+    /// Fill history.
+    pub fills: Vec<OrderFillInfo>,
+}
+
+/// Response for single order status query.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrderStatusResponse {
+    /// Unique order identifier.
+    pub order_id: String,
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
     pub symbol: String,
     /// Order side.
     pub side: OrderSide,
     /// Limit price in smallest units.
-    pub price: u64,
+    pub price: u128,
     /// Original order quantity.
     pub original_quantity: u64,
-    /// Remaining quantity not yet filled.
+    /// Remaining quantity.
     pub remaining_quantity: u64,
-    /// Quantity that has been filled.
+    /// Filled quantity.
     pub filled_quantity: u64,
     /// Current order status.
     pub status: OrderStatus,
-    /// Time in force (e.g., "GTC").
-    pub time_in_force: String,
-    /// Order creation timestamp (ISO 8601).
+    /// Time in force.
+    pub time_in_force: OrderTimeInForce,
+    /// Creation timestamp (ISO 8601).
     pub created_at: String,
     /// Last update timestamp (ISO 8601).
     pub updated_at: String,
-    /// List of fills for this order.
-    pub fills: Vec<OrderFillRecord>,
+    /// Fill history.
+    pub fills: Vec<OrderFillInfo>,
+}
+
+impl From<OrderInfo> for OrderStatusResponse {
+    fn from(info: OrderInfo) -> Self {
+        use chrono::{TimeZone, Utc};
+        Self {
+            order_id: info.order_id,
+            symbol: info.symbol,
+            side: info.side,
+            price: info.price,
+            original_quantity: info.original_quantity,
+            remaining_quantity: info.remaining_quantity,
+            filled_quantity: info.filled_quantity,
+            status: info.status,
+            time_in_force: info.time_in_force,
+            created_at: Utc
+                .timestamp_millis_opt(info.created_at_ms as i64)
+                .single()
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+            updated_at: Utc
+                .timestamp_millis_opt(info.updated_at_ms as i64)
+                .single()
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+            fills: info.fills,
+        }
+    }
+}
+
+/// Response for listing orders.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrderListResponse {
+    /// List of orders.
+    pub orders: Vec<OrderStatusResponse>,
+    /// Total number of matching orders.
+    pub total: usize,
+    /// Limit used for pagination.
+    pub limit: usize,
+    /// Offset used for pagination.
+    pub offset: usize,
 }
 
 /// Query parameters for listing orders.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct OrderListQuery {
     /// Filter by underlying symbol.
+    #[serde(default)]
     pub underlying: Option<String>,
     /// Filter by order status.
-    pub status: Option<String>,
-    /// Filter by side (buy/sell).
-    pub side: Option<String>,
-    /// Maximum number of results (default: 100).
-    #[serde(default = "default_limit")]
-    pub limit: u32,
-    /// Offset for pagination (default: 0).
     #[serde(default)]
-    pub offset: u32,
+    pub status: Option<String>,
+    /// Filter by order side.
+    #[serde(default)]
+    pub side: Option<String>,
+    /// Pagination limit (default: 100).
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Pagination offset (default: 0).
+    #[serde(default)]
+    pub offset: usize,
 }
 
-fn default_limit() -> u32 {
+fn default_limit() -> usize {
     100
 }
 
-/// Response for listing orders with pagination.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct OrderListResponse {
-    /// List of orders.
-    pub orders: Vec<OrderInfo>,
-    /// Total number of matching orders.
-    pub total: usize,
-    /// Limit used in query.
-    pub limit: u32,
-    /// Offset used in query.
-    pub offset: u32,
+// ============================================================================
+// Position and Inventory Tracking Types
+// ============================================================================
+
+/// Internal storage for position information.
+#[derive(Debug, Clone)]
+pub struct PositionInfo {
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
+    pub symbol: String,
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Position quantity (positive = long, negative = short).
+    pub quantity: i64,
+    /// Average entry price in smallest units.
+    pub average_price: u128,
+    /// Realized P&L in smallest units.
+    pub realized_pnl: i64,
+    /// Creation timestamp in milliseconds.
+    pub created_at_ms: u64,
+    /// Last update timestamp in milliseconds.
+    pub updated_at_ms: u64,
+}
+
+impl PositionInfo {
+    /// Creates a new position from a fill.
+    #[must_use]
+    pub fn new(
+        symbol: String,
+        underlying: String,
+        quantity: i64,
+        price: u128,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            symbol,
+            underlying,
+            quantity,
+            average_price: price,
+            realized_pnl: 0,
+            created_at_ms: timestamp_ms,
+            updated_at_ms: timestamp_ms,
+        }
+    }
+
+    /// Updates the position with a new fill.
+    ///
+    /// Returns the realized P&L from this fill (if closing a position).
+    pub fn update(&mut self, fill_quantity: i64, fill_price: u128, timestamp_ms: u64) -> i64 {
+        let mut realized = 0i64;
+
+        // Check if this fill is closing or opening
+        let same_direction =
+            (self.quantity > 0 && fill_quantity > 0) || (self.quantity < 0 && fill_quantity < 0);
+
+        if same_direction || self.quantity == 0 {
+            // Opening or adding to position - update average price
+            let old_value = self.average_price as i128 * self.quantity.abs() as i128;
+            let new_value = fill_price as i128 * fill_quantity.abs() as i128;
+            let total_quantity = self.quantity.abs() + fill_quantity.abs();
+
+            if total_quantity > 0 {
+                self.average_price = ((old_value + new_value) / total_quantity as i128) as u128;
+            }
+            self.quantity += fill_quantity;
+        } else {
+            // Closing position (opposite direction)
+            let close_quantity = fill_quantity.abs().min(self.quantity.abs());
+
+            // Calculate realized P&L
+            let price_diff = fill_price as i128 - self.average_price as i128;
+            if self.quantity > 0 {
+                // Long position being closed by sell
+                realized = (price_diff * close_quantity as i128) as i64;
+            } else {
+                // Short position being closed by buy
+                realized = (-price_diff * close_quantity as i128) as i64;
+            }
+
+            self.realized_pnl += realized;
+            self.quantity += fill_quantity;
+
+            // If position flipped, reset average price to fill price
+            if (self.quantity > 0 && fill_quantity > 0) || (self.quantity < 0 && fill_quantity < 0)
+            {
+                self.average_price = fill_price;
+            }
+        }
+
+        self.updated_at_ms = timestamp_ms;
+        realized
+    }
+
+    /// Calculates unrealized P&L given current market price.
+    #[must_use]
+    pub fn unrealized_pnl(&self, current_price: u128) -> i64 {
+        let price_diff = current_price as i128 - self.average_price as i128;
+        (price_diff * self.quantity as i128) as i64
+    }
+
+    /// Calculates notional value given current market price.
+    #[must_use]
+    pub fn notional_value(&self, current_price: u128) -> u128 {
+        current_price * self.quantity.unsigned_abs() as u128
+    }
+}
+
+/// Response for a single position.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PositionResponse {
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
+    pub symbol: String,
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Position quantity (positive = long, negative = short).
+    pub quantity: i64,
+    /// Average entry price in smallest units.
+    pub average_price: u128,
+    /// Current market price in smallest units.
+    pub current_price: u128,
+    /// Unrealized P&L in smallest units.
+    pub unrealized_pnl: i64,
+    /// Realized P&L in smallest units.
+    pub realized_pnl: i64,
+    /// Delta exposure (quantity * delta).
+    pub delta_exposure: f64,
+    /// Notional value (current_price * abs(quantity)).
+    pub notional_value: u128,
+}
+
+/// Summary of all positions.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PositionSummary {
+    /// Total unrealized P&L across all positions.
+    pub total_unrealized_pnl: i64,
+    /// Total realized P&L across all positions.
+    pub total_realized_pnl: i64,
+    /// Net delta exposure across all positions.
+    pub net_delta: f64,
+    /// Number of open positions.
+    pub position_count: usize,
+}
+
+/// Response for listing all positions.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PositionsListResponse {
+    /// List of positions.
+    pub positions: Vec<PositionResponse>,
+    /// Aggregate summary.
+    pub summary: PositionSummary,
+}
+
+/// Query parameters for listing positions.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PositionQuery {
+    /// Filter by underlying symbol.
+    #[serde(default)]
+    pub underlying: Option<String>,
 }
