@@ -23,8 +23,7 @@ use option_chain_orderbook_backend::db::{InsertPriceRequest, UpdateParametersReq
 use option_chain_orderbook_backend::models::{
     AddOrderRequest, AddOrderResponse, CancelOrderResponse, ExpirationSummary,
     ExpirationsListResponse, GlobalStatsResponse, HealthResponse, OrderBookSnapshotResponse,
-    OrderFillRecord, OrderInfo, OrderListQuery, OrderListResponse, OrderStatus, QuoteResponse,
-    StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
+    QuoteResponse, StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
 };
 
 /// OpenAPI documentation.
@@ -57,8 +56,6 @@ use option_chain_orderbook_backend::models::{
         option_chain_orderbook_backend::api::controls::get_latest_price,
         option_chain_orderbook_backend::api::controls::get_all_prices,
         option_chain_orderbook_backend::api::websocket::ws_handler,
-        option_chain_orderbook_backend::api::handlers::get_order_status,
-        option_chain_orderbook_backend::api::handlers::list_orders,
     ),
     components(
         schemas(
@@ -85,11 +82,6 @@ use option_chain_orderbook_backend::models::{
             InsertPriceRequest,
             InsertPriceResponse,
             LatestPriceResponse,
-            OrderInfo,
-            OrderStatus,
-            OrderFillRecord,
-            OrderListQuery,
-            OrderListResponse,
         )
     ),
     tags(

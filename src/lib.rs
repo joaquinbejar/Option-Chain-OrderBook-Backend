@@ -154,6 +154,5 @@ pub mod db;
 pub mod error;
 pub mod market_maker;
 pub mod models;
-pub mod order_tracker;
 pub mod simulation;
 pub mod state;
