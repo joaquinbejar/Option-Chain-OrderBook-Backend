@@ -161,10 +161,146 @@ impl AppState {
 
         Some(ExpirationDate::DateTime(utc_datetime))
     }
+
+    /// Removes filled or canceled orders older than the specified age.
+    ///
+    /// # Arguments
+    /// * `max_age_secs` - Maximum age in seconds for retention.
+    ///
+    /// # Returns
+    /// Number of orders removed.
+    pub fn cleanup_old_orders(&self, max_age_secs: u64) -> usize {
+        let threshold = chrono::Utc::now() - chrono::Duration::seconds(max_age_secs as i64);
+
+        // Identify keys to remove first to avoid deadlock or long holding of locks
+        // Dashmap creates deadlocks if you hold a read reference and try to remove.
+        // We collect keys first.
+        let keys_to_remove: Vec<String> = self
+            .orders
+            .iter()
+            .filter_map(|entry| {
+                let order = entry.value();
+                // Check status
+                if order.status == crate::models::OrderStatus::Filled
+                    || order.status == crate::models::OrderStatus::Canceled
+                {
+                    // Check age
+                    let updated = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                        order.updated_at_ms as i64,
+                    );
+                    if let Some(updated_dt) = updated {
+                        if updated_dt < threshold {
+                            return Some(entry.key().clone());
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        let count = keys_to_remove.len();
+        if count > 0 {
+            info!(
+                "Running order cleanup. Found {} old orders to remove",
+                count
+            );
+            for key in keys_to_remove {
+                self.orders.remove(&key);
+            }
+        }
+
+        count
+    }
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{OrderSide, OrderStatus, OrderTimeInForce};
+
+    #[test]
+    fn test_cleanup_old_orders() {
+        let state = AppState::new();
+        let now = chrono::Utc::now();
+        let old_time = now - chrono::Duration::seconds(1000);
+
+        // 1. Active order (should not be removed)
+        let active_order = OrderInfo {
+            order_id: "active1".to_string(),
+            symbol: "BTC".to_string(),
+            underlying: "BTC".to_string(),
+            expiration: "20251231".to_string(),
+            strike: 100000,
+            style: "call".to_string(),
+            side: OrderSide::Buy,
+            price: 50000,
+            original_quantity: 1,
+            remaining_quantity: 1,
+            filled_quantity: 0,
+            status: OrderStatus::Active,
+            time_in_force: OrderTimeInForce::Gtc,
+            created_at_ms: old_time.timestamp_millis() as u64,
+            updated_at_ms: old_time.timestamp_millis() as u64,
+            fills: vec![],
+        };
+        state.orders.insert("active1".to_string(), active_order);
+
+        // 2. Old filled order (should be removed)
+        let filled_order = OrderInfo {
+            order_id: "filled1".to_string(),
+            symbol: "BTC".to_string(),
+            underlying: "BTC".to_string(),
+            expiration: "20251231".to_string(),
+            strike: 100000,
+            style: "call".to_string(),
+            side: OrderSide::Buy,
+            price: 50000,
+            original_quantity: 1,
+            remaining_quantity: 0,
+            filled_quantity: 1,
+            status: OrderStatus::Filled,
+            time_in_force: OrderTimeInForce::Gtc,
+            created_at_ms: old_time.timestamp_millis() as u64,
+            updated_at_ms: old_time.timestamp_millis() as u64,
+            fills: vec![],
+        };
+        state.orders.insert("filled1".to_string(), filled_order);
+
+        // 3. Recent filled order (should not be removed yet)
+        let recent_filled = OrderInfo {
+            order_id: "filled_recent".to_string(),
+            symbol: "BTC".to_string(),
+            underlying: "BTC".to_string(),
+            expiration: "20251231".to_string(),
+            strike: 100000,
+            style: "call".to_string(),
+            side: OrderSide::Buy,
+            price: 50000,
+            original_quantity: 1,
+            remaining_quantity: 0,
+            filled_quantity: 1,
+            status: OrderStatus::Filled,
+            time_in_force: OrderTimeInForce::Gtc,
+            created_at_ms: now.timestamp_millis() as u64,
+            updated_at_ms: now.timestamp_millis() as u64,
+            fills: vec![],
+        };
+        state
+            .orders
+            .insert("filled_recent".to_string(), recent_filled);
+
+        // Run cleanup with 500s retention
+        let removed = state.cleanup_old_orders(500);
+
+        assert_eq!(removed, 1);
+        assert!(state.orders.contains_key("active1")); // Active kept
+        assert!(!state.orders.contains_key("filled1")); // Old filled removed
+        assert!(state.orders.contains_key("filled_recent")); // Recent filled kept
     }
 }
