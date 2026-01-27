@@ -25,7 +25,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Option Chain OrderBook library
-option-chain-orderbook = { path = "../Option-Chain-OrderBook" }
+option-chain-orderbook = "0.3"
 optionstratlib = "0.14"
 orderbook-rs = { version = "0.5", features = ["special_orders"] }
 
