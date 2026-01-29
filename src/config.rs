@@ -26,6 +26,9 @@ pub struct Config {
     pub server: ServerConfig,
     /// Price simulation configuration.
     pub simulation: SimulationConfig,
+    /// Cleanup configuration.
+    #[serde(default)]
+    pub cleanup: CleanupConfig,
     /// List of configured assets.
     pub assets: Vec<AssetConfig>,
 }
@@ -65,6 +68,24 @@ impl Default for SimulationConfig {
             enabled: true,
             interval_ms: 1000,
             walk_type: WalkTypeConfig::GeometricBrownian,
+        }
+    }
+}
+
+/// Cleanup configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CleanupConfig {
+    /// Interval in seconds between cleanup runs.
+    pub interval_seconds: u64,
+    /// Age in seconds after which filled/canceled orders are removed.
+    pub retention_seconds: u64,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            interval_seconds: 60,
+            retention_seconds: 300, // 5 minutes
         }
     }
 }
@@ -207,6 +228,7 @@ impl Default for Config {
         Self {
             server: ServerConfig::default(),
             simulation: SimulationConfig::default(),
+            cleanup: CleanupConfig::default(),
             assets: vec![AssetConfig {
                 symbol: "BTC".to_string(),
                 name: "Bitcoin".to_string(),
@@ -286,6 +308,7 @@ strike_spacing = 1000.0
         let config = Config {
             server: ServerConfig::default(),
             simulation: SimulationConfig::default(),
+            cleanup: CleanupConfig::default(),
             assets: vec![],
         };
         assert!(config.validate().is_err());
