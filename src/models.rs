@@ -1012,3 +1012,127 @@ pub struct ModifyOrderResponse {
     /// Descriptive message.
     pub message: String,
 }
+
+// ============================================================================
+// Bulk Order Operations Types
+// ============================================================================
+
+/// Individual order item in a bulk order request.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct BulkOrderItem {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Expiration date string (e.g., "20240329").
+    pub expiration: String,
+    /// Strike price.
+    pub strike: u64,
+    /// Option style: "call" or "put".
+    pub style: String,
+    /// Order side: "buy" or "sell".
+    pub side: String,
+    /// Limit price.
+    pub price: u128,
+    /// Order quantity.
+    pub quantity: u64,
+}
+
+/// Request for bulk order submission.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct BulkOrderRequest {
+    /// List of orders to submit.
+    pub orders: Vec<BulkOrderItem>,
+    /// If true, all orders must succeed or none will be submitted.
+    #[serde(default)]
+    pub atomic: bool,
+}
+
+/// Status of an individual order in a bulk operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BulkOrderStatus {
+    /// Order was accepted.
+    Accepted,
+    /// Order was rejected.
+    Rejected,
+}
+
+/// Result for an individual order in a bulk submission.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BulkOrderResultItem {
+    /// Index of the order in the request array.
+    pub index: usize,
+    /// Order ID if accepted.
+    pub order_id: Option<String>,
+    /// Status of the order.
+    pub status: BulkOrderStatus,
+    /// Error message if rejected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response for bulk order submission.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BulkOrderResponse {
+    /// Number of orders successfully submitted.
+    pub success_count: usize,
+    /// Number of orders that failed.
+    pub failure_count: usize,
+    /// Detailed results for each order.
+    pub results: Vec<BulkOrderResultItem>,
+}
+
+/// Request for bulk order cancellation.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct BulkCancelRequest {
+    /// List of order IDs to cancel.
+    pub order_ids: Vec<String>,
+}
+
+/// Result for an individual order cancellation.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BulkCancelResultItem {
+    /// Order ID that was attempted to cancel.
+    pub order_id: String,
+    /// Whether the cancellation was successful.
+    pub canceled: bool,
+    /// Error message if cancellation failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response for bulk order cancellation.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BulkCancelResponse {
+    /// Number of orders successfully canceled.
+    pub success_count: usize,
+    /// Number of orders that failed to cancel.
+    pub failure_count: usize,
+    /// Detailed results for each cancellation.
+    pub results: Vec<BulkCancelResultItem>,
+}
+
+/// Query parameters for cancel-all endpoint.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CancelAllQuery {
+    /// Filter by underlying symbol.
+    #[serde(default)]
+    pub underlying: Option<String>,
+    /// Filter by expiration date.
+    #[serde(default)]
+    pub expiration: Option<String>,
+    /// Filter by order side.
+    #[serde(default)]
+    pub side: Option<String>,
+    /// Filter by option style.
+    #[serde(default)]
+    pub style: Option<String>,
+}
+
+/// Response for cancel-all endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CancelAllResponse {
+    /// Number of orders successfully canceled.
+    pub canceled_count: usize,
+    /// Number of orders that failed to cancel.
+    pub failed_count: usize,
+}
