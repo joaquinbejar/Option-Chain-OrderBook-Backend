@@ -2,14 +2,14 @@
 
 use crate::error::ApiError;
 use crate::models::{
-    AddOrderRequest, AddOrderResponse, CancelOrderResponse, EnrichedSnapshotResponse,
-    ExpirationSummary, ExpirationsListResponse, FillInfo, GlobalStatsResponse, HealthResponse,
-    LastTradeResponse, MarketOrderRequest, MarketOrderResponse, MarketOrderStatus,
-    OrderBookSnapshotResponse, OrderInfo, OrderListQuery, OrderListResponse, OrderSide,
-    OrderStatus, OrderStatusResponse, PositionInfo, PositionQuery, PositionResponse,
-    PositionSummary, PositionsListResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth,
-    SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary,
-    UnderlyingsListResponse,
+    AddOrderRequest, AddOrderResponse, ApiTimeInForce, CancelOrderResponse,
+    EnrichedSnapshotResponse, ExpirationSummary, ExpirationsListResponse, FillInfo,
+    GlobalStatsResponse, HealthResponse, LastTradeResponse, LimitOrderStatus, MarketOrderRequest,
+    MarketOrderResponse, MarketOrderStatus, OrderBookSnapshotResponse, OrderInfo, OrderListQuery,
+    OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse, PositionInfo, PositionQuery,
+    PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo, QuoteResponse,
+    SnapshotDepth, SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse,
+    UnderlyingSummary, UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -17,7 +17,7 @@ use axum::extract::Query;
 use axum::extract::{Path, State};
 use option_chain_orderbook::orderbook::Quote;
 use optionstratlib::{ExpirationDate, OptionStyle};
-use orderbook_rs::{OrderId, Side};
+use orderbook_rs::{OrderId, Side, TimeInForce};
 use std::sync::Arc;
 
 /// Converts a Quote to QuoteResponse.
@@ -546,20 +546,59 @@ pub async fn add_order(
     let option_style = parse_option_style(&style)?;
     let side = order_side_to_side(body.side);
 
+    // Convert API TimeInForce to orderbook-rs TimeInForce
+    let tif = match body.time_in_force.unwrap_or_default() {
+        ApiTimeInForce::Gtc => TimeInForce::Gtc,
+        ApiTimeInForce::Ioc => TimeInForce::Ioc,
+        ApiTimeInForce::Fok => TimeInForce::Fok,
+        ApiTimeInForce::Gtd => {
+            // Parse expire_at timestamp for GTD orders
+            let expire_ms = if let Some(expire_str) = &body.expire_at {
+                chrono::DateTime::parse_from_rfc3339(expire_str)
+                    .map(|dt| dt.timestamp_millis() as u64)
+                    .unwrap_or(0)
+            } else {
+                0 // Default to 0 if no expiration provided
+            };
+            TimeInForce::Gtd(expire_ms)
+        }
+    };
+
     let underlying_book = state.manager.get_or_create(&underlying);
     let exp_book = underlying_book.get_or_create_expiration(expiration);
     let strike_book = exp_book.get_or_create_strike(strike);
     let option_book = strike_book.get(option_style);
 
     let order_id = OrderId::new();
-    option_book
-        .add_limit_order(order_id, side, body.price, body.quantity)
-        .map_err(|e| ApiError::OrderBook(e.to_string()))?;
 
-    Ok(Json(AddOrderResponse {
-        order_id: order_id.to_string(),
-        message: "Order added successfully".to_string(),
-    }))
+    // Use add_limit_order_with_tif for TIF support
+    match option_book.add_limit_order_with_tif(order_id, side, body.price, body.quantity, tif) {
+        Ok(()) => {
+            // For GTC orders, the order is accepted and placed in the book
+            Ok(Json(AddOrderResponse {
+                order_id: order_id.to_string(),
+                status: LimitOrderStatus::Accepted,
+                filled_quantity: 0,
+                remaining_quantity: body.quantity,
+                message: format!("Order added successfully with TIF={}", tif),
+            }))
+        }
+        Err(e) => {
+            let error_str = e.to_string();
+            // Check if it's an IOC/FOK rejection due to insufficient liquidity
+            if error_str.contains("InsufficientLiquidity") || error_str.contains("insufficient") {
+                Ok(Json(AddOrderResponse {
+                    order_id: order_id.to_string(),
+                    status: LimitOrderStatus::Rejected,
+                    filled_quantity: 0,
+                    remaining_quantity: body.quantity,
+                    message: format!("Order rejected: {}", error_str),
+                }))
+            } else {
+                Err(ApiError::OrderBook(error_str))
+            }
+        }
+    }
 }
 
 /// Cancel order from option book.
@@ -2303,5 +2342,128 @@ mod tests {
         // Current price is 600, so unrealized P&L = (600 - 500) * -100 = -10000 (loss)
         let unrealized_loss = position.unrealized_pnl(600);
         assert_eq!(unrealized_loss, -10000);
+    }
+
+    #[test]
+    fn test_api_time_in_force_serialization() {
+        use crate::models::ApiTimeInForce;
+
+        let gtc = ApiTimeInForce::Gtc;
+        let json = serde_json::to_string(&gtc).unwrap();
+        assert_eq!(json, "\"GTC\"");
+
+        let ioc = ApiTimeInForce::Ioc;
+        let json = serde_json::to_string(&ioc).unwrap();
+        assert_eq!(json, "\"IOC\"");
+
+        let fok = ApiTimeInForce::Fok;
+        let json = serde_json::to_string(&fok).unwrap();
+        assert_eq!(json, "\"FOK\"");
+
+        let gtd = ApiTimeInForce::Gtd;
+        let json = serde_json::to_string(&gtd).unwrap();
+        assert_eq!(json, "\"GTD\"");
+    }
+
+    #[test]
+    fn test_api_time_in_force_deserialization() {
+        use crate::models::ApiTimeInForce;
+
+        let gtc: ApiTimeInForce = serde_json::from_str("\"GTC\"").unwrap();
+        assert_eq!(gtc, ApiTimeInForce::Gtc);
+
+        let ioc: ApiTimeInForce = serde_json::from_str("\"IOC\"").unwrap();
+        assert_eq!(ioc, ApiTimeInForce::Ioc);
+
+        let fok: ApiTimeInForce = serde_json::from_str("\"FOK\"").unwrap();
+        assert_eq!(fok, ApiTimeInForce::Fok);
+
+        let gtd: ApiTimeInForce = serde_json::from_str("\"GTD\"").unwrap();
+        assert_eq!(gtd, ApiTimeInForce::Gtd);
+    }
+
+    #[test]
+    fn test_api_time_in_force_default() {
+        use crate::models::ApiTimeInForce;
+
+        let default = ApiTimeInForce::default();
+        assert_eq!(default, ApiTimeInForce::Gtc);
+    }
+
+    #[test]
+    fn test_limit_order_status_serialization() {
+        use crate::models::LimitOrderStatus;
+
+        let accepted = LimitOrderStatus::Accepted;
+        let json = serde_json::to_string(&accepted).unwrap();
+        assert_eq!(json, "\"accepted\"");
+
+        let filled = LimitOrderStatus::Filled;
+        let json = serde_json::to_string(&filled).unwrap();
+        assert_eq!(json, "\"filled\"");
+
+        let partial = LimitOrderStatus::Partial;
+        let json = serde_json::to_string(&partial).unwrap();
+        assert_eq!(json, "\"partial\"");
+
+        let rejected = LimitOrderStatus::Rejected;
+        let json = serde_json::to_string(&rejected).unwrap();
+        assert_eq!(json, "\"rejected\"");
+    }
+
+    #[test]
+    fn test_add_order_request_with_tif() {
+        use crate::models::{AddOrderRequest, ApiTimeInForce, OrderSide};
+
+        // Test with explicit TIF
+        let json = r#"{"side":"buy","price":100,"quantity":10,"time_in_force":"IOC"}"#;
+        let request: AddOrderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.side, OrderSide::Buy);
+        assert_eq!(request.price, 100);
+        assert_eq!(request.quantity, 10);
+        assert_eq!(request.time_in_force, Some(ApiTimeInForce::Ioc));
+    }
+
+    #[test]
+    fn test_add_order_request_default_tif() {
+        use crate::models::{AddOrderRequest, OrderSide};
+
+        // Test without TIF (should default to None, which means GTC)
+        let json = r#"{"side":"sell","price":200,"quantity":5}"#;
+        let request: AddOrderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.side, OrderSide::Sell);
+        assert_eq!(request.price, 200);
+        assert_eq!(request.quantity, 5);
+        assert_eq!(request.time_in_force, None);
+    }
+
+    #[test]
+    fn test_add_order_request_with_expire_at() {
+        use crate::models::{AddOrderRequest, ApiTimeInForce, OrderSide};
+
+        let json = r#"{"side":"buy","price":100,"quantity":10,"time_in_force":"GTD","expire_at":"2024-12-31T16:00:00Z"}"#;
+        let request: AddOrderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.side, OrderSide::Buy);
+        assert_eq!(request.time_in_force, Some(ApiTimeInForce::Gtd));
+        assert_eq!(request.expire_at, Some("2024-12-31T16:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn test_add_order_response_serialization() {
+        use crate::models::{AddOrderResponse, LimitOrderStatus};
+
+        let response = AddOrderResponse {
+            order_id: "test-order-123".to_string(),
+            status: LimitOrderStatus::Accepted,
+            filled_quantity: 0,
+            remaining_quantity: 100,
+            message: "Order added successfully".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"order_id\":\"test-order-123\""));
+        assert!(json.contains("\"status\":\"accepted\""));
+        assert!(json.contains("\"filled_quantity\":0"));
+        assert!(json.contains("\"remaining_quantity\":100"));
     }
 }
