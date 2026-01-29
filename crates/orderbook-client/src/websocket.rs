@@ -126,6 +126,24 @@ pub enum WsMessage {
         /// Error message.
         message: String,
     },
+    /// Trade execution notification.
+    #[serde(rename = "trade")]
+    Trade {
+        /// Unique trade identifier.
+        trade_id: String,
+        /// Symbol identifier.
+        symbol: String,
+        /// Execution price in smallest units.
+        price: u128,
+        /// Executed quantity.
+        quantity: u64,
+        /// Timestamp in milliseconds since epoch.
+        timestamp_ms: u64,
+        /// Maker order identifier.
+        maker_order_id: String,
+        /// Taker order identifier.
+        taker_order_id: String,
+    },
 }
 
 /// Price level data for snapshots.
@@ -210,6 +228,30 @@ impl ClientCommand {
         Self {
             action: "unsubscribe".to_string(),
             channel: Some("orderbook".to_string()),
+            symbol: Some(symbol.to_string()),
+            depth: None,
+            value: None,
+        }
+    }
+
+    /// Creates a trades subscribe command.
+    #[must_use]
+    pub fn subscribe_trades(symbol: &str) -> Self {
+        Self {
+            action: "subscribe".to_string(),
+            channel: Some("trades".to_string()),
+            symbol: Some(symbol.to_string()),
+            depth: None,
+            value: None,
+        }
+    }
+
+    /// Creates a trades unsubscribe command.
+    #[must_use]
+    pub fn unsubscribe_trades(symbol: &str) -> Self {
+        Self {
+            action: "unsubscribe".to_string(),
+            channel: Some("trades".to_string()),
             symbol: Some(symbol.to_string()),
             depth: None,
             value: None,
@@ -391,5 +433,24 @@ impl WsClient {
     pub async fn unsubscribe_orderbook(&self, symbol: &str) -> Result<(), Error> {
         self.send(ClientCommand::unsubscribe_orderbook(symbol))
             .await
+    }
+
+    /// Subscribes to trade updates for a symbol.
+    ///
+    /// # Arguments
+    /// * `symbol` - Symbol in format "UNDERLYING-EXPIRATION-STRIKE-STYLE"
+    ///
+    /// # Errors
+    /// Returns error if the send fails.
+    pub async fn subscribe_trades(&self, symbol: &str) -> Result<(), Error> {
+        self.send(ClientCommand::subscribe_trades(symbol)).await
+    }
+
+    /// Unsubscribes from trade updates for a symbol.
+    ///
+    /// # Errors
+    /// Returns error if the send fails.
+    pub async fn unsubscribe_trades(&self, symbol: &str) -> Result<(), Error> {
+        self.send(ClientCommand::unsubscribe_trades(symbol)).await
     }
 }
