@@ -69,7 +69,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/orders/{order_id}",
-            delete(handlers::cancel_order),
+            delete(handlers::cancel_order).patch(handlers::modify_order),
         )
         .route(
             "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/quote",

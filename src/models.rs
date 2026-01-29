@@ -961,3 +961,54 @@ pub struct OhlcResponse {
     /// List of OHLC bars.
     pub bars: Vec<OhlcBar>,
 }
+
+// ============================================================================
+// Order Modification Types
+// ============================================================================
+
+/// Request to modify an existing order.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct ModifyOrderRequest {
+    /// New price for the order (optional).
+    #[serde(default)]
+    pub price: Option<u128>,
+    /// New quantity for the order (optional).
+    #[serde(default)]
+    pub quantity: Option<u64>,
+}
+
+/// Status of an order modification request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ModifyOrderStatus {
+    /// Order was successfully modified.
+    Modified,
+    /// Order modification was rejected.
+    Rejected,
+}
+
+impl std::fmt::Display for ModifyOrderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Modified => write!(f, "modified"),
+            Self::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
+/// Response after modifying an order.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ModifyOrderResponse {
+    /// The order ID that was modified.
+    pub order_id: String,
+    /// Status of the modification.
+    pub status: ModifyOrderStatus,
+    /// New price after modification (if changed).
+    pub new_price: Option<u128>,
+    /// New quantity after modification (if changed).
+    pub new_quantity: Option<u64>,
+    /// Whether the order lost time priority due to the modification.
+    pub priority_changed: bool,
+    /// Descriptive message.
+    pub message: String,
+}
