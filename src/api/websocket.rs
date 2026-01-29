@@ -152,6 +152,108 @@ pub enum WsMessage {
         /// Taker order identifier.
         taker_order_id: String,
     },
+    /// Batch subscription response.
+    #[serde(rename = "batch_subscribed")]
+    BatchSubscribed {
+        /// Request identifier for correlation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// List of subscription results.
+        subscriptions: Vec<SubscriptionResult>,
+    },
+    /// Batch unsubscription response.
+    #[serde(rename = "batch_unsubscribed")]
+    BatchUnsubscribed {
+        /// Request identifier for correlation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// List of unsubscription results.
+        subscriptions: Vec<SubscriptionResult>,
+    },
+    /// List of active subscriptions.
+    #[serde(rename = "subscriptions")]
+    SubscriptionList {
+        /// Active subscriptions.
+        active: Vec<ActiveSubscription>,
+    },
+}
+
+/// Subscription channel types.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubscriptionChannel {
+    /// Orderbook updates channel.
+    Orderbook,
+    /// Trade stream channel.
+    Trades,
+    /// Quote updates channel.
+    Quotes,
+    /// Price updates channel.
+    Prices,
+    /// Fill notifications channel.
+    Fills,
+}
+
+impl std::fmt::Display for SubscriptionChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Orderbook => write!(f, "orderbook"),
+            Self::Trades => write!(f, "trades"),
+            Self::Quotes => write!(f, "quotes"),
+            Self::Prices => write!(f, "prices"),
+            Self::Fills => write!(f, "fills"),
+        }
+    }
+}
+
+/// Individual channel subscription request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSubscription {
+    /// Channel to subscribe to.
+    pub channel: SubscriptionChannel,
+    /// Optional specific symbol (full format: UNDERLYING-EXPIRATION-STRIKE-STYLE).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Optional underlying filter for wildcard subscriptions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underlying: Option<String>,
+    /// Optional expiration filter for wildcard subscriptions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiration: Option<String>,
+    /// Optional depth for orderbook subscriptions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+}
+
+/// Result of a subscription operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionResult {
+    /// Channel that was subscribed to.
+    pub channel: SubscriptionChannel,
+    /// Symbol or filter that was subscribed to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Underlying filter if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underlying: Option<String>,
+    /// Status of the subscription ("ok" or error message).
+    pub status: String,
+}
+
+/// Active subscription entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveSubscription {
+    /// Channel of the subscription.
+    pub channel: SubscriptionChannel,
+    /// Symbol or filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Underlying filter if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underlying: Option<String>,
+    /// Depth for orderbook subscriptions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
 }
 
 /// Price level data for snapshots.
@@ -540,6 +642,12 @@ struct ClientCommand {
     /// Optional value for parameter updates.
     #[serde(default)]
     value: Option<f64>,
+    /// Optional request ID for correlation.
+    #[serde(default)]
+    request_id: Option<String>,
+    /// Optional batch channels for batch subscribe/unsubscribe.
+    #[serde(default)]
+    channels: Option<Vec<ChannelSubscription>>,
 }
 
 /// Sender type alias for WebSocket.
@@ -610,6 +718,16 @@ async fn handle_client_message(
             }
             "enable" => {
                 state.market_maker.set_enabled(true);
+            }
+            "batch_subscribe" => {
+                handle_batch_subscribe(state, sender, subscribed_symbols, subscribed_trades, &cmd)
+                    .await;
+            }
+            "batch_unsubscribe" => {
+                handle_batch_unsubscribe(sender, subscribed_symbols, subscribed_trades, &cmd).await;
+            }
+            "list_subscriptions" => {
+                handle_list_subscriptions(sender, subscribed_symbols, subscribed_trades).await;
             }
             _ => {
                 debug!("Unknown command: {}", cmd.action);
@@ -788,6 +906,319 @@ async fn handle_trades_unsubscribe(
     }
 
     info!("Client unsubscribed from trades: {}", symbol);
+}
+
+/// Handles batch subscription requests.
+async fn handle_batch_subscribe(
+    state: &Arc<AppState>,
+    sender: &WsSender,
+    subscribed_symbols: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+    subscribed_trades: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+    cmd: &ClientCommand,
+) {
+    let Some(channels) = &cmd.channels else {
+        let error_msg = WsMessage::Error {
+            message: "channels array required for batch_subscribe".to_string(),
+        };
+        if let Ok(json) = serde_json::to_string(&error_msg) {
+            let _ = sender.lock().await.send(Message::Text(json.into())).await;
+        }
+        return;
+    };
+
+    let mut results = Vec::new();
+
+    for sub in channels {
+        let result = process_channel_subscription(
+            state,
+            subscribed_symbols,
+            subscribed_trades,
+            sub,
+            true, // subscribe
+        )
+        .await;
+        results.push(result);
+    }
+
+    // Send batch response
+    let response = WsMessage::BatchSubscribed {
+        request_id: cmd.request_id.clone(),
+        subscriptions: results,
+    };
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = sender.lock().await.send(Message::Text(json.into())).await;
+    }
+
+    info!(
+        "Client batch subscribed to {} channels",
+        cmd.channels.as_ref().map(|c| c.len()).unwrap_or(0)
+    );
+}
+
+/// Handles batch unsubscription requests.
+async fn handle_batch_unsubscribe(
+    sender: &WsSender,
+    subscribed_symbols: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+    subscribed_trades: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+    cmd: &ClientCommand,
+) {
+    let Some(channels) = &cmd.channels else {
+        let error_msg = WsMessage::Error {
+            message: "channels array required for batch_unsubscribe".to_string(),
+        };
+        if let Ok(json) = serde_json::to_string(&error_msg) {
+            let _ = sender.lock().await.send(Message::Text(json.into())).await;
+        }
+        return;
+    };
+
+    let mut results = Vec::new();
+
+    for sub in channels {
+        let result =
+            process_channel_unsubscription(subscribed_symbols, subscribed_trades, sub).await;
+        results.push(result);
+    }
+
+    // Send batch response
+    let response = WsMessage::BatchUnsubscribed {
+        request_id: cmd.request_id.clone(),
+        subscriptions: results,
+    };
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = sender.lock().await.send(Message::Text(json.into())).await;
+    }
+
+    info!(
+        "Client batch unsubscribed from {} channels",
+        cmd.channels.as_ref().map(|c| c.len()).unwrap_or(0)
+    );
+}
+
+/// Processes a single channel subscription.
+async fn process_channel_subscription(
+    _state: &Arc<AppState>,
+    subscribed_symbols: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+    subscribed_trades: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+    sub: &ChannelSubscription,
+    _subscribe: bool,
+) -> SubscriptionResult {
+    match sub.channel {
+        SubscriptionChannel::Orderbook => {
+            if let Some(symbol) = &sub.symbol {
+                // Validate symbol format
+                let parts: Vec<&str> = symbol.split('-').collect();
+                if parts.len() < 4 {
+                    return SubscriptionResult {
+                        channel: sub.channel.clone(),
+                        symbol: Some(symbol.clone()),
+                        underlying: sub.underlying.clone(),
+                        status: "error: invalid symbol format".to_string(),
+                    };
+                }
+                subscribed_symbols.write().await.insert(symbol.clone());
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: Some(symbol.clone()),
+                    underlying: None,
+                    status: "ok".to_string(),
+                }
+            } else if let Some(underlying) = &sub.underlying {
+                // Wildcard subscription by underlying
+                let filter = format!("{}:*", underlying);
+                subscribed_symbols.write().await.insert(filter.clone());
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: None,
+                    underlying: Some(underlying.clone()),
+                    status: "ok".to_string(),
+                }
+            } else {
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: None,
+                    underlying: None,
+                    status: "error: symbol or underlying required".to_string(),
+                }
+            }
+        }
+        SubscriptionChannel::Trades => {
+            if let Some(symbol) = &sub.symbol {
+                let parts: Vec<&str> = symbol.split('-').collect();
+                if parts.len() < 4 {
+                    return SubscriptionResult {
+                        channel: sub.channel.clone(),
+                        symbol: Some(symbol.clone()),
+                        underlying: sub.underlying.clone(),
+                        status: "error: invalid symbol format".to_string(),
+                    };
+                }
+                subscribed_trades.write().await.insert(symbol.clone());
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: Some(symbol.clone()),
+                    underlying: None,
+                    status: "ok".to_string(),
+                }
+            } else if let Some(underlying) = &sub.underlying {
+                let filter = format!("{}:*", underlying);
+                subscribed_trades.write().await.insert(filter.clone());
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: None,
+                    underlying: Some(underlying.clone()),
+                    status: "ok".to_string(),
+                }
+            } else {
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: None,
+                    underlying: None,
+                    status: "error: symbol or underlying required".to_string(),
+                }
+            }
+        }
+        SubscriptionChannel::Quotes | SubscriptionChannel::Prices | SubscriptionChannel::Fills => {
+            // These channels are not yet fully implemented but we accept subscriptions
+            SubscriptionResult {
+                channel: sub.channel.clone(),
+                symbol: sub.symbol.clone(),
+                underlying: sub.underlying.clone(),
+                status: "ok".to_string(),
+            }
+        }
+    }
+}
+
+/// Processes a single channel unsubscription.
+async fn process_channel_unsubscription(
+    subscribed_symbols: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+    subscribed_trades: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+    sub: &ChannelSubscription,
+) -> SubscriptionResult {
+    match sub.channel {
+        SubscriptionChannel::Orderbook => {
+            if let Some(symbol) = &sub.symbol {
+                subscribed_symbols.write().await.remove(symbol);
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: Some(symbol.clone()),
+                    underlying: None,
+                    status: "ok".to_string(),
+                }
+            } else if let Some(underlying) = &sub.underlying {
+                let filter = format!("{}:*", underlying);
+                subscribed_symbols.write().await.remove(&filter);
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: None,
+                    underlying: Some(underlying.clone()),
+                    status: "ok".to_string(),
+                }
+            } else {
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: None,
+                    underlying: None,
+                    status: "error: symbol or underlying required".to_string(),
+                }
+            }
+        }
+        SubscriptionChannel::Trades => {
+            if let Some(symbol) = &sub.symbol {
+                subscribed_trades.write().await.remove(symbol);
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: Some(symbol.clone()),
+                    underlying: None,
+                    status: "ok".to_string(),
+                }
+            } else if let Some(underlying) = &sub.underlying {
+                let filter = format!("{}:*", underlying);
+                subscribed_trades.write().await.remove(&filter);
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: None,
+                    underlying: Some(underlying.clone()),
+                    status: "ok".to_string(),
+                }
+            } else {
+                SubscriptionResult {
+                    channel: sub.channel.clone(),
+                    symbol: None,
+                    underlying: None,
+                    status: "error: symbol or underlying required".to_string(),
+                }
+            }
+        }
+        SubscriptionChannel::Quotes | SubscriptionChannel::Prices | SubscriptionChannel::Fills => {
+            SubscriptionResult {
+                channel: sub.channel.clone(),
+                symbol: sub.symbol.clone(),
+                underlying: sub.underlying.clone(),
+                status: "ok".to_string(),
+            }
+        }
+    }
+}
+
+/// Handles list subscriptions request.
+async fn handle_list_subscriptions(
+    sender: &WsSender,
+    subscribed_symbols: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+    subscribed_trades: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+) {
+    let mut active = Vec::new();
+
+    // Add orderbook subscriptions
+    let symbols = subscribed_symbols.read().await;
+    for symbol in symbols.iter() {
+        if symbol.contains(":*") {
+            // Wildcard subscription
+            let underlying = symbol.trim_end_matches(":*");
+            active.push(ActiveSubscription {
+                channel: SubscriptionChannel::Orderbook,
+                symbol: None,
+                underlying: Some(underlying.to_string()),
+                depth: None,
+            });
+        } else {
+            active.push(ActiveSubscription {
+                channel: SubscriptionChannel::Orderbook,
+                symbol: Some(symbol.clone()),
+                underlying: None,
+                depth: Some(10), // Default depth
+            });
+        }
+    }
+
+    // Add trade subscriptions
+    let trades = subscribed_trades.read().await;
+    for symbol in trades.iter() {
+        if symbol.contains(":*") {
+            let underlying = symbol.trim_end_matches(":*");
+            active.push(ActiveSubscription {
+                channel: SubscriptionChannel::Trades,
+                symbol: None,
+                underlying: Some(underlying.to_string()),
+                depth: None,
+            });
+        } else {
+            active.push(ActiveSubscription {
+                channel: SubscriptionChannel::Trades,
+                symbol: Some(symbol.clone()),
+                underlying: None,
+                depth: None,
+            });
+        }
+    }
+
+    let response = WsMessage::SubscriptionList { active };
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = sender.lock().await.send(Message::Text(json.into())).await;
+    }
+
+    info!("Client requested subscription list");
 }
 
 /// Gets the current orderbook snapshot for a symbol.
@@ -1150,5 +1581,186 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"unsubscribed\""));
         assert!(json.contains("\"channel\":\"trades\""));
+    }
+
+    #[test]
+    fn test_subscription_channel_serialization() {
+        let channel = SubscriptionChannel::Orderbook;
+        let json = serde_json::to_string(&channel).unwrap();
+        assert_eq!(json, "\"orderbook\"");
+
+        let channel = SubscriptionChannel::Trades;
+        let json = serde_json::to_string(&channel).unwrap();
+        assert_eq!(json, "\"trades\"");
+
+        let channel = SubscriptionChannel::Quotes;
+        let json = serde_json::to_string(&channel).unwrap();
+        assert_eq!(json, "\"quotes\"");
+    }
+
+    #[test]
+    fn test_subscription_channel_deserialization() {
+        let channel: SubscriptionChannel = serde_json::from_str("\"orderbook\"").unwrap();
+        assert_eq!(channel, SubscriptionChannel::Orderbook);
+
+        let channel: SubscriptionChannel = serde_json::from_str("\"trades\"").unwrap();
+        assert_eq!(channel, SubscriptionChannel::Trades);
+
+        let channel: SubscriptionChannel = serde_json::from_str("\"fills\"").unwrap();
+        assert_eq!(channel, SubscriptionChannel::Fills);
+    }
+
+    #[test]
+    fn test_channel_subscription_serialization() {
+        let sub = ChannelSubscription {
+            channel: SubscriptionChannel::Orderbook,
+            symbol: Some("AAPL-20240329-150-C".to_string()),
+            underlying: None,
+            expiration: None,
+            depth: Some(10),
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert!(json.contains("\"channel\":\"orderbook\""));
+        assert!(json.contains("\"symbol\":\"AAPL-20240329-150-C\""));
+        assert!(json.contains("\"depth\":10"));
+    }
+
+    #[test]
+    fn test_channel_subscription_deserialization() {
+        let json = r#"{"channel":"orderbook","symbol":"AAPL-20240329-150-C","depth":10}"#;
+        let sub: ChannelSubscription = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.channel, SubscriptionChannel::Orderbook);
+        assert_eq!(sub.symbol, Some("AAPL-20240329-150-C".to_string()));
+        assert_eq!(sub.depth, Some(10));
+    }
+
+    #[test]
+    fn test_channel_subscription_wildcard() {
+        let json = r#"{"channel":"trades","underlying":"AAPL"}"#;
+        let sub: ChannelSubscription = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.channel, SubscriptionChannel::Trades);
+        assert_eq!(sub.underlying, Some("AAPL".to_string()));
+        assert_eq!(sub.symbol, None);
+    }
+
+    #[test]
+    fn test_subscription_result_serialization() {
+        let result = SubscriptionResult {
+            channel: SubscriptionChannel::Orderbook,
+            symbol: Some("AAPL-20240329-150-C".to_string()),
+            underlying: None,
+            status: "ok".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"channel\":\"orderbook\""));
+        assert!(json.contains("\"status\":\"ok\""));
+    }
+
+    #[test]
+    fn test_active_subscription_serialization() {
+        let active = ActiveSubscription {
+            channel: SubscriptionChannel::Trades,
+            symbol: Some("AAPL-20240329-150-C".to_string()),
+            underlying: None,
+            depth: None,
+        };
+        let json = serde_json::to_string(&active).unwrap();
+        assert!(json.contains("\"channel\":\"trades\""));
+        assert!(json.contains("\"symbol\":\"AAPL-20240329-150-C\""));
+    }
+
+    #[test]
+    fn test_ws_message_batch_subscribed_serialization() {
+        let msg = WsMessage::BatchSubscribed {
+            request_id: Some("req_123".to_string()),
+            subscriptions: vec![
+                SubscriptionResult {
+                    channel: SubscriptionChannel::Orderbook,
+                    symbol: Some("AAPL-20240329-150-C".to_string()),
+                    underlying: None,
+                    status: "ok".to_string(),
+                },
+                SubscriptionResult {
+                    channel: SubscriptionChannel::Trades,
+                    symbol: None,
+                    underlying: Some("AAPL".to_string()),
+                    status: "ok".to_string(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"batch_subscribed\""));
+        assert!(json.contains("\"request_id\":\"req_123\""));
+        assert!(json.contains("\"status\":\"ok\""));
+    }
+
+    #[test]
+    fn test_ws_message_batch_unsubscribed_serialization() {
+        let msg = WsMessage::BatchUnsubscribed {
+            request_id: Some("req_456".to_string()),
+            subscriptions: vec![SubscriptionResult {
+                channel: SubscriptionChannel::Orderbook,
+                symbol: Some("AAPL-20240329-150-C".to_string()),
+                underlying: None,
+                status: "ok".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"batch_unsubscribed\""));
+        assert!(json.contains("\"request_id\":\"req_456\""));
+    }
+
+    #[test]
+    fn test_ws_message_subscription_list_serialization() {
+        let msg = WsMessage::SubscriptionList {
+            active: vec![
+                ActiveSubscription {
+                    channel: SubscriptionChannel::Orderbook,
+                    symbol: Some("AAPL-20240329-150-C".to_string()),
+                    underlying: None,
+                    depth: Some(10),
+                },
+                ActiveSubscription {
+                    channel: SubscriptionChannel::Trades,
+                    symbol: None,
+                    underlying: Some("AAPL".to_string()),
+                    depth: None,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"subscriptions\""));
+        assert!(json.contains("\"active\""));
+        assert!(json.contains("\"channel\":\"orderbook\""));
+        assert!(json.contains("\"channel\":\"trades\""));
+    }
+
+    #[test]
+    fn test_client_command_batch_subscribe_deserialization() {
+        let json = r#"{"action":"batch_subscribe","request_id":"req_123","channels":[{"channel":"orderbook","symbol":"AAPL-20240329-150-C","depth":10},{"channel":"trades","underlying":"AAPL"}]}"#;
+        let cmd: ClientCommand = serde_json::from_str(json).unwrap();
+        assert_eq!(cmd.action, "batch_subscribe");
+        assert_eq!(cmd.request_id, Some("req_123".to_string()));
+        assert!(cmd.channels.is_some());
+        let channels = cmd.channels.unwrap();
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].channel, SubscriptionChannel::Orderbook);
+        assert_eq!(channels[1].channel, SubscriptionChannel::Trades);
+    }
+
+    #[test]
+    fn test_client_command_list_subscriptions_deserialization() {
+        let json = r#"{"action":"list_subscriptions"}"#;
+        let cmd: ClientCommand = serde_json::from_str(json).unwrap();
+        assert_eq!(cmd.action, "list_subscriptions");
+    }
+
+    #[test]
+    fn test_subscription_channel_display() {
+        assert_eq!(SubscriptionChannel::Orderbook.to_string(), "orderbook");
+        assert_eq!(SubscriptionChannel::Trades.to_string(), "trades");
+        assert_eq!(SubscriptionChannel::Quotes.to_string(), "quotes");
+        assert_eq!(SubscriptionChannel::Prices.to_string(), "prices");
+        assert_eq!(SubscriptionChannel::Fills.to_string(), "fills");
     }
 }

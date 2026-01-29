@@ -144,6 +144,96 @@ pub enum WsMessage {
         /// Taker order identifier.
         taker_order_id: String,
     },
+    /// Batch subscription response.
+    #[serde(rename = "batch_subscribed")]
+    BatchSubscribed {
+        /// Request identifier for correlation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// List of subscription results.
+        subscriptions: Vec<SubscriptionResult>,
+    },
+    /// Batch unsubscription response.
+    #[serde(rename = "batch_unsubscribed")]
+    BatchUnsubscribed {
+        /// Request identifier for correlation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// List of unsubscription results.
+        subscriptions: Vec<SubscriptionResult>,
+    },
+    /// List of active subscriptions.
+    #[serde(rename = "subscriptions")]
+    SubscriptionList {
+        /// Active subscriptions.
+        active: Vec<ActiveSubscription>,
+    },
+}
+
+/// Subscription channel types.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubscriptionChannel {
+    /// Orderbook updates channel.
+    Orderbook,
+    /// Trade stream channel.
+    Trades,
+    /// Quote updates channel.
+    Quotes,
+    /// Price updates channel.
+    Prices,
+    /// Fill notifications channel.
+    Fills,
+}
+
+/// Individual channel subscription request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSubscription {
+    /// Channel to subscribe to.
+    pub channel: SubscriptionChannel,
+    /// Optional specific symbol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Optional underlying filter for wildcard subscriptions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underlying: Option<String>,
+    /// Optional expiration filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiration: Option<String>,
+    /// Optional depth for orderbook subscriptions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+}
+
+/// Result of a subscription operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionResult {
+    /// Channel that was subscribed to.
+    pub channel: SubscriptionChannel,
+    /// Symbol or filter that was subscribed to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Underlying filter if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underlying: Option<String>,
+    /// Status of the subscription.
+    pub status: String,
+}
+
+/// Active subscription entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveSubscription {
+    /// Channel of the subscription.
+    pub channel: SubscriptionChannel,
+    /// Symbol or filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Underlying filter if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underlying: Option<String>,
+    /// Depth for orderbook subscriptions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
 }
 
 /// Price level data for snapshots.
@@ -183,6 +273,12 @@ pub struct ClientCommand {
     /// Optional value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
+    /// Optional request ID for correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Optional batch channels for batch subscribe/unsubscribe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<Vec<ChannelSubscription>>,
 }
 
 impl ClientCommand {
@@ -195,6 +291,8 @@ impl ClientCommand {
             symbol: Some(symbol.to_string()),
             depth: None,
             value: None,
+            request_id: None,
+            channels: None,
         }
     }
 
@@ -207,6 +305,8 @@ impl ClientCommand {
             symbol: Some(symbol.to_string()),
             depth,
             value: None,
+            request_id: None,
+            channels: None,
         }
     }
 
@@ -219,6 +319,8 @@ impl ClientCommand {
             symbol: Some(symbol.to_string()),
             depth: None,
             value: None,
+            request_id: None,
+            channels: None,
         }
     }
 
@@ -231,6 +333,8 @@ impl ClientCommand {
             symbol: Some(symbol.to_string()),
             depth: None,
             value: None,
+            request_id: None,
+            channels: None,
         }
     }
 
@@ -243,6 +347,8 @@ impl ClientCommand {
             symbol: Some(symbol.to_string()),
             depth: None,
             value: None,
+            request_id: None,
+            channels: None,
         }
     }
 
@@ -255,6 +361,8 @@ impl ClientCommand {
             symbol: Some(symbol.to_string()),
             depth: None,
             value: None,
+            request_id: None,
+            channels: None,
         }
     }
 
@@ -267,6 +375,8 @@ impl ClientCommand {
             symbol: None,
             depth: None,
             value: Some(value),
+            request_id: None,
+            channels: None,
         }
     }
 
@@ -279,6 +389,8 @@ impl ClientCommand {
             symbol: None,
             depth: None,
             value: Some(value),
+            request_id: None,
+            channels: None,
         }
     }
 
@@ -291,6 +403,8 @@ impl ClientCommand {
             symbol: None,
             depth: None,
             value: Some(value),
+            request_id: None,
+            channels: None,
         }
     }
 
@@ -303,6 +417,8 @@ impl ClientCommand {
             symbol: None,
             depth: None,
             value: None,
+            request_id: None,
+            channels: None,
         }
     }
 
@@ -315,6 +431,53 @@ impl ClientCommand {
             symbol: None,
             depth: None,
             value: None,
+            request_id: None,
+            channels: None,
+        }
+    }
+
+    /// Creates a batch subscribe command.
+    #[must_use]
+    pub fn batch_subscribe(channels: Vec<ChannelSubscription>, request_id: Option<String>) -> Self {
+        Self {
+            action: "batch_subscribe".to_string(),
+            channel: None,
+            symbol: None,
+            depth: None,
+            value: None,
+            request_id,
+            channels: Some(channels),
+        }
+    }
+
+    /// Creates a batch unsubscribe command.
+    #[must_use]
+    pub fn batch_unsubscribe(
+        channels: Vec<ChannelSubscription>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self {
+            action: "batch_unsubscribe".to_string(),
+            channel: None,
+            symbol: None,
+            depth: None,
+            value: None,
+            request_id,
+            channels: Some(channels),
+        }
+    }
+
+    /// Creates a list subscriptions command.
+    #[must_use]
+    pub fn list_subscriptions() -> Self {
+        Self {
+            action: "list_subscriptions".to_string(),
+            channel: None,
+            symbol: None,
+            depth: None,
+            value: None,
+            request_id: None,
+            channels: None,
         }
     }
 }
@@ -452,5 +615,47 @@ impl WsClient {
     /// Returns error if the send fails.
     pub async fn unsubscribe_trades(&self, symbol: &str) -> Result<(), Error> {
         self.send(ClientCommand::unsubscribe_trades(symbol)).await
+    }
+
+    /// Batch subscribes to multiple channels.
+    ///
+    /// # Arguments
+    /// * `channels` - List of channel subscriptions
+    /// * `request_id` - Optional request ID for correlation
+    ///
+    /// # Errors
+    /// Returns error if the send fails.
+    pub async fn batch_subscribe(
+        &self,
+        channels: Vec<ChannelSubscription>,
+        request_id: Option<String>,
+    ) -> Result<(), Error> {
+        self.send(ClientCommand::batch_subscribe(channels, request_id))
+            .await
+    }
+
+    /// Batch unsubscribes from multiple channels.
+    ///
+    /// # Arguments
+    /// * `channels` - List of channel subscriptions to remove
+    /// * `request_id` - Optional request ID for correlation
+    ///
+    /// # Errors
+    /// Returns error if the send fails.
+    pub async fn batch_unsubscribe(
+        &self,
+        channels: Vec<ChannelSubscription>,
+        request_id: Option<String>,
+    ) -> Result<(), Error> {
+        self.send(ClientCommand::batch_unsubscribe(channels, request_id))
+            .await
+    }
+
+    /// Lists all active subscriptions.
+    ///
+    /// # Errors
+    /// Returns error if the send fails.
+    pub async fn list_subscriptions(&self) -> Result<(), Error> {
+        self.send(ClientCommand::list_subscriptions()).await
     }
 }
