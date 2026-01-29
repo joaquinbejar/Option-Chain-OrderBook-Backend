@@ -81,6 +81,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::get_option_quote),
         )
         .route(
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/greeks",
+            get(handlers::get_option_greeks),
+        )
+        .route(
             "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/snapshot",
             get(handlers::get_option_snapshot),
         )

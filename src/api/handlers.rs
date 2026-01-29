@@ -6,14 +6,14 @@ use crate::models::{
     BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse, BulkOrderResultItem,
     BulkOrderStatus, CancelAllQuery, CancelAllResponse, CancelOrderResponse, ChainQuery,
     ChainStrikeRow, EnrichedSnapshotResponse, ExpirationSummary, ExpirationsListResponse, FillInfo,
-    GlobalStatsResponse, HealthResponse, LastTradeResponse, LimitOrderStatus, MarketOrderRequest,
-    MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse,
-    ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse, OptionChainResponse, OptionQuoteData,
-    OrderBookSnapshotResponse, OrderInfo, OrderListQuery, OrderListResponse, OrderSide,
-    OrderStatus, OrderStatusResponse, OrderTimeInForce, PositionInfo, PositionQuery,
-    PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo, QuoteResponse,
-    SnapshotDepth, SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse,
-    UnderlyingSummary, UnderlyingsListResponse,
+    GlobalStatsResponse, GreeksData, GreeksResponse, HealthResponse, LastTradeResponse,
+    LimitOrderStatus, MarketOrderRequest, MarketOrderResponse, MarketOrderStatus,
+    ModifyOrderRequest, ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery,
+    OhlcResponse, OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderInfo,
+    OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
+    OrderTimeInForce, PositionInfo, PositionQuery, PositionResponse, PositionSummary,
+    PositionsListResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth, SnapshotQuery,
+    SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -987,6 +987,151 @@ pub async fn get_option_quote(
     let quote = option_book.best_quote();
 
     Ok(Json(quote_to_response(&quote)))
+}
+
+// ============================================================================
+// Greeks Calculation
+// ============================================================================
+
+/// Get Greeks for an option.
+///
+/// Calculates and returns the Greeks (Delta, Gamma, Theta, Vega, Rho) for a specific option.
+#[utoipa::path(
+    get,
+    path = "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/greeks",
+    params(
+        ("underlying" = String, Path, description = "Underlying symbol"),
+        ("expiration" = String, Path, description = "Expiration date"),
+        ("strike" = u64, Path, description = "Strike price"),
+        ("style" = String, Path, description = "Option style: 'call' or 'put'")
+    ),
+    responses(
+        (status = 200, description = "Greeks for the option", body = GreeksResponse),
+        (status = 404, description = "Not found")
+    ),
+    tag = "Greeks"
+)]
+pub async fn get_option_greeks(
+    State(state): State<Arc<AppState>>,
+    Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
+) -> Result<Json<GreeksResponse>, ApiError> {
+    use optionstratlib::greeks::Greeks;
+    use optionstratlib::model::option::Options;
+    use optionstratlib::prelude::{OptionType, Positive};
+
+    let option_style = parse_option_style(&style)?;
+
+    // Verify the option exists
+    let underlying_book = state
+        .manager
+        .get(&underlying)
+        .map_err(|_| ApiError::UnderlyingNotFound(underlying.clone()))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
+
+    let _exp_book = underlying_book
+        .get_expiration(&expiration)
+        .map_err(|_| ApiError::ExpirationNotFound(exp_str.clone()))?;
+
+    // Build symbol
+    let style_char = match option_style {
+        OptionStyle::Call => "C",
+        OptionStyle::Put => "P",
+    };
+    let symbol = format!("{}-{}-{}-{}", underlying, exp_str, strike, style_char);
+
+    // Get spot price from price simulator (default to strike if not available)
+    let spot_price = state
+        .price_simulator
+        .as_ref()
+        .and_then(|sim| sim.get_price(&underlying))
+        .unwrap_or(strike);
+
+    // Default IV (30%) and risk-free rate (5%)
+    let iv = 0.30;
+    let risk_free_rate = 0.05;
+
+    // Calculate time to expiry in years
+    let now = chrono::Utc::now();
+    let expiry_date = expiration
+        .get_date()
+        .map_err(|_| ApiError::InvalidRequest("Failed to parse expiration date".to_string()))?;
+    let _days_to_expiry = (expiry_date - now).num_days().max(1) as f64;
+
+    // Create Options struct for Greeks calculation
+    let option_type = match option_style {
+        OptionStyle::Call => OptionType::European,
+        OptionStyle::Put => OptionType::European,
+    };
+
+    let side = match option_style {
+        OptionStyle::Call => optionstratlib::prelude::Side::Long,
+        OptionStyle::Put => optionstratlib::prelude::Side::Long,
+    };
+
+    // Create Positive values
+    let spot_pos = Positive::new(spot_price as f64)
+        .map_err(|_| ApiError::InvalidRequest("Invalid spot price".to_string()))?;
+    let strike_pos = Positive::new(strike as f64)
+        .map_err(|_| ApiError::InvalidRequest("Invalid strike price".to_string()))?;
+    let iv_pos =
+        Positive::new(iv).map_err(|_| ApiError::InvalidRequest("Invalid IV".to_string()))?;
+    let quantity_pos =
+        Positive::new(1.0).map_err(|_| ApiError::InvalidRequest("Invalid quantity".to_string()))?;
+    let dividend_yield = Positive::new(0.0)
+        .map_err(|_| ApiError::InvalidRequest("Invalid dividend yield".to_string()))?;
+
+    use rust_decimal::Decimal;
+
+    // Build the Options struct
+    let option = Options::new(
+        option_type,
+        side,
+        underlying.clone(),
+        strike_pos,
+        expiration,
+        iv_pos,
+        quantity_pos,
+        spot_pos,
+        Decimal::from_f64_retain(risk_free_rate).unwrap_or_default(),
+        option_style,
+        dividend_yield,
+        None, // exotic_params
+    );
+
+    // Calculate Greeks
+    let greeks_result = option.greeks();
+    let theoretical_value = option.calculate_price_black_scholes().unwrap_or_default();
+
+    let greeks_data = match greeks_result {
+        Ok(greek) => {
+            use rust_decimal::prelude::ToPrimitive;
+            GreeksData {
+                delta: greek.delta.to_f64().unwrap_or(0.0),
+                gamma: greek.gamma.to_f64().unwrap_or(0.0),
+                theta: greek.theta.to_f64().unwrap_or(0.0),
+                vega: greek.vega.to_f64().unwrap_or(0.0),
+                rho: greek.rho.to_f64().unwrap_or(0.0),
+                vanna: Some(greek.vanna.to_f64().unwrap_or(0.0)),
+                vomma: Some(greek.vomma.to_f64().unwrap_or(0.0)),
+                charm: Some(greek.charm.to_f64().unwrap_or(0.0)),
+                color: Some(greek.color.to_f64().unwrap_or(0.0)),
+            }
+        }
+        Err(_) => GreeksData::default(),
+    };
+
+    let timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
+
+    use rust_decimal::prelude::ToPrimitive;
+    Ok(Json(GreeksResponse {
+        symbol,
+        greeks: greeks_data,
+        iv,
+        theoretical_value: theoretical_value.to_f64().unwrap_or(0.0),
+        timestamp_ms,
+    }))
 }
 
 // ============================================================================
@@ -4152,5 +4297,176 @@ mod tests {
         assert_eq!(response.chain.len(), 2);
         assert_eq!(response.chain[0].strike, 15000);
         assert_eq!(response.chain[1].strike, 16000);
+    }
+
+    // ========================================================================
+    // Greeks Tests
+    // ========================================================================
+
+    #[test]
+    fn test_greeks_data_default() {
+        use crate::models::GreeksData;
+
+        let greeks = GreeksData::default();
+        assert_eq!(greeks.delta, 0.0);
+        assert_eq!(greeks.gamma, 0.0);
+        assert_eq!(greeks.theta, 0.0);
+        assert_eq!(greeks.vega, 0.0);
+        assert_eq!(greeks.rho, 0.0);
+        assert!(greeks.vanna.is_none());
+        assert!(greeks.vomma.is_none());
+        assert!(greeks.charm.is_none());
+        assert!(greeks.color.is_none());
+    }
+
+    #[test]
+    fn test_greeks_data_serialization() {
+        use crate::models::GreeksData;
+
+        let greeks = GreeksData {
+            delta: 0.65,
+            gamma: 0.02,
+            theta: -0.15,
+            vega: 0.25,
+            rho: 0.10,
+            vanna: Some(0.01),
+            vomma: Some(0.005),
+            charm: None,
+            color: None,
+        };
+
+        let json = serde_json::to_string(&greeks).unwrap();
+        assert!(json.contains("\"delta\":0.65"));
+        assert!(json.contains("\"gamma\":0.02"));
+        assert!(json.contains("\"theta\":-0.15"));
+        assert!(json.contains("\"vega\":0.25"));
+        assert!(json.contains("\"rho\":0.1"));
+        assert!(json.contains("\"vanna\":0.01"));
+        assert!(json.contains("\"vomma\":0.005"));
+        // charm and color should be skipped (None)
+        assert!(!json.contains("\"charm\""));
+        assert!(!json.contains("\"color\""));
+    }
+
+    #[test]
+    fn test_greeks_response_serialization() {
+        use crate::models::{GreeksData, GreeksResponse};
+
+        let response = GreeksResponse {
+            symbol: "AAPL-20240329-15000-C".to_string(),
+            greeks: GreeksData {
+                delta: 0.65,
+                gamma: 0.02,
+                theta: -0.15,
+                vega: 0.25,
+                rho: 0.10,
+                vanna: None,
+                vomma: None,
+                charm: None,
+                color: None,
+            },
+            iv: 0.32,
+            theoretical_value: 525.0,
+            timestamp_ms: 1709123456789,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"symbol\":\"AAPL-20240329-15000-C\""));
+        assert!(json.contains("\"greeks\""));
+        assert!(json.contains("\"iv\":0.32"));
+        assert!(json.contains("\"theoretical_value\":525.0"));
+        assert!(json.contains("\"timestamp_ms\":1709123456789"));
+    }
+
+    #[tokio::test]
+    async fn test_get_option_greeks_underlying_not_found() {
+        let state = create_test_state();
+
+        let result = get_option_greeks(
+            State(state.clone()),
+            Path((
+                "NONEXISTENT".to_string(),
+                "20251231".to_string(),
+                15000,
+                "call".to_string(),
+            )),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_option_greeks_invalid_style() {
+        let state = create_test_state();
+
+        // Create underlying
+        state.manager.get_or_create("GREEKS1");
+
+        let result = get_option_greeks(
+            State(state.clone()),
+            Path((
+                "GREEKS1".to_string(),
+                "20251231".to_string(),
+                15000,
+                "invalid".to_string(),
+            )),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_option_greeks_success() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, and strike
+        let underlying = state.manager.get_or_create("GREEKS2");
+        let exp = ExpirationDate::Days(optionstratlib::prelude::Positive::new(30.0).unwrap());
+        let exp_book = underlying.get_or_create_expiration(exp);
+        exp_book.get_or_create_strike(15000);
+
+        // Get the expiration string
+        let exp_str = exp.get_date().unwrap().format("%Y%m%d").to_string();
+
+        let result = get_option_greeks(
+            State(state.clone()),
+            Path(("GREEKS2".to_string(), exp_str, 15000, "call".to_string())),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert!(response.symbol.contains("GREEKS2"));
+        assert!(response.symbol.contains("15000"));
+        assert!(response.symbol.contains("C"));
+        assert_eq!(response.iv, 0.30); // Default IV
+        // Greeks should have reasonable values
+        assert!(response.greeks.delta >= -1.0 && response.greeks.delta <= 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_get_option_greeks_put() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, and strike
+        let underlying = state.manager.get_or_create("GREEKS3");
+        let exp = ExpirationDate::Days(optionstratlib::prelude::Positive::new(30.0).unwrap());
+        let exp_book = underlying.get_or_create_expiration(exp);
+        exp_book.get_or_create_strike(15000);
+
+        // Get the expiration string
+        let exp_str = exp.get_date().unwrap().format("%Y%m%d").to_string();
+
+        let result = get_option_greeks(
+            State(state.clone()),
+            Path(("GREEKS3".to_string(), exp_str, 15000, "put".to_string())),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert!(response.symbol.contains("P"));
     }
 }
