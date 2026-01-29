@@ -5,12 +5,12 @@ use crate::models::{
     AddOrderRequest, AddOrderResponse, ApiTimeInForce, CancelOrderResponse,
     EnrichedSnapshotResponse, ExpirationSummary, ExpirationsListResponse, FillInfo,
     GlobalStatsResponse, HealthResponse, LastTradeResponse, LimitOrderStatus, MarketOrderRequest,
-    MarketOrderResponse, MarketOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse,
-    OrderBookSnapshotResponse, OrderInfo, OrderListQuery, OrderListResponse, OrderSide,
-    OrderStatus, OrderStatusResponse, PositionInfo, PositionQuery, PositionResponse,
-    PositionSummary, PositionsListResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth,
-    SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary,
-    UnderlyingsListResponse,
+    MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse,
+    ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse, OrderBookSnapshotResponse, OrderInfo,
+    OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse, PositionInfo,
+    PositionQuery, PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo,
+    QuoteResponse, SnapshotDepth, SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse,
+    UnderlyingSummary, UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -666,6 +666,141 @@ pub async fn cancel_order(
             "Order not found".to_string()
         },
     }))
+}
+
+/// Modify an existing order's price and/or quantity.
+///
+/// This implements order modification using cancel-and-replace semantics.
+/// The order is canceled and a new order is placed with the updated parameters.
+/// This means the order will always lose time priority.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/orders/{order_id}",
+    params(
+        ("underlying" = String, Path, description = "Underlying symbol"),
+        ("expiration" = String, Path, description = "Expiration date"),
+        ("strike" = u64, Path, description = "Strike price"),
+        ("style" = String, Path, description = "Option style: 'call' or 'put'"),
+        ("order_id" = String, Path, description = "Order identifier to modify")
+    ),
+    request_body = ModifyOrderRequest,
+    responses(
+        (status = 200, description = "Order modification result", body = ModifyOrderResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Order not found")
+    ),
+    tag = "Options"
+)]
+pub async fn modify_order(
+    State(state): State<Arc<AppState>>,
+    Path((underlying, exp_str, strike, style, order_id_str)): Path<(
+        String,
+        String,
+        u64,
+        String,
+        String,
+    )>,
+    Json(body): Json<ModifyOrderRequest>,
+) -> Result<Json<ModifyOrderResponse>, ApiError> {
+    // Validate that at least one field is provided
+    if body.price.is_none() && body.quantity.is_none() {
+        return Err(ApiError::InvalidRequest(
+            "At least one of 'price' or 'quantity' must be provided".to_string(),
+        ));
+    }
+
+    let option_style = parse_option_style(&style)?;
+
+    let underlying_book = state
+        .manager
+        .get(&underlying)
+        .map_err(|_| ApiError::UnderlyingNotFound(underlying.clone()))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
+
+    let exp_book = underlying_book
+        .get_expiration(&expiration)
+        .map_err(|_| ApiError::ExpirationNotFound(exp_str.clone()))?;
+
+    let strike_book = exp_book
+        .get_strike(strike)
+        .map_err(|_| ApiError::StrikeNotFound(strike))?;
+
+    let option_book = strike_book.get(option_style);
+
+    // Parse order ID
+    let order_id: OrderId = order_id_str
+        .parse()
+        .map_err(|_| ApiError::InvalidRequest(format!("Invalid order ID: {}", order_id_str)))?;
+
+    // Get the existing order from the order book
+    let existing_order = option_book
+        .inner()
+        .get_order(order_id)
+        .ok_or_else(|| ApiError::NotFound(format!("Order not found: {}", order_id_str)))?;
+
+    // Get current order parameters
+    let current_price = existing_order.price();
+    let current_quantity = existing_order.visible_quantity();
+    let side = existing_order.side();
+
+    // Determine new values
+    let new_price = body.price.unwrap_or(current_price);
+    let new_quantity = body.quantity.unwrap_or(current_quantity);
+
+    // Cancel the existing order
+    let canceled = option_book
+        .cancel_order(order_id)
+        .map_err(|e| ApiError::OrderBook(e.to_string()))?;
+
+    if !canceled {
+        return Ok(Json(ModifyOrderResponse {
+            order_id: order_id_str,
+            status: ModifyOrderStatus::Rejected,
+            new_price: None,
+            new_quantity: None,
+            priority_changed: false,
+            message: "Failed to cancel existing order for modification".to_string(),
+        }));
+    }
+
+    // Create a new order with the updated parameters
+    let new_order_id = OrderId::new();
+
+    match option_book.add_limit_order(new_order_id, side, new_price, new_quantity) {
+        Ok(()) => {
+            // Update order info in AppState
+            if let Some(order_info) = state.orders.remove(&order_id_str) {
+                let mut updated_info = order_info.1;
+                updated_info.order_id = new_order_id.to_string();
+                updated_info.price = new_price;
+                updated_info.remaining_quantity = new_quantity;
+                updated_info.updated_at_ms = chrono::Utc::now().timestamp_millis() as u64;
+                state.orders.insert(new_order_id.to_string(), updated_info);
+            }
+
+            Ok(Json(ModifyOrderResponse {
+                order_id: new_order_id.to_string(),
+                status: ModifyOrderStatus::Modified,
+                new_price: Some(new_price),
+                new_quantity: Some(new_quantity),
+                priority_changed: true, // Cancel-and-replace always loses priority
+                message: "Order modified successfully (cancel-and-replace)".to_string(),
+            }))
+        }
+        Err(e) => {
+            // Failed to place new order - the original is already canceled
+            Ok(Json(ModifyOrderResponse {
+                order_id: order_id_str,
+                status: ModifyOrderStatus::Rejected,
+                new_price: None,
+                new_quantity: None,
+                priority_changed: false,
+                message: format!("Order canceled but failed to place replacement: {}", e),
+            }))
+        }
+    }
 }
 
 /// Get option quote.
@@ -2747,6 +2882,158 @@ mod tests {
                 from: None,
                 to: None,
                 limit: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Order Modification Tests
+    // ========================================================================
+
+    #[test]
+    fn test_modify_order_request_deserialization() {
+        use crate::models::ModifyOrderRequest;
+
+        // Both fields
+        let json = r#"{"price":100,"quantity":50}"#;
+        let request: ModifyOrderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.price, Some(100));
+        assert_eq!(request.quantity, Some(50));
+
+        // Only price
+        let json = r#"{"price":200}"#;
+        let request: ModifyOrderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.price, Some(200));
+        assert_eq!(request.quantity, None);
+
+        // Only quantity
+        let json = r#"{"quantity":75}"#;
+        let request: ModifyOrderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.price, None);
+        assert_eq!(request.quantity, Some(75));
+
+        // Empty (valid JSON but will fail validation in handler)
+        let json = r#"{}"#;
+        let request: ModifyOrderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.price, None);
+        assert_eq!(request.quantity, None);
+    }
+
+    #[test]
+    fn test_modify_order_status_serialization() {
+        use crate::models::ModifyOrderStatus;
+
+        let modified = ModifyOrderStatus::Modified;
+        let json = serde_json::to_string(&modified).unwrap();
+        assert_eq!(json, "\"modified\"");
+
+        let rejected = ModifyOrderStatus::Rejected;
+        let json = serde_json::to_string(&rejected).unwrap();
+        assert_eq!(json, "\"rejected\"");
+    }
+
+    #[test]
+    fn test_modify_order_response_serialization() {
+        use crate::models::{ModifyOrderResponse, ModifyOrderStatus};
+
+        let response = ModifyOrderResponse {
+            order_id: "test-order-123".to_string(),
+            status: ModifyOrderStatus::Modified,
+            new_price: Some(100),
+            new_quantity: Some(50),
+            priority_changed: true,
+            message: "Order modified successfully".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"order_id\":\"test-order-123\""));
+        assert!(json.contains("\"status\":\"modified\""));
+        assert!(json.contains("\"new_price\":100"));
+        assert!(json.contains("\"new_quantity\":50"));
+        assert!(json.contains("\"priority_changed\":true"));
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_no_changes() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, strike
+        let underlying = state.manager.get_or_create("MOD1");
+        let exp = ExpirationDate::Days(optionstratlib::prelude::Positive::new(30.0).unwrap());
+        let exp_book = underlying.get_or_create_expiration(exp);
+        drop(exp_book.get_or_create_strike(100));
+
+        // Try to modify with no price or quantity - should fail validation
+        let result = modify_order(
+            State(state.clone()),
+            Path((
+                "MOD1".to_string(),
+                "20251231".to_string(),
+                100,
+                "call".to_string(),
+                "12345".to_string(),
+            )),
+            Json(ModifyOrderRequest {
+                price: None,
+                quantity: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        match result {
+            Err(ApiError::InvalidRequest(msg)) => {
+                assert!(msg.contains("At least one"));
+            }
+            _ => panic!("Expected InvalidRequest error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_underlying_not_found() {
+        let state = create_test_state();
+
+        let result = modify_order(
+            State(state.clone()),
+            Path((
+                "NONEXISTENT".to_string(),
+                "20251231".to_string(),
+                100,
+                "call".to_string(),
+                "12345".to_string(),
+            )),
+            Json(ModifyOrderRequest {
+                price: Some(100),
+                quantity: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_invalid_style() {
+        let state = create_test_state();
+
+        // Create underlying
+        state.manager.get_or_create("MOD2");
+
+        let result = modify_order(
+            State(state.clone()),
+            Path((
+                "MOD2".to_string(),
+                "20251231".to_string(),
+                100,
+                "invalid".to_string(),
+                "12345".to_string(),
+            )),
+            Json(ModifyOrderRequest {
+                price: Some(100),
+                quantity: None,
             }),
         )
         .await;
