@@ -808,3 +808,156 @@ pub struct PositionQuery {
     #[serde(default)]
     pub underlying: Option<String>,
 }
+
+// ============================================================================
+// OHLC (Candlestick) Data Types
+// ============================================================================
+
+/// OHLC bar interval for candlestick data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OhlcInterval {
+    /// 1 minute bars.
+    #[serde(rename = "1m")]
+    OneMinute,
+    /// 5 minute bars.
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    /// 15 minute bars.
+    #[serde(rename = "15m")]
+    FifteenMinutes,
+    /// 1 hour bars.
+    #[serde(rename = "1h")]
+    OneHour,
+    /// 4 hour bars.
+    #[serde(rename = "4h")]
+    FourHours,
+    /// 1 day bars.
+    #[serde(rename = "1d")]
+    OneDay,
+}
+
+impl OhlcInterval {
+    /// Returns the interval duration in seconds.
+    #[must_use]
+    pub fn seconds(&self) -> u64 {
+        match self {
+            Self::OneMinute => 60,
+            Self::FiveMinutes => 300,
+            Self::FifteenMinutes => 900,
+            Self::OneHour => 3600,
+            Self::FourHours => 14400,
+            Self::OneDay => 86400,
+        }
+    }
+
+    /// Floors a timestamp to the start of the interval.
+    #[must_use]
+    pub fn floor_timestamp(&self, timestamp_secs: u64) -> u64 {
+        let interval = self.seconds();
+        (timestamp_secs / interval) * interval
+    }
+}
+
+impl std::fmt::Display for OhlcInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OneMinute => write!(f, "1m"),
+            Self::FiveMinutes => write!(f, "5m"),
+            Self::FifteenMinutes => write!(f, "15m"),
+            Self::OneHour => write!(f, "1h"),
+            Self::FourHours => write!(f, "4h"),
+            Self::OneDay => write!(f, "1d"),
+        }
+    }
+}
+
+impl std::str::FromStr for OhlcInterval {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "1m" => Ok(Self::OneMinute),
+            "5m" => Ok(Self::FiveMinutes),
+            "15m" => Ok(Self::FifteenMinutes),
+            "1h" => Ok(Self::OneHour),
+            "4h" => Ok(Self::FourHours),
+            "1d" => Ok(Self::OneDay),
+            _ => Err(format!(
+                "Invalid interval: {}. Use 1m, 5m, 15m, 1h, 4h, or 1d",
+                s
+            )),
+        }
+    }
+}
+
+/// A single OHLC bar (candlestick).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+pub struct OhlcBar {
+    /// Bar start timestamp in seconds since epoch.
+    pub timestamp: u64,
+    /// Opening price in smallest units.
+    pub open: u128,
+    /// Highest price in smallest units.
+    pub high: u128,
+    /// Lowest price in smallest units.
+    pub low: u128,
+    /// Closing price in smallest units.
+    pub close: u128,
+    /// Total volume traded in this bar.
+    pub volume: u64,
+    /// Number of trades in this bar.
+    pub trade_count: u64,
+}
+
+impl OhlcBar {
+    /// Creates a new OHLC bar from a single trade.
+    #[must_use]
+    pub fn new(timestamp: u64, price: u128, quantity: u64) -> Self {
+        Self {
+            timestamp,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: quantity,
+            trade_count: 1,
+        }
+    }
+
+    /// Updates the bar with a new trade.
+    pub fn update(&mut self, price: u128, quantity: u64) {
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
+        self.close = price;
+        self.volume += quantity;
+        self.trade_count += 1;
+    }
+}
+
+/// Query parameters for OHLC endpoint.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct OhlcQuery {
+    /// Bar interval (1m, 5m, 15m, 1h, 4h, 1d).
+    pub interval: String,
+    /// Start timestamp in seconds (optional).
+    #[serde(default)]
+    pub from: Option<u64>,
+    /// End timestamp in seconds (optional).
+    #[serde(default)]
+    pub to: Option<u64>,
+    /// Maximum number of bars to return (default 500).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Response for OHLC endpoint.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OhlcResponse {
+    /// Symbol identifier.
+    pub symbol: String,
+    /// Bar interval.
+    pub interval: String,
+    /// List of OHLC bars.
+    pub bars: Vec<OhlcBar>,
+}

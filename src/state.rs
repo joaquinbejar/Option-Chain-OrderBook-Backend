@@ -5,6 +5,7 @@ use crate::config::{AssetConfig, Config};
 use crate::db::DatabasePool;
 use crate::market_maker::MarketMakerEngine;
 use crate::models::{LastTradeInfo, OrderInfo, PositionInfo};
+use crate::ohlc::OhlcAggregator;
 use crate::simulation::PriceSimulator;
 use dashmap::DashMap;
 use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
@@ -33,6 +34,8 @@ pub struct AppState {
     pub positions: Arc<DashMap<String, PositionInfo>>,
     /// Orderbook subscription manager for WebSocket real-time updates.
     pub orderbook_subscriptions: Arc<OrderbookSubscriptionManager>,
+    /// OHLC candlestick data aggregator.
+    pub ohlc_aggregator: Arc<OhlcAggregator>,
 }
 
 impl AppState {
@@ -52,6 +55,7 @@ impl AppState {
             orders: Arc::new(DashMap::new()),
             positions: Arc::new(DashMap::new()),
             orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
+            ohlc_aggregator: Arc::new(OhlcAggregator::new()),
         }
     }
 
@@ -74,6 +78,7 @@ impl AppState {
             orders: Arc::new(DashMap::new()),
             positions: Arc::new(DashMap::new()),
             orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
+            ohlc_aggregator: Arc::new(OhlcAggregator::new()),
         }
     }
 
@@ -111,6 +116,7 @@ impl AppState {
             orders: Arc::new(DashMap::new()),
             positions: Arc::new(DashMap::new()),
             orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
+            ohlc_aggregator: Arc::new(OhlcAggregator::new()),
         }
     }
 
