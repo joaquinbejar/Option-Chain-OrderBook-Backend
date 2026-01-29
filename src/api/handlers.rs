@@ -5,11 +5,12 @@ use crate::models::{
     AddOrderRequest, AddOrderResponse, ApiTimeInForce, CancelOrderResponse,
     EnrichedSnapshotResponse, ExpirationSummary, ExpirationsListResponse, FillInfo,
     GlobalStatsResponse, HealthResponse, LastTradeResponse, LimitOrderStatus, MarketOrderRequest,
-    MarketOrderResponse, MarketOrderStatus, OrderBookSnapshotResponse, OrderInfo, OrderListQuery,
-    OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse, PositionInfo, PositionQuery,
-    PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo, QuoteResponse,
-    SnapshotDepth, SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse,
-    UnderlyingSummary, UnderlyingsListResponse,
+    MarketOrderResponse, MarketOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse,
+    OrderBookSnapshotResponse, OrderInfo, OrderListQuery, OrderListResponse, OrderSide,
+    OrderStatus, OrderStatusResponse, PositionInfo, PositionQuery, PositionResponse,
+    PositionSummary, PositionsListResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth,
+    SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary,
+    UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -957,6 +958,67 @@ pub async fn get_last_trade(
             symbol
         ))),
     }
+}
+
+// ============================================================================
+// OHLC Historical Data
+// ============================================================================
+
+/// Get OHLC (candlestick) historical data for an option.
+///
+/// Returns OHLC bars aggregated from trades at the specified interval.
+/// Supports filtering by time range and limiting the number of bars returned.
+#[utoipa::path(
+    get,
+    path = "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/ohlc",
+    params(
+        ("underlying" = String, Path, description = "Underlying symbol"),
+        ("expiration" = String, Path, description = "Expiration date"),
+        ("strike" = u64, Path, description = "Strike price"),
+        ("style" = String, Path, description = "Option style: 'call' or 'put'"),
+        ("interval" = String, Query, description = "Bar interval: 1m, 5m, 15m, 1h, 4h, 1d"),
+        ("from" = Option<u64>, Query, description = "Start timestamp in seconds (optional)"),
+        ("to" = Option<u64>, Query, description = "End timestamp in seconds (optional)"),
+        ("limit" = Option<usize>, Query, description = "Maximum number of bars (default 500)")
+    ),
+    responses(
+        (status = 200, description = "OHLC historical data", body = OhlcResponse),
+        (status = 400, description = "Invalid interval"),
+        (status = 404, description = "Not found")
+    ),
+    tag = "Options"
+)]
+pub async fn get_ohlc(
+    State(state): State<Arc<AppState>>,
+    Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
+    Query(query): Query<OhlcQuery>,
+) -> Result<Json<OhlcResponse>, ApiError> {
+    let option_style = parse_option_style(&style)?;
+
+    // Parse interval
+    let interval: OhlcInterval = query
+        .interval
+        .parse()
+        .map_err(|e: String| ApiError::InvalidRequest(e))?;
+
+    // Build the symbol key
+    let style_char = match option_style {
+        OptionStyle::Call => "C",
+        OptionStyle::Put => "P",
+    };
+    let symbol = format!("{}-{}-{}-{}", underlying, exp_str, strike, style_char);
+
+    // Get bars from aggregator
+    let limit = query.limit.unwrap_or(500).min(1000); // Cap at 1000
+    let bars = state
+        .ohlc_aggregator
+        .get_bars(&symbol, interval, query.from, query.to, limit);
+
+    Ok(Json(OhlcResponse {
+        symbol,
+        interval: interval.to_string(),
+        bars,
+    }))
 }
 
 // ============================================================================
@@ -2465,5 +2527,230 @@ mod tests {
         assert!(json.contains("\"status\":\"accepted\""));
         assert!(json.contains("\"filled_quantity\":0"));
         assert!(json.contains("\"remaining_quantity\":100"));
+    }
+
+    // ========================================================================
+    // OHLC Tests
+    // ========================================================================
+
+    #[test]
+    fn test_ohlc_interval_parsing() {
+        use crate::models::OhlcInterval;
+
+        assert_eq!(
+            "1m".parse::<OhlcInterval>().unwrap(),
+            OhlcInterval::OneMinute
+        );
+        assert_eq!(
+            "5m".parse::<OhlcInterval>().unwrap(),
+            OhlcInterval::FiveMinutes
+        );
+        assert_eq!(
+            "15m".parse::<OhlcInterval>().unwrap(),
+            OhlcInterval::FifteenMinutes
+        );
+        assert_eq!("1h".parse::<OhlcInterval>().unwrap(), OhlcInterval::OneHour);
+        assert_eq!(
+            "4h".parse::<OhlcInterval>().unwrap(),
+            OhlcInterval::FourHours
+        );
+        assert_eq!("1d".parse::<OhlcInterval>().unwrap(), OhlcInterval::OneDay);
+
+        assert!("invalid".parse::<OhlcInterval>().is_err());
+    }
+
+    #[test]
+    fn test_ohlc_interval_serialization() {
+        use crate::models::OhlcInterval;
+
+        let interval = OhlcInterval::OneMinute;
+        let json = serde_json::to_string(&interval).unwrap();
+        assert_eq!(json, "\"1m\"");
+
+        let interval = OhlcInterval::FourHours;
+        let json = serde_json::to_string(&interval).unwrap();
+        assert_eq!(json, "\"4h\"");
+    }
+
+    #[test]
+    fn test_ohlc_interval_seconds() {
+        use crate::models::OhlcInterval;
+
+        assert_eq!(OhlcInterval::OneMinute.seconds(), 60);
+        assert_eq!(OhlcInterval::FiveMinutes.seconds(), 300);
+        assert_eq!(OhlcInterval::FifteenMinutes.seconds(), 900);
+        assert_eq!(OhlcInterval::OneHour.seconds(), 3600);
+        assert_eq!(OhlcInterval::FourHours.seconds(), 14400);
+        assert_eq!(OhlcInterval::OneDay.seconds(), 86400);
+    }
+
+    #[test]
+    fn test_ohlc_bar_creation() {
+        use crate::models::OhlcBar;
+
+        let bar = OhlcBar::new(1704067200, 500, 100);
+        assert_eq!(bar.timestamp, 1704067200);
+        assert_eq!(bar.open, 500);
+        assert_eq!(bar.high, 500);
+        assert_eq!(bar.low, 500);
+        assert_eq!(bar.close, 500);
+        assert_eq!(bar.volume, 100);
+        assert_eq!(bar.trade_count, 1);
+    }
+
+    #[test]
+    fn test_ohlc_bar_update() {
+        use crate::models::OhlcBar;
+
+        let mut bar = OhlcBar::new(1704067200, 500, 100);
+
+        // Update with higher price
+        bar.update(520, 50);
+        assert_eq!(bar.high, 520);
+        assert_eq!(bar.low, 500);
+        assert_eq!(bar.close, 520);
+        assert_eq!(bar.volume, 150);
+        assert_eq!(bar.trade_count, 2);
+
+        // Update with lower price
+        bar.update(480, 75);
+        assert_eq!(bar.high, 520);
+        assert_eq!(bar.low, 480);
+        assert_eq!(bar.close, 480);
+        assert_eq!(bar.volume, 225);
+        assert_eq!(bar.trade_count, 3);
+    }
+
+    #[test]
+    fn test_ohlc_query_deserialization() {
+        use crate::models::OhlcQuery;
+
+        let json = r#"{"interval":"1m","from":1704067200,"to":1704153600,"limit":100}"#;
+        let query: OhlcQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.interval, "1m");
+        assert_eq!(query.from, Some(1704067200));
+        assert_eq!(query.to, Some(1704153600));
+        assert_eq!(query.limit, Some(100));
+    }
+
+    #[test]
+    fn test_ohlc_query_minimal() {
+        use crate::models::OhlcQuery;
+
+        let json = r#"{"interval":"5m"}"#;
+        let query: OhlcQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.interval, "5m");
+        assert_eq!(query.from, None);
+        assert_eq!(query.to, None);
+        assert_eq!(query.limit, None);
+    }
+
+    #[test]
+    fn test_ohlc_response_serialization() {
+        use crate::models::{OhlcBar, OhlcResponse};
+
+        let response = OhlcResponse {
+            symbol: "AAPL-20251231-150-C".to_string(),
+            interval: "1m".to_string(),
+            bars: vec![
+                OhlcBar::new(1704067200, 500, 100),
+                OhlcBar::new(1704067260, 510, 50),
+            ],
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"symbol\":\"AAPL-20251231-150-C\""));
+        assert!(json.contains("\"interval\":\"1m\""));
+        assert!(json.contains("\"bars\":["));
+    }
+
+    #[tokio::test]
+    async fn test_get_ohlc_empty() {
+        let state = create_test_state();
+
+        let result = get_ohlc(
+            State(state.clone()),
+            Path((
+                "OHLC1".to_string(),
+                "20251231".to_string(),
+                100,
+                "call".to_string(),
+            )),
+            Query(OhlcQuery {
+                interval: "1m".to_string(),
+                from: None,
+                to: None,
+                limit: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.symbol, "OHLC1-20251231-100-C");
+        assert_eq!(response.interval, "1m");
+        assert!(response.bars.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_ohlc_with_data() {
+        let state = create_test_state();
+
+        // Record some trades
+        let symbol = "OHLC2-20251231-100-C";
+        state
+            .ohlc_aggregator
+            .record_trade(symbol, 1704067200000, 500, 100);
+        state
+            .ohlc_aggregator
+            .record_trade(symbol, 1704067210000, 510, 50);
+
+        let result = get_ohlc(
+            State(state.clone()),
+            Path((
+                "OHLC2".to_string(),
+                "20251231".to_string(),
+                100,
+                "call".to_string(),
+            )),
+            Query(OhlcQuery {
+                interval: "1m".to_string(),
+                from: None,
+                to: None,
+                limit: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.bars.len(), 1);
+        assert_eq!(response.bars[0].open, 500);
+        assert_eq!(response.bars[0].close, 510);
+        assert_eq!(response.bars[0].volume, 150);
+    }
+
+    #[tokio::test]
+    async fn test_get_ohlc_invalid_interval() {
+        let state = create_test_state();
+
+        let result = get_ohlc(
+            State(state.clone()),
+            Path((
+                "OHLC3".to_string(),
+                "20251231".to_string(),
+                100,
+                "call".to_string(),
+            )),
+            Query(OhlcQuery {
+                interval: "invalid".to_string(),
+                from: None,
+                to: None,
+                limit: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
     }
 }
