@@ -1273,3 +1273,48 @@ pub struct GreeksResponse {
     /// Timestamp of calculation in milliseconds.
     pub timestamp_ms: u64,
 }
+
+// ============================================================================
+// Implied Volatility Surface Types
+// ============================================================================
+
+/// Implied volatility for a single strike (call and put).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct StrikeIV {
+    /// Implied volatility for the call option.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_iv: Option<f64>,
+    /// Implied volatility for the put option.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub put_iv: Option<f64>,
+}
+
+/// A point in the ATM term structure.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ATMTermStructurePoint {
+    /// Expiration date string.
+    pub expiration: String,
+    /// Days to expiration.
+    pub days: u64,
+    /// ATM implied volatility.
+    pub iv: f64,
+}
+
+/// Response for volatility surface endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VolatilitySurfaceResponse {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Current spot price (if available).
+    pub spot_price: Option<u64>,
+    /// Timestamp of calculation in milliseconds.
+    pub timestamp_ms: u64,
+    /// List of expiration dates.
+    pub expirations: Vec<String>,
+    /// List of strikes.
+    pub strikes: Vec<u64>,
+    /// IV surface: expiration -> strike -> StrikeIV.
+    pub surface: std::collections::HashMap<String, std::collections::HashMap<u64, StrikeIV>>,
+    /// ATM term structure.
+    pub atm_term_structure: Vec<ATMTermStructurePoint>,
+}

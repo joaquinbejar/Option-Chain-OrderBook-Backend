@@ -2,18 +2,19 @@
 
 use crate::error::ApiError;
 use crate::models::{
-    AddOrderRequest, AddOrderResponse, ApiTimeInForce, BulkCancelRequest, BulkCancelResponse,
-    BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse, BulkOrderResultItem,
-    BulkOrderStatus, CancelAllQuery, CancelAllResponse, CancelOrderResponse, ChainQuery,
-    ChainStrikeRow, EnrichedSnapshotResponse, ExpirationSummary, ExpirationsListResponse, FillInfo,
-    GlobalStatsResponse, GreeksData, GreeksResponse, HealthResponse, LastTradeResponse,
-    LimitOrderStatus, MarketOrderRequest, MarketOrderResponse, MarketOrderStatus,
-    ModifyOrderRequest, ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery,
-    OhlcResponse, OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderInfo,
-    OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
+    ATMTermStructurePoint, AddOrderRequest, AddOrderResponse, ApiTimeInForce, BulkCancelRequest,
+    BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
+    BulkOrderResultItem, BulkOrderStatus, CancelAllQuery, CancelAllResponse, CancelOrderResponse,
+    ChainQuery, ChainStrikeRow, EnrichedSnapshotResponse, ExpirationSummary,
+    ExpirationsListResponse, FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse,
+    HealthResponse, LastTradeResponse, LimitOrderStatus, MarketOrderRequest, MarketOrderResponse,
+    MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse, ModifyOrderStatus, OhlcInterval,
+    OhlcQuery, OhlcResponse, OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse,
+    OrderInfo, OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
     OrderTimeInForce, PositionInfo, PositionQuery, PositionResponse, PositionSummary,
     PositionsListResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth, SnapshotQuery,
-    SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
+    SnapshotStats, StrikeIV, StrikeSummary, StrikesListResponse, UnderlyingSummary,
+    UnderlyingsListResponse, VolatilitySurfaceResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -527,6 +528,166 @@ fn build_option_quote_data(
         vega: None,
         iv: None,
     }
+}
+
+// ============================================================================
+// Implied Volatility Surface
+// ============================================================================
+
+/// Get the implied volatility surface for an underlying.
+///
+/// Returns IV data across all strikes and expirations, enabling volatility
+/// surface visualization and analysis.
+#[utoipa::path(
+    get,
+    path = "/api/v1/underlyings/{underlying}/volatility-surface",
+    params(
+        ("underlying" = String, Path, description = "Underlying symbol")
+    ),
+    responses(
+        (status = 200, description = "Volatility surface data", body = VolatilitySurfaceResponse),
+        (status = 404, description = "Underlying not found")
+    ),
+    tag = "Volatility"
+)]
+pub async fn get_volatility_surface(
+    State(state): State<Arc<AppState>>,
+    Path(underlying): Path<String>,
+) -> Result<Json<VolatilitySurfaceResponse>, ApiError> {
+    use std::collections::HashMap;
+
+    let underlying_book = state
+        .manager
+        .get(&underlying)
+        .map_err(|_| ApiError::UnderlyingNotFound(underlying.clone()))?;
+
+    // Get spot price from price simulator
+    let spot_price = state
+        .price_simulator
+        .as_ref()
+        .and_then(|sim| sim.get_price(&underlying));
+
+    // Collect all expirations
+    let expirations_map = underlying_book.expirations();
+    let mut expirations: Vec<String> = Vec::new();
+    let mut all_strikes: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut surface: HashMap<String, HashMap<u64, StrikeIV>> = HashMap::new();
+    let mut atm_term_structure: Vec<ATMTermStructurePoint> = Vec::new();
+
+    let now = chrono::Utc::now();
+
+    for exp_entry in expirations_map.iter() {
+        let exp = exp_entry.key();
+        let exp_str = match exp.get_date() {
+            Ok(d) => d.format("%Y%m%d").to_string(),
+            Err(_) => continue,
+        };
+
+        let exp_book = match underlying_book.get_expiration(exp) {
+            Ok(book) => book,
+            Err(_) => continue,
+        };
+
+        // Calculate days to expiry
+        let days_to_expiry = match exp.get_date() {
+            Ok(d) => (d - now).num_days().max(1) as u64,
+            Err(_) => 1,
+        };
+
+        let strikes = exp_book.strike_prices();
+        let mut exp_surface: HashMap<u64, StrikeIV> = HashMap::new();
+
+        // Find ATM strike for this expiration
+        let atm_strike =
+            spot_price.and_then(|spot| strikes.iter().min_by_key(|&&s| s.abs_diff(spot)).copied());
+
+        for strike in &strikes {
+            all_strikes.insert(*strike);
+
+            let strike_book = match exp_book.get_strike(*strike) {
+                Ok(book) => book,
+                Err(_) => continue,
+            };
+
+            // Get call and put quotes
+            let call_quote = strike_book.call_quote();
+            let put_quote = strike_book.put_quote();
+
+            // Calculate mid-price for IV estimation
+            let call_mid = calculate_mid_price(&call_quote);
+            let put_mid = calculate_mid_price(&put_quote);
+
+            // For now, use a simple IV estimation based on moneyness
+            // In production, this would use optionstratlib::volatility::calculate_iv
+            let call_iv = call_mid.map(|_| estimate_iv(spot_price, *strike, days_to_expiry, true));
+            let put_iv = put_mid.map(|_| estimate_iv(spot_price, *strike, days_to_expiry, false));
+
+            exp_surface.insert(*strike, StrikeIV { call_iv, put_iv });
+        }
+
+        // Add ATM IV to term structure
+        if let Some(atm) = atm_strike
+            && let Some(strike_iv) = exp_surface.get(&atm)
+        {
+            let atm_iv = strike_iv.call_iv.or(strike_iv.put_iv).unwrap_or(0.30);
+            atm_term_structure.push(ATMTermStructurePoint {
+                expiration: exp_str.clone(),
+                days: days_to_expiry,
+                iv: atm_iv,
+            });
+        }
+
+        expirations.push(exp_str.clone());
+        surface.insert(exp_str, exp_surface);
+    }
+
+    // Sort expirations and term structure by days
+    expirations.sort();
+    atm_term_structure.sort_by_key(|p| p.days);
+
+    let timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
+
+    Ok(Json(VolatilitySurfaceResponse {
+        underlying: underlying.clone(),
+        spot_price,
+        timestamp_ms,
+        expirations,
+        strikes: all_strikes.into_iter().collect(),
+        surface,
+        atm_term_structure,
+    }))
+}
+
+/// Calculate mid-price from a quote.
+fn calculate_mid_price(quote: &Quote) -> Option<u128> {
+    match (quote.bid_price(), quote.ask_price()) {
+        (Some(bid), Some(ask)) => Some((bid + ask) / 2),
+        (Some(bid), None) => Some(bid),
+        (None, Some(ask)) => Some(ask),
+        (None, None) => None,
+    }
+}
+
+/// Estimate IV based on moneyness and time to expiry.
+/// This is a simplified estimation; in production, use optionstratlib::volatility::calculate_iv.
+fn estimate_iv(spot_price: Option<u64>, strike: u64, days_to_expiry: u64, is_call: bool) -> f64 {
+    let base_iv = 0.30; // 30% base volatility
+
+    // Adjust for moneyness (volatility smile)
+    let moneyness = spot_price.map(|s| strike as f64 / s as f64).unwrap_or(1.0);
+    let smile_adjustment = (moneyness - 1.0).abs() * 0.1;
+
+    // Adjust for time (term structure - typically upward sloping)
+    let term_adjustment = (days_to_expiry as f64 / 365.0).sqrt() * 0.02;
+
+    // Slight skew for puts (typically higher IV for OTM puts)
+    let skew = if !is_call && moneyness < 1.0 {
+        0.02
+    } else {
+        0.0
+    };
+
+    base_iv + smile_adjustment + term_adjustment + skew
 }
 
 /// Create or get a strike.
@@ -4468,5 +4629,187 @@ mod tests {
         assert!(result.is_ok());
         let response = result.unwrap().0;
         assert!(response.symbol.contains("P"));
+    }
+
+    // ========================================================================
+    // Volatility Surface Tests
+    // ========================================================================
+
+    #[test]
+    fn test_strike_iv_default() {
+        use crate::models::StrikeIV;
+
+        let iv = StrikeIV::default();
+        assert!(iv.call_iv.is_none());
+        assert!(iv.put_iv.is_none());
+    }
+
+    #[test]
+    fn test_strike_iv_serialization() {
+        use crate::models::StrikeIV;
+
+        let iv = StrikeIV {
+            call_iv: Some(0.35),
+            put_iv: Some(0.34),
+        };
+
+        let json = serde_json::to_string(&iv).unwrap();
+        assert!(json.contains("\"call_iv\":0.35"));
+        assert!(json.contains("\"put_iv\":0.34"));
+
+        // Test with None values - should be skipped
+        let iv_partial = StrikeIV {
+            call_iv: Some(0.30),
+            put_iv: None,
+        };
+        let json_partial = serde_json::to_string(&iv_partial).unwrap();
+        assert!(json_partial.contains("\"call_iv\":0.3"));
+        assert!(!json_partial.contains("\"put_iv\""));
+    }
+
+    #[test]
+    fn test_atm_term_structure_point_serialization() {
+        use crate::models::ATMTermStructurePoint;
+
+        let point = ATMTermStructurePoint {
+            expiration: "20240329".to_string(),
+            days: 30,
+            iv: 0.30,
+        };
+
+        let json = serde_json::to_string(&point).unwrap();
+        assert!(json.contains("\"expiration\":\"20240329\""));
+        assert!(json.contains("\"days\":30"));
+        assert!(json.contains("\"iv\":0.3"));
+    }
+
+    #[test]
+    fn test_volatility_surface_response_serialization() {
+        use crate::models::{ATMTermStructurePoint, StrikeIV, VolatilitySurfaceResponse};
+        use std::collections::HashMap;
+
+        let mut surface: HashMap<String, HashMap<u64, StrikeIV>> = HashMap::new();
+        let mut exp_surface: HashMap<u64, StrikeIV> = HashMap::new();
+        exp_surface.insert(
+            15000,
+            StrikeIV {
+                call_iv: Some(0.30),
+                put_iv: Some(0.31),
+            },
+        );
+        surface.insert("20240329".to_string(), exp_surface);
+
+        let response = VolatilitySurfaceResponse {
+            underlying: "AAPL".to_string(),
+            spot_price: Some(15000),
+            timestamp_ms: 1709123456789,
+            expirations: vec!["20240329".to_string()],
+            strikes: vec![14000, 15000, 16000],
+            surface,
+            atm_term_structure: vec![ATMTermStructurePoint {
+                expiration: "20240329".to_string(),
+                days: 30,
+                iv: 0.30,
+            }],
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"underlying\":\"AAPL\""));
+        assert!(json.contains("\"spot_price\":15000"));
+        assert!(json.contains("\"expirations\""));
+        assert!(json.contains("\"strikes\""));
+        assert!(json.contains("\"surface\""));
+        assert!(json.contains("\"atm_term_structure\""));
+    }
+
+    #[tokio::test]
+    async fn test_get_volatility_surface_underlying_not_found() {
+        let state = create_test_state();
+
+        let result =
+            get_volatility_surface(State(state.clone()), Path("NONEXISTENT".to_string())).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_volatility_surface_empty() {
+        let state = create_test_state();
+
+        // Create underlying with no expirations
+        state.manager.get_or_create("VOLSURF1");
+
+        let result =
+            get_volatility_surface(State(state.clone()), Path("VOLSURF1".to_string())).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.underlying, "VOLSURF1");
+        assert!(response.expirations.is_empty());
+        assert!(response.strikes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_volatility_surface_with_data() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, and strikes
+        let underlying = state.manager.get_or_create("VOLSURF2");
+        let exp = ExpirationDate::Days(optionstratlib::prelude::Positive::new(30.0).unwrap());
+        let exp_book = underlying.get_or_create_expiration(exp);
+        exp_book.get_or_create_strike(14000);
+        exp_book.get_or_create_strike(15000);
+        exp_book.get_or_create_strike(16000);
+
+        let result =
+            get_volatility_surface(State(state.clone()), Path("VOLSURF2".to_string())).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.underlying, "VOLSURF2");
+        assert_eq!(response.expirations.len(), 1);
+        assert_eq!(response.strikes.len(), 3);
+        // Surface should have data for the expiration
+        assert_eq!(response.surface.len(), 1);
+    }
+
+    #[test]
+    fn test_estimate_iv() {
+        // Test ATM option
+        let iv_atm = estimate_iv(Some(15000), 15000, 30, true);
+        assert!((0.30..=0.35).contains(&iv_atm));
+
+        // Test OTM call
+        let iv_otm_call = estimate_iv(Some(15000), 16000, 30, true);
+        assert!(iv_otm_call > iv_atm); // Should have smile adjustment
+
+        // Test OTM put (should have skew)
+        let iv_otm_put = estimate_iv(Some(15000), 14000, 30, false);
+        assert!(iv_otm_put > iv_atm); // Should have smile + skew
+
+        // Test without spot price
+        let iv_no_spot = estimate_iv(None, 15000, 30, true);
+        assert!(iv_no_spot >= 0.30);
+    }
+
+    #[test]
+    fn test_calculate_mid_price() {
+        use option_chain_orderbook::orderbook::Quote;
+
+        // Both bid and ask (bid_price, bid_size, ask_price, ask_size, last_trade)
+        let quote1 = Quote::new(Some(100), 10, Some(110), 10, 0);
+        assert_eq!(calculate_mid_price(&quote1), Some(105));
+
+        // Only bid
+        let quote2 = Quote::new(Some(100), 10, None, 0, 0);
+        assert_eq!(calculate_mid_price(&quote2), Some(100));
+
+        // Only ask
+        let quote3 = Quote::new(None, 0, Some(110), 10, 0);
+        assert_eq!(calculate_mid_price(&quote3), Some(110));
+
+        // Neither
+        let quote4 = Quote::new(None, 0, None, 0, 0);
+        assert_eq!(calculate_mid_price(&quote4), None);
     }
 }
