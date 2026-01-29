@@ -188,10 +188,10 @@ impl AppState {
                     let updated = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
                         order.updated_at_ms as i64,
                     );
-                    if let Some(updated_dt) = updated {
-                        if updated_dt < threshold {
-                            return Some(entry.key().clone());
-                        }
+                    if let Some(updated_dt) = updated
+                        && updated_dt < threshold
+                    {
+                        return Some(entry.key().clone());
                     }
                 }
                 None
