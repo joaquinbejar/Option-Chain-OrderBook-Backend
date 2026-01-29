@@ -4,15 +4,16 @@ use crate::error::ApiError;
 use crate::models::{
     AddOrderRequest, AddOrderResponse, ApiTimeInForce, BulkCancelRequest, BulkCancelResponse,
     BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse, BulkOrderResultItem,
-    BulkOrderStatus, CancelAllQuery, CancelAllResponse, CancelOrderResponse,
-    EnrichedSnapshotResponse, ExpirationSummary, ExpirationsListResponse, FillInfo,
+    BulkOrderStatus, CancelAllQuery, CancelAllResponse, CancelOrderResponse, ChainQuery,
+    ChainStrikeRow, EnrichedSnapshotResponse, ExpirationSummary, ExpirationsListResponse, FillInfo,
     GlobalStatsResponse, HealthResponse, LastTradeResponse, LimitOrderStatus, MarketOrderRequest,
     MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse,
-    ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse, OrderBookSnapshotResponse, OrderInfo,
-    OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
-    OrderTimeInForce, PositionInfo, PositionQuery, PositionResponse, PositionSummary,
-    PositionsListResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth, SnapshotQuery,
-    SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
+    ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse, OptionChainResponse, OptionQuoteData,
+    OrderBookSnapshotResponse, OrderInfo, OrderListQuery, OrderListResponse, OrderSide,
+    OrderStatus, OrderStatusResponse, OrderTimeInForce, PositionInfo, PositionQuery,
+    PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo, QuoteResponse,
+    SnapshotDepth, SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse,
+    UnderlyingSummary, UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -387,6 +388,145 @@ pub async fn list_strikes(
     let strikes = exp_book.strike_prices();
 
     Ok(Json(StrikesListResponse { strikes }))
+}
+
+/// Get the complete option chain matrix for an expiration.
+///
+/// Returns all strikes with both call and put quotes in a single response.
+/// Supports filtering by strike range.
+#[utoipa::path(
+    get,
+    path = "/api/v1/underlyings/{underlying}/expirations/{expiration}/chain",
+    params(
+        ("underlying" = String, Path, description = "Underlying symbol"),
+        ("expiration" = String, Path, description = "Expiration date"),
+        ("min_strike" = Option<u64>, Query, description = "Minimum strike price filter"),
+        ("max_strike" = Option<u64>, Query, description = "Maximum strike price filter")
+    ),
+    responses(
+        (status = 200, description = "Option chain matrix", body = OptionChainResponse),
+        (status = 404, description = "Not found")
+    ),
+    tag = "Chain"
+)]
+pub async fn get_option_chain(
+    State(state): State<Arc<AppState>>,
+    Path((underlying, exp_str)): Path<(String, String)>,
+    Query(query): Query<ChainQuery>,
+) -> Result<Json<OptionChainResponse>, ApiError> {
+    let underlying_book = state
+        .manager
+        .get(&underlying)
+        .map_err(|_| ApiError::UnderlyingNotFound(underlying.clone()))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
+
+    let exp_book = underlying_book
+        .get_expiration(&expiration)
+        .map_err(|_| ApiError::ExpirationNotFound(exp_str.clone()))?;
+
+    // Get all strikes
+    let mut strikes = exp_book.strike_prices();
+    strikes.sort();
+
+    // Apply strike range filters
+    let filtered_strikes: Vec<u64> = strikes
+        .into_iter()
+        .filter(|&strike| {
+            if let Some(min) = query.min_strike
+                && strike < min
+            {
+                return false;
+            }
+            if let Some(max) = query.max_strike
+                && strike > max
+            {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    // Get spot price from price simulator if available
+    let spot_price = state
+        .price_simulator
+        .as_ref()
+        .and_then(|sim| sim.get_price(&underlying))
+        .map(|p| p as u128);
+
+    // Determine ATM strike (closest to spot price)
+    let atm_strike = spot_price.and_then(|spot| {
+        filtered_strikes
+            .iter()
+            .min_by_key(|&&strike| {
+                let strike_128 = strike as u128;
+                strike_128.abs_diff(spot)
+            })
+            .copied()
+    });
+
+    // Build chain data
+    let mut chain: Vec<ChainStrikeRow> = Vec::with_capacity(filtered_strikes.len());
+
+    for strike in filtered_strikes {
+        if let Ok(strike_book) = exp_book.get_strike(strike) {
+            // Get call quote
+            let call_quote = strike_book.call_quote();
+            let call_data =
+                build_option_quote_data(&call_quote, &state, &underlying, &exp_str, strike, "C");
+
+            // Get put quote
+            let put_quote = strike_book.put_quote();
+            let put_data =
+                build_option_quote_data(&put_quote, &state, &underlying, &exp_str, strike, "P");
+
+            chain.push(ChainStrikeRow {
+                strike,
+                call: call_data,
+                put: put_data,
+            });
+        }
+    }
+
+    Ok(Json(OptionChainResponse {
+        underlying: underlying.clone(),
+        expiration: exp_str,
+        spot_price,
+        atm_strike,
+        chain,
+    }))
+}
+
+/// Helper function to build OptionQuoteData from a Quote.
+fn build_option_quote_data(
+    quote: &Quote,
+    state: &Arc<AppState>,
+    underlying: &str,
+    expiration: &str,
+    strike: u64,
+    style_char: &str,
+) -> OptionQuoteData {
+    // Build symbol for last trade lookup
+    let symbol = format!("{}-{}-{}-{}", underlying, expiration, strike, style_char);
+
+    // Get last trade price if available
+    let last_trade = state.last_trades.get(&symbol).map(|entry| entry.price);
+
+    OptionQuoteData {
+        bid: quote.bid_price(),
+        ask: quote.ask_price(),
+        bid_size: quote.bid_size(),
+        ask_size: quote.ask_size(),
+        last_trade: last_trade.map(|p| p as u128),
+        volume: 0,        // Not tracked yet
+        open_interest: 0, // Not tracked yet
+        delta: None,      // Greeks not calculated yet
+        gamma: None,
+        theta: None,
+        vega: None,
+        iv: None,
+    }
 }
 
 /// Create or get a strike.
@@ -3782,5 +3922,235 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Option Chain Matrix Tests
+    // ========================================================================
+
+    #[test]
+    fn test_chain_query_defaults() {
+        use crate::models::ChainQuery;
+
+        let query = ChainQuery {
+            min_strike: None,
+            max_strike: None,
+        };
+        assert!(query.min_strike.is_none());
+        assert!(query.max_strike.is_none());
+
+        let query = ChainQuery {
+            min_strike: Some(14000),
+            max_strike: Some(16000),
+        };
+        assert_eq!(query.min_strike, Some(14000));
+        assert_eq!(query.max_strike, Some(16000));
+    }
+
+    #[test]
+    fn test_option_quote_data_default() {
+        use crate::models::OptionQuoteData;
+
+        let quote = OptionQuoteData::default();
+        assert!(quote.bid.is_none());
+        assert!(quote.ask.is_none());
+        assert_eq!(quote.bid_size, 0);
+        assert_eq!(quote.ask_size, 0);
+        assert!(quote.last_trade.is_none());
+        assert_eq!(quote.volume, 0);
+        assert_eq!(quote.open_interest, 0);
+        assert!(quote.delta.is_none());
+        assert!(quote.gamma.is_none());
+        assert!(quote.theta.is_none());
+        assert!(quote.vega.is_none());
+        assert!(quote.iv.is_none());
+    }
+
+    #[test]
+    fn test_option_quote_data_serialization() {
+        use crate::models::OptionQuoteData;
+
+        let quote = OptionQuoteData {
+            bid: Some(100),
+            ask: Some(105),
+            bid_size: 50,
+            ask_size: 30,
+            last_trade: Some(102),
+            volume: 1000,
+            open_interest: 5000,
+            delta: Some(0.65),
+            gamma: None,
+            theta: None,
+            vega: None,
+            iv: Some(0.32),
+        };
+
+        let json = serde_json::to_string(&quote).unwrap();
+        assert!(json.contains("\"bid\":100"));
+        assert!(json.contains("\"ask\":105"));
+        assert!(json.contains("\"bid_size\":50"));
+        assert!(json.contains("\"delta\":0.65"));
+        assert!(json.contains("\"iv\":0.32"));
+        // gamma, theta, vega should be skipped (None)
+        assert!(!json.contains("\"gamma\""));
+        assert!(!json.contains("\"theta\""));
+        assert!(!json.contains("\"vega\""));
+    }
+
+    #[test]
+    fn test_chain_strike_row_serialization() {
+        use crate::models::{ChainStrikeRow, OptionQuoteData};
+
+        let row = ChainStrikeRow {
+            strike: 15000,
+            call: OptionQuoteData {
+                bid: Some(500),
+                ask: Some(510),
+                ..Default::default()
+            },
+            put: OptionQuoteData {
+                bid: Some(50),
+                ask: Some(55),
+                ..Default::default()
+            },
+        };
+
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("\"strike\":15000"));
+        assert!(json.contains("\"call\""));
+        assert!(json.contains("\"put\""));
+    }
+
+    #[test]
+    fn test_option_chain_response_serialization() {
+        use crate::models::{ChainStrikeRow, OptionChainResponse, OptionQuoteData};
+
+        let response = OptionChainResponse {
+            underlying: "AAPL".to_string(),
+            expiration: "20240329".to_string(),
+            spot_price: Some(15000),
+            atm_strike: Some(15000),
+            chain: vec![ChainStrikeRow {
+                strike: 15000,
+                call: OptionQuoteData::default(),
+                put: OptionQuoteData::default(),
+            }],
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"underlying\":\"AAPL\""));
+        assert!(json.contains("\"expiration\":\"20240329\""));
+        assert!(json.contains("\"spot_price\":15000"));
+        assert!(json.contains("\"atm_strike\":15000"));
+        assert!(json.contains("\"chain\""));
+    }
+
+    #[tokio::test]
+    async fn test_get_option_chain_underlying_not_found() {
+        let state = create_test_state();
+
+        let result = get_option_chain(
+            State(state.clone()),
+            Path(("NONEXISTENT".to_string(), "20251231".to_string())),
+            Query(ChainQuery {
+                min_strike: None,
+                max_strike: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_option_chain_empty() {
+        let state = create_test_state();
+
+        // Create underlying and expiration but no strikes
+        let underlying = state.manager.get_or_create("CHAIN1");
+        let exp = ExpirationDate::Days(optionstratlib::prelude::Positive::new(30.0).unwrap());
+        underlying.get_or_create_expiration(exp);
+
+        let result = get_option_chain(
+            State(state.clone()),
+            Path(("CHAIN1".to_string(), "20251231".to_string())),
+            Query(ChainQuery {
+                min_strike: None,
+                max_strike: None,
+            }),
+        )
+        .await;
+
+        // Should fail because expiration string doesn't match
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_option_chain_with_strikes() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, and strikes
+        let underlying = state.manager.get_or_create("CHAIN2");
+        let exp = ExpirationDate::Days(optionstratlib::prelude::Positive::new(30.0).unwrap());
+        let exp_book = underlying.get_or_create_expiration(exp);
+        exp_book.get_or_create_strike(14000);
+        exp_book.get_or_create_strike(15000);
+        exp_book.get_or_create_strike(16000);
+
+        // Get the expiration string
+        let exp_str = exp.get_date().unwrap().format("%Y%m%d").to_string();
+
+        let result = get_option_chain(
+            State(state.clone()),
+            Path(("CHAIN2".to_string(), exp_str)),
+            Query(ChainQuery {
+                min_strike: None,
+                max_strike: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.underlying, "CHAIN2");
+        assert_eq!(response.chain.len(), 3);
+        // Strikes should be sorted
+        assert_eq!(response.chain[0].strike, 14000);
+        assert_eq!(response.chain[1].strike, 15000);
+        assert_eq!(response.chain[2].strike, 16000);
+    }
+
+    #[tokio::test]
+    async fn test_get_option_chain_with_strike_filter() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, and strikes
+        let underlying = state.manager.get_or_create("CHAIN3");
+        let exp = ExpirationDate::Days(optionstratlib::prelude::Positive::new(30.0).unwrap());
+        let exp_book = underlying.get_or_create_expiration(exp);
+        exp_book.get_or_create_strike(14000);
+        exp_book.get_or_create_strike(15000);
+        exp_book.get_or_create_strike(16000);
+        exp_book.get_or_create_strike(17000);
+
+        // Get the expiration string
+        let exp_str = exp.get_date().unwrap().format("%Y%m%d").to_string();
+
+        let result = get_option_chain(
+            State(state.clone()),
+            Path(("CHAIN3".to_string(), exp_str)),
+            Query(ChainQuery {
+                min_strike: Some(14500),
+                max_strike: Some(16500),
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        // Only strikes 15000 and 16000 should be included
+        assert_eq!(response.chain.len(), 2);
+        assert_eq!(response.chain[0].strike, 15000);
+        assert_eq!(response.chain[1].strike, 16000);
     }
 }

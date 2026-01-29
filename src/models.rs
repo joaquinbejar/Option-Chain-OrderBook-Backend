@@ -1136,3 +1136,78 @@ pub struct CancelAllResponse {
     /// Number of orders that failed to cancel.
     pub failed_count: usize,
 }
+
+// ============================================================================
+// Option Chain Matrix Types
+// ============================================================================
+
+/// Query parameters for option chain endpoint.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ChainQuery {
+    /// Minimum strike price filter.
+    #[serde(default)]
+    pub min_strike: Option<u64>,
+    /// Maximum strike price filter.
+    #[serde(default)]
+    pub max_strike: Option<u64>,
+}
+
+/// Quote data for a single option (call or put).
+#[derive(Debug, Clone, Serialize, ToSchema, Default)]
+pub struct OptionQuoteData {
+    /// Best bid price.
+    pub bid: Option<u128>,
+    /// Best ask price.
+    pub ask: Option<u128>,
+    /// Bid size (quantity at best bid).
+    pub bid_size: u64,
+    /// Ask size (quantity at best ask).
+    pub ask_size: u64,
+    /// Last trade price.
+    pub last_trade: Option<u128>,
+    /// Trading volume (placeholder, not tracked yet).
+    pub volume: u64,
+    /// Open interest (placeholder, not tracked yet).
+    pub open_interest: u64,
+    /// Delta (optional, if Greeks are calculated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<f64>,
+    /// Gamma (optional, if Greeks are calculated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gamma: Option<f64>,
+    /// Theta (optional, if Greeks are calculated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theta: Option<f64>,
+    /// Vega (optional, if Greeks are calculated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vega: Option<f64>,
+    /// Implied volatility (optional, if calculated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iv: Option<f64>,
+}
+
+/// A single row in the option chain matrix (one strike with call and put).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ChainStrikeRow {
+    /// Strike price.
+    pub strike: u64,
+    /// Call option quote data.
+    pub call: OptionQuoteData,
+    /// Put option quote data.
+    pub put: OptionQuoteData,
+}
+
+/// Response for option chain matrix endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OptionChainResponse {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Expiration date string.
+    pub expiration: String,
+    /// Current spot price (if available).
+    pub spot_price: Option<u128>,
+    /// At-the-money strike (closest to spot price).
+    pub atm_strike: Option<u64>,
+    /// Chain data: list of strikes with call and put quotes.
+    pub chain: Vec<ChainStrikeRow>,
+}
