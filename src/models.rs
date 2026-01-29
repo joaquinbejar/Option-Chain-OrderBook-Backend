@@ -44,6 +44,57 @@ impl std::fmt::Display for MarketOrderStatus {
     }
 }
 
+/// Time in force for limit order requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ApiTimeInForce {
+    /// Good till canceled (default).
+    #[default]
+    Gtc,
+    /// Immediate or cancel.
+    Ioc,
+    /// Fill or kill.
+    Fok,
+    /// Good till date.
+    Gtd,
+}
+
+impl std::fmt::Display for ApiTimeInForce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gtc => write!(f, "GTC"),
+            Self::Ioc => write!(f, "IOC"),
+            Self::Fok => write!(f, "FOK"),
+            Self::Gtd => write!(f, "GTD"),
+        }
+    }
+}
+
+/// Limit order execution status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LimitOrderStatus {
+    /// Order was accepted and placed in the book.
+    Accepted,
+    /// Order was fully filled immediately.
+    Filled,
+    /// Order was partially filled (IOC behavior).
+    Partial,
+    /// Order was rejected (FOK not fillable, or other error).
+    Rejected,
+}
+
+impl std::fmt::Display for LimitOrderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Accepted => write!(f, "accepted"),
+            Self::Filled => write!(f, "filled"),
+            Self::Partial => write!(f, "partial"),
+            Self::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
 /// Request to add a limit order.
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct AddOrderRequest {
@@ -53,6 +104,12 @@ pub struct AddOrderRequest {
     pub price: u128,
     /// Order quantity in smallest units.
     pub quantity: u64,
+    /// Time in force (default: GTC).
+    #[serde(default)]
+    pub time_in_force: Option<ApiTimeInForce>,
+    /// Expiration timestamp for GTD orders (ISO 8601 format).
+    #[serde(default)]
+    pub expire_at: Option<String>,
 }
 
 /// Response after adding an order.
@@ -60,7 +117,13 @@ pub struct AddOrderRequest {
 pub struct AddOrderResponse {
     /// The generated order ID.
     pub order_id: String,
-    /// Success message.
+    /// Order execution status.
+    pub status: LimitOrderStatus,
+    /// Quantity that was filled immediately (for IOC/FOK).
+    pub filled_quantity: u64,
+    /// Remaining quantity in the book or unfilled.
+    pub remaining_quantity: u64,
+    /// Descriptive message.
     pub message: String,
 }
 
