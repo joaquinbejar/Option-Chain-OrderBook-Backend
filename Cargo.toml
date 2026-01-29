@@ -17,6 +17,49 @@ members = [
 
 [dependencies]
 # Web framework
+axum = { workspace = true }
+tower-http = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Option Chain OrderBook library
+option-chain-orderbook = { workspace = true }
+optionstratlib = { workspace = true }
+orderbook-rs = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# OpenAPI documentation
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+toml = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+dashmap = { workspace = true }
+futures-util = { workspace = true }
+
+[workspace.dependencies]
+# Web framework
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
 
@@ -56,6 +99,10 @@ toml = "0.9"
 rust_decimal = "1.40"
 rust_decimal_macros = "1.40"
 dashmap = "6.1"
+futures-util = "0.3"
+reqwest = { version = "0.13", features = ["json"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+url = "2.5"
 
 [dev-dependencies]
 
