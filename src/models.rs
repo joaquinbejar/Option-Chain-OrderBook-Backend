@@ -1211,3 +1211,65 @@ pub struct OptionChainResponse {
     /// Chain data: list of strikes with call and put quotes.
     pub chain: Vec<ChainStrikeRow>,
 }
+
+// ============================================================================
+// Greeks Types
+// ============================================================================
+
+/// Greeks data for an option.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GreeksData {
+    /// Delta: rate of change of option price with respect to underlying price.
+    pub delta: f64,
+    /// Gamma: rate of change of delta with respect to underlying price.
+    pub gamma: f64,
+    /// Theta: rate of change of option price with respect to time (daily).
+    pub theta: f64,
+    /// Vega: rate of change of option price with respect to volatility.
+    pub vega: f64,
+    /// Rho: rate of change of option price with respect to interest rate.
+    pub rho: f64,
+    /// Vanna: sensitivity of delta to changes in volatility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vanna: Option<f64>,
+    /// Vomma: sensitivity of vega to changes in volatility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vomma: Option<f64>,
+    /// Charm: rate of change of delta with respect to time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charm: Option<f64>,
+    /// Color: rate of change of gamma with respect to time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<f64>,
+}
+
+impl Default for GreeksData {
+    fn default() -> Self {
+        Self {
+            delta: 0.0,
+            gamma: 0.0,
+            theta: 0.0,
+            vega: 0.0,
+            rho: 0.0,
+            vanna: None,
+            vomma: None,
+            charm: None,
+            color: None,
+        }
+    }
+}
+
+/// Response for Greeks endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GreeksResponse {
+    /// Option symbol.
+    pub symbol: String,
+    /// Greeks values.
+    pub greeks: GreeksData,
+    /// Implied volatility used for calculation.
+    pub iv: f64,
+    /// Theoretical option value.
+    pub theoretical_value: f64,
+    /// Timestamp of calculation in milliseconds.
+    pub timestamp_ms: u64,
+}
