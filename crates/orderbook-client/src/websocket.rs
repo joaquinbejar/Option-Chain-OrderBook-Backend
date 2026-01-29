@@ -80,6 +80,72 @@ pub enum WsMessage {
         /// Timestamp in milliseconds.
         timestamp: u64,
     },
+    /// Orderbook snapshot.
+    #[serde(rename = "orderbook_snapshot")]
+    OrderbookSnapshot {
+        /// Channel name.
+        channel: String,
+        /// Symbol identifier.
+        symbol: String,
+        /// Sequence number for ordering.
+        sequence: u64,
+        /// Bid price levels.
+        bids: Vec<PriceLevelData>,
+        /// Ask price levels.
+        asks: Vec<PriceLevelData>,
+    },
+    /// Orderbook delta (incremental update).
+    #[serde(rename = "orderbook_delta")]
+    OrderbookDelta {
+        /// Symbol identifier.
+        symbol: String,
+        /// Sequence number for ordering.
+        sequence: u64,
+        /// List of price level changes.
+        changes: Vec<PriceLevelChange>,
+    },
+    /// Subscription confirmation.
+    #[serde(rename = "subscribed")]
+    Subscribed {
+        /// Channel name.
+        channel: String,
+        /// Symbol subscribed to.
+        symbol: String,
+    },
+    /// Unsubscription confirmation.
+    #[serde(rename = "unsubscribed")]
+    Unsubscribed {
+        /// Channel name.
+        channel: String,
+        /// Symbol unsubscribed from.
+        symbol: String,
+    },
+    /// Error message.
+    #[serde(rename = "error")]
+    Error {
+        /// Error message.
+        message: String,
+    },
+}
+
+/// Price level data for snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceLevelData {
+    /// Price in smallest units.
+    pub price: u128,
+    /// Quantity at this price level.
+    pub quantity: u64,
+}
+
+/// Price level change for delta updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceLevelChange {
+    /// Side of the orderbook ("bid" or "ask").
+    pub side: String,
+    /// Price in smallest units.
+    pub price: u128,
+    /// New quantity at this price level (0 means level removed).
+    pub quantity: u64,
 }
 
 /// Commands that can be sent to the server.
@@ -87,9 +153,15 @@ pub enum WsMessage {
 pub struct ClientCommand {
     /// Action to perform.
     pub action: String,
+    /// Optional channel (e.g., "orderbook").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
     /// Optional symbol.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    /// Optional depth for orderbook subscriptions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
     /// Optional value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
@@ -101,7 +173,21 @@ impl ClientCommand {
     pub fn subscribe(symbol: &str) -> Self {
         Self {
             action: "subscribe".to_string(),
+            channel: None,
             symbol: Some(symbol.to_string()),
+            depth: None,
+            value: None,
+        }
+    }
+
+    /// Creates an orderbook subscribe command.
+    #[must_use]
+    pub fn subscribe_orderbook(symbol: &str, depth: Option<usize>) -> Self {
+        Self {
+            action: "subscribe".to_string(),
+            channel: Some("orderbook".to_string()),
+            symbol: Some(symbol.to_string()),
+            depth,
             value: None,
         }
     }
@@ -111,7 +197,21 @@ impl ClientCommand {
     pub fn unsubscribe(symbol: &str) -> Self {
         Self {
             action: "unsubscribe".to_string(),
+            channel: None,
             symbol: Some(symbol.to_string()),
+            depth: None,
+            value: None,
+        }
+    }
+
+    /// Creates an orderbook unsubscribe command.
+    #[must_use]
+    pub fn unsubscribe_orderbook(symbol: &str) -> Self {
+        Self {
+            action: "unsubscribe".to_string(),
+            channel: Some("orderbook".to_string()),
+            symbol: Some(symbol.to_string()),
+            depth: None,
             value: None,
         }
     }
@@ -121,7 +221,9 @@ impl ClientCommand {
     pub fn set_spread(value: f64) -> Self {
         Self {
             action: "set_spread".to_string(),
+            channel: None,
             symbol: None,
+            depth: None,
             value: Some(value),
         }
     }
@@ -131,7 +233,9 @@ impl ClientCommand {
     pub fn set_size(value: f64) -> Self {
         Self {
             action: "set_size".to_string(),
+            channel: None,
             symbol: None,
+            depth: None,
             value: Some(value),
         }
     }
@@ -141,7 +245,9 @@ impl ClientCommand {
     pub fn set_skew(value: f64) -> Self {
         Self {
             action: "set_skew".to_string(),
+            channel: None,
             symbol: None,
+            depth: None,
             value: Some(value),
         }
     }
@@ -151,7 +257,9 @@ impl ClientCommand {
     pub fn kill() -> Self {
         Self {
             action: "kill".to_string(),
+            channel: None,
             symbol: None,
+            depth: None,
             value: None,
         }
     }
@@ -161,7 +269,9 @@ impl ClientCommand {
     pub fn enable() -> Self {
         Self {
             action: "enable".to_string(),
+            channel: None,
             symbol: None,
+            depth: None,
             value: None,
         }
     }
@@ -255,5 +365,31 @@ impl WsClient {
     /// Returns error if the send fails.
     pub async fn unsubscribe(&self, symbol: &str) -> Result<(), Error> {
         self.send(ClientCommand::unsubscribe(symbol)).await
+    }
+
+    /// Subscribes to orderbook updates for a symbol.
+    ///
+    /// # Arguments
+    /// * `symbol` - Symbol in format "UNDERLYING-EXPIRATION-STRIKE-STYLE"
+    /// * `depth` - Optional depth (default: 10)
+    ///
+    /// # Errors
+    /// Returns error if the send fails.
+    pub async fn subscribe_orderbook(
+        &self,
+        symbol: &str,
+        depth: Option<usize>,
+    ) -> Result<(), Error> {
+        self.send(ClientCommand::subscribe_orderbook(symbol, depth))
+            .await
+    }
+
+    /// Unsubscribes from orderbook updates for a symbol.
+    ///
+    /// # Errors
+    /// Returns error if the send fails.
+    pub async fn unsubscribe_orderbook(&self, symbol: &str) -> Result<(), Error> {
+        self.send(ClientCommand::unsubscribe_orderbook(symbol))
+            .await
     }
 }

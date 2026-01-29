@@ -1,5 +1,6 @@
 //! Application state management.
 
+use crate::api::websocket::OrderbookSubscriptionManager;
 use crate::config::{AssetConfig, Config};
 use crate::db::DatabasePool;
 use crate::market_maker::MarketMakerEngine;
@@ -30,6 +31,8 @@ pub struct AppState {
     pub orders: Arc<DashMap<String, OrderInfo>>,
     /// Storage for position information by symbol.
     pub positions: Arc<DashMap<String, PositionInfo>>,
+    /// Orderbook subscription manager for WebSocket real-time updates.
+    pub orderbook_subscriptions: Arc<OrderbookSubscriptionManager>,
 }
 
 impl AppState {
@@ -48,6 +51,7 @@ impl AppState {
             last_trades: Arc::new(DashMap::new()),
             orders: Arc::new(DashMap::new()),
             positions: Arc::new(DashMap::new()),
+            orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
         }
     }
 
@@ -69,6 +73,7 @@ impl AppState {
             last_trades: Arc::new(DashMap::new()),
             orders: Arc::new(DashMap::new()),
             positions: Arc::new(DashMap::new()),
+            orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
         }
     }
 
@@ -105,6 +110,7 @@ impl AppState {
             last_trades: Arc::new(DashMap::new()),
             orders: Arc::new(DashMap::new()),
             positions: Arc::new(DashMap::new()),
+            orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
         }
     }
 
