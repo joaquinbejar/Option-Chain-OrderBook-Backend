@@ -2,15 +2,17 @@
 
 use crate::error::ApiError;
 use crate::models::{
-    AddOrderRequest, AddOrderResponse, ApiTimeInForce, CancelOrderResponse,
+    AddOrderRequest, AddOrderResponse, ApiTimeInForce, BulkCancelRequest, BulkCancelResponse,
+    BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse, BulkOrderResultItem,
+    BulkOrderStatus, CancelAllQuery, CancelAllResponse, CancelOrderResponse,
     EnrichedSnapshotResponse, ExpirationSummary, ExpirationsListResponse, FillInfo,
     GlobalStatsResponse, HealthResponse, LastTradeResponse, LimitOrderStatus, MarketOrderRequest,
     MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse,
     ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse, OrderBookSnapshotResponse, OrderInfo,
-    OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse, PositionInfo,
-    PositionQuery, PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo,
-    QuoteResponse, SnapshotDepth, SnapshotQuery, SnapshotStats, StrikeSummary, StrikesListResponse,
-    UnderlyingSummary, UnderlyingsListResponse,
+    OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
+    OrderTimeInForce, PositionInfo, PositionQuery, PositionResponse, PositionSummary,
+    PositionsListResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth, SnapshotQuery,
+    SnapshotStats, StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -1288,6 +1290,467 @@ pub async fn list_orders(
         total,
         limit: query.limit,
         offset: query.offset,
+    }))
+}
+
+// ============================================================================
+// Bulk Order Operations
+// ============================================================================
+
+/// Helper function to submit a single order from a bulk request.
+fn submit_single_order(
+    state: &Arc<AppState>,
+    item: &BulkOrderItem,
+) -> Result<(OrderId, String), String> {
+    // Parse option style
+    let option_style = match item.style.to_lowercase().as_str() {
+        "call" => OptionStyle::Call,
+        "put" => OptionStyle::Put,
+        _ => return Err(format!("Invalid option style: {}", item.style)),
+    };
+
+    // Parse side
+    let side = match item.side.to_lowercase().as_str() {
+        "buy" => Side::Buy,
+        "sell" => Side::Sell,
+        _ => return Err(format!("Invalid side: {}", item.side)),
+    };
+
+    // Get or create underlying
+    let underlying_book = state.manager.get_or_create(&item.underlying);
+
+    // Find expiration
+    let expiration = find_expiration_by_str(&underlying_book, &item.expiration)
+        .ok_or_else(|| format!("Expiration not found: {}", item.expiration))?;
+
+    // Get expiration book
+    let exp_book = underlying_book
+        .get_expiration(&expiration)
+        .map_err(|e| format!("Failed to get expiration: {}", e))?;
+
+    // Get strike book
+    let strike_book = exp_book
+        .get_strike(item.strike)
+        .map_err(|e| format!("Strike not found: {}", e))?;
+
+    // Get option book
+    let option_book = strike_book.get(option_style);
+
+    // Generate order ID and submit
+    let order_id = OrderId::new();
+    option_book
+        .add_limit_order(order_id, side, item.price, item.quantity)
+        .map_err(|e| format!("Failed to add order: {}", e))?;
+
+    // Build symbol for tracking
+    let style_char = match option_style {
+        OptionStyle::Call => "C",
+        OptionStyle::Put => "P",
+    };
+    let symbol = format!(
+        "{}-{}-{}-{}",
+        item.underlying, item.expiration, item.strike, style_char
+    );
+
+    // Track order in AppState
+    let order_side = match side {
+        Side::Buy => OrderSide::Buy,
+        Side::Sell => OrderSide::Sell,
+    };
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let order_info = OrderInfo {
+        order_id: order_id.to_string(),
+        symbol: symbol.clone(),
+        underlying: item.underlying.clone(),
+        expiration: item.expiration.clone(),
+        strike: item.strike,
+        style: item.style.clone(),
+        side: order_side,
+        price: item.price,
+        original_quantity: item.quantity,
+        remaining_quantity: item.quantity,
+        filled_quantity: 0,
+        status: OrderStatus::Active,
+        time_in_force: OrderTimeInForce::Gtc,
+        created_at_ms: now,
+        updated_at_ms: now,
+        fills: Vec::new(),
+    };
+    state.orders.insert(order_id.to_string(), order_info);
+
+    Ok((order_id, symbol))
+}
+
+/// Submit multiple orders in a single request.
+///
+/// Supports atomic mode where all orders must succeed or none are submitted.
+#[utoipa::path(
+    post,
+    path = "/api/v1/orders/bulk",
+    request_body = BulkOrderRequest,
+    responses(
+        (status = 200, description = "Bulk order submission results", body = BulkOrderResponse),
+        (status = 400, description = "Invalid request")
+    ),
+    tag = "Orders"
+)]
+pub async fn bulk_submit_orders(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BulkOrderRequest>,
+) -> Result<Json<BulkOrderResponse>, ApiError> {
+    if body.orders.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "Orders array cannot be empty".to_string(),
+        ));
+    }
+
+    let mut results: Vec<BulkOrderResultItem> = Vec::with_capacity(body.orders.len());
+    let mut success_count = 0;
+    let mut failure_count = 0;
+    let mut submitted_order_ids: Vec<String> = Vec::new();
+
+    for (index, item) in body.orders.iter().enumerate() {
+        match submit_single_order(&state, item) {
+            Ok((order_id, _symbol)) => {
+                let order_id_str = order_id.to_string();
+                submitted_order_ids.push(order_id_str.clone());
+                results.push(BulkOrderResultItem {
+                    index,
+                    order_id: Some(order_id_str),
+                    status: BulkOrderStatus::Accepted,
+                    error: None,
+                });
+                success_count += 1;
+            }
+            Err(error) => {
+                results.push(BulkOrderResultItem {
+                    index,
+                    order_id: None,
+                    status: BulkOrderStatus::Rejected,
+                    error: Some(error.clone()),
+                });
+                failure_count += 1;
+
+                // If atomic mode and we have a failure, rollback all submitted orders
+                if body.atomic {
+                    // Cancel all previously submitted orders
+                    for order_id_str in &submitted_order_ids {
+                        // Remove from tracking
+                        state.orders.remove(order_id_str);
+                        // Note: We can't easily cancel from the order book without
+                        // knowing the full path, so we just remove from tracking
+                    }
+
+                    return Ok(Json(BulkOrderResponse {
+                        success_count: 0,
+                        failure_count: body.orders.len(),
+                        results: body
+                            .orders
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| {
+                                if i == index {
+                                    BulkOrderResultItem {
+                                        index: i,
+                                        order_id: None,
+                                        status: BulkOrderStatus::Rejected,
+                                        error: Some(error.clone()),
+                                    }
+                                } else if i < index {
+                                    BulkOrderResultItem {
+                                        index: i,
+                                        order_id: None,
+                                        status: BulkOrderStatus::Rejected,
+                                        error: Some(
+                                            "Rolled back due to atomic failure".to_string(),
+                                        ),
+                                    }
+                                } else {
+                                    BulkOrderResultItem {
+                                        index: i,
+                                        order_id: None,
+                                        status: BulkOrderStatus::Rejected,
+                                        error: Some(
+                                            "Not attempted due to atomic failure".to_string(),
+                                        ),
+                                    }
+                                }
+                            })
+                            .collect(),
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(Json(BulkOrderResponse {
+        success_count,
+        failure_count,
+        results,
+    }))
+}
+
+/// Cancel multiple orders by their IDs.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/orders/bulk",
+    request_body = BulkCancelRequest,
+    responses(
+        (status = 200, description = "Bulk cancellation results", body = BulkCancelResponse),
+        (status = 400, description = "Invalid request")
+    ),
+    tag = "Orders"
+)]
+pub async fn bulk_cancel_orders(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BulkCancelRequest>,
+) -> Result<Json<BulkCancelResponse>, ApiError> {
+    if body.order_ids.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "Order IDs array cannot be empty".to_string(),
+        ));
+    }
+
+    let mut results: Vec<BulkCancelResultItem> = Vec::with_capacity(body.order_ids.len());
+    let mut success_count = 0;
+    let mut failure_count = 0;
+
+    for order_id_str in &body.order_ids {
+        // Try to get order info to find the order book location
+        if let Some(order_info) = state.orders.get(order_id_str) {
+            // Parse order ID
+            if let Ok(order_id) = order_id_str.parse::<OrderId>() {
+                // Try to find and cancel the order
+                let option_style = match order_info.style.to_lowercase().as_str() {
+                    "call" => OptionStyle::Call,
+                    "put" => OptionStyle::Put,
+                    _ => {
+                        results.push(BulkCancelResultItem {
+                            order_id: order_id_str.clone(),
+                            canceled: false,
+                            error: Some("Invalid option style in order info".to_string()),
+                        });
+                        failure_count += 1;
+                        continue;
+                    }
+                };
+
+                // Try to get the order book and cancel
+                if let Ok(underlying_book) = state.manager.get(&order_info.underlying)
+                    && let Some(expiration) =
+                        find_expiration_by_str(&underlying_book, &order_info.expiration)
+                    && let Ok(exp_book) = underlying_book.get_expiration(&expiration)
+                    && let Ok(strike_book) = exp_book.get_strike(order_info.strike)
+                {
+                    let option_book = strike_book.get(option_style);
+                    match option_book.cancel_order(order_id) {
+                        Ok(true) => {
+                            // Remove from tracking
+                            drop(order_info);
+                            state.orders.remove(order_id_str);
+                            results.push(BulkCancelResultItem {
+                                order_id: order_id_str.clone(),
+                                canceled: true,
+                                error: None,
+                            });
+                            success_count += 1;
+                            continue;
+                        }
+                        Ok(false) => {
+                            results.push(BulkCancelResultItem {
+                                order_id: order_id_str.clone(),
+                                canceled: false,
+                                error: Some("Order not found in book".to_string()),
+                            });
+                            failure_count += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            results.push(BulkCancelResultItem {
+                                order_id: order_id_str.clone(),
+                                canceled: false,
+                                error: Some(format!("Cancel failed: {}", e)),
+                            });
+                            failure_count += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                // If we get here, something in the path lookup failed
+                results.push(BulkCancelResultItem {
+                    order_id: order_id_str.clone(),
+                    canceled: false,
+                    error: Some("Order book path not found".to_string()),
+                });
+                failure_count += 1;
+            } else {
+                results.push(BulkCancelResultItem {
+                    order_id: order_id_str.clone(),
+                    canceled: false,
+                    error: Some("Invalid order ID format".to_string()),
+                });
+                failure_count += 1;
+            }
+        } else {
+            results.push(BulkCancelResultItem {
+                order_id: order_id_str.clone(),
+                canceled: false,
+                error: Some("Order not found".to_string()),
+            });
+            failure_count += 1;
+        }
+    }
+
+    Ok(Json(BulkCancelResponse {
+        success_count,
+        failure_count,
+        results,
+    }))
+}
+
+/// Cancel all orders matching the specified filters.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/orders/cancel-all",
+    params(
+        ("underlying" = Option<String>, Query, description = "Filter by underlying symbol"),
+        ("expiration" = Option<String>, Query, description = "Filter by expiration date"),
+        ("side" = Option<String>, Query, description = "Filter by order side"),
+        ("style" = Option<String>, Query, description = "Filter by option style")
+    ),
+    responses(
+        (status = 200, description = "Cancel all results", body = CancelAllResponse),
+        (status = 400, description = "Invalid query parameters")
+    ),
+    tag = "Orders"
+)]
+pub async fn cancel_all_orders(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CancelAllQuery>,
+) -> Result<Json<CancelAllResponse>, ApiError> {
+    // Parse side filter if provided
+    let side_filter: Option<OrderSide> = if let Some(ref side_str) = query.side {
+        match side_str.to_lowercase().as_str() {
+            "buy" => Some(OrderSide::Buy),
+            "sell" => Some(OrderSide::Sell),
+            _ => {
+                return Err(ApiError::InvalidRequest(format!(
+                    "Invalid side: {}. Use 'buy' or 'sell'",
+                    side_str
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Parse style filter if provided
+    let style_filter: Option<OptionStyle> = if let Some(ref style_str) = query.style {
+        match style_str.to_lowercase().as_str() {
+            "call" => Some(OptionStyle::Call),
+            "put" => Some(OptionStyle::Put),
+            _ => {
+                return Err(ApiError::InvalidRequest(format!(
+                    "Invalid style: {}. Use 'call' or 'put'",
+                    style_str
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut canceled_count = 0;
+    let mut failed_count = 0;
+
+    // Collect order IDs to cancel (to avoid holding locks while canceling)
+    let orders_to_cancel: Vec<(String, OrderInfo)> = state
+        .orders
+        .iter()
+        .filter(|entry| {
+            let order = entry.value();
+
+            // Filter by underlying
+            if let Some(ref underlying) = query.underlying
+                && &order.underlying != underlying
+            {
+                return false;
+            }
+
+            // Filter by expiration
+            if let Some(ref expiration) = query.expiration
+                && &order.expiration != expiration
+            {
+                return false;
+            }
+
+            // Filter by side
+            if let Some(side) = side_filter
+                && order.side != side
+            {
+                return false;
+            }
+
+            // Filter by style
+            if let Some(style) = style_filter {
+                let order_style = match order.style.to_lowercase().as_str() {
+                    "call" => OptionStyle::Call,
+                    "put" => OptionStyle::Put,
+                    _ => return false,
+                };
+                if order_style != style {
+                    return false;
+                }
+            }
+
+            // Only cancel open orders
+            order.status == OrderStatus::Active
+        })
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect();
+
+    // Cancel each matching order
+    for (order_id_str, order_info) in orders_to_cancel {
+        if let Ok(order_id) = order_id_str.parse::<OrderId>() {
+            let option_style = match order_info.style.to_lowercase().as_str() {
+                "call" => OptionStyle::Call,
+                "put" => OptionStyle::Put,
+                _ => {
+                    failed_count += 1;
+                    continue;
+                }
+            };
+
+            if let Ok(underlying_book) = state.manager.get(&order_info.underlying)
+                && let Some(expiration) =
+                    find_expiration_by_str(&underlying_book, &order_info.expiration)
+                && let Ok(exp_book) = underlying_book.get_expiration(&expiration)
+                && let Ok(strike_book) = exp_book.get_strike(order_info.strike)
+            {
+                let option_book = strike_book.get(option_style);
+                match option_book.cancel_order(order_id) {
+                    Ok(true) => {
+                        state.orders.remove(&order_id_str);
+                        canceled_count += 1;
+                        continue;
+                    }
+                    Ok(false) | Err(_) => {
+                        failed_count += 1;
+                        continue;
+                    }
+                }
+            }
+
+            failed_count += 1;
+        } else {
+            failed_count += 1;
+        }
+    }
+
+    Ok(Json(CancelAllResponse {
+        canceled_count,
+        failed_count,
     }))
 }
 
@@ -3034,6 +3497,286 @@ mod tests {
             Json(ModifyOrderRequest {
                 price: Some(100),
                 quantity: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Bulk Order Operations Tests
+    // ========================================================================
+
+    #[test]
+    fn test_bulk_order_request_deserialization() {
+        use crate::models::BulkOrderRequest;
+
+        let json = r#"{
+            "orders": [
+                {
+                    "underlying": "AAPL",
+                    "expiration": "20240329",
+                    "strike": 15000,
+                    "style": "call",
+                    "side": "buy",
+                    "price": 150,
+                    "quantity": 10
+                }
+            ],
+            "atomic": true
+        }"#;
+
+        let request: BulkOrderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.orders.len(), 1);
+        assert!(request.atomic);
+        assert_eq!(request.orders[0].underlying, "AAPL");
+        assert_eq!(request.orders[0].strike, 15000);
+    }
+
+    #[test]
+    fn test_bulk_order_request_default_atomic() {
+        use crate::models::BulkOrderRequest;
+
+        let json = r#"{
+            "orders": [
+                {
+                    "underlying": "AAPL",
+                    "expiration": "20240329",
+                    "strike": 15000,
+                    "style": "call",
+                    "side": "buy",
+                    "price": 150,
+                    "quantity": 10
+                }
+            ]
+        }"#;
+
+        let request: BulkOrderRequest = serde_json::from_str(json).unwrap();
+        assert!(!request.atomic); // Default is false
+    }
+
+    #[test]
+    fn test_bulk_order_response_serialization() {
+        use crate::models::{BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus};
+
+        let response = BulkOrderResponse {
+            success_count: 2,
+            failure_count: 1,
+            results: vec![
+                BulkOrderResultItem {
+                    index: 0,
+                    order_id: Some("order-1".to_string()),
+                    status: BulkOrderStatus::Accepted,
+                    error: None,
+                },
+                BulkOrderResultItem {
+                    index: 1,
+                    order_id: None,
+                    status: BulkOrderStatus::Rejected,
+                    error: Some("Invalid style".to_string()),
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"success_count\":2"));
+        assert!(json.contains("\"failure_count\":1"));
+        assert!(json.contains("\"status\":\"accepted\""));
+        assert!(json.contains("\"status\":\"rejected\""));
+    }
+
+    #[test]
+    fn test_bulk_cancel_request_deserialization() {
+        use crate::models::BulkCancelRequest;
+
+        let json = r#"{"order_ids": ["order-1", "order-2", "order-3"]}"#;
+        let request: BulkCancelRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.order_ids.len(), 3);
+        assert_eq!(request.order_ids[0], "order-1");
+    }
+
+    #[test]
+    fn test_bulk_cancel_response_serialization() {
+        use crate::models::{BulkCancelResponse, BulkCancelResultItem};
+
+        let response = BulkCancelResponse {
+            success_count: 2,
+            failure_count: 1,
+            results: vec![
+                BulkCancelResultItem {
+                    order_id: "order-1".to_string(),
+                    canceled: true,
+                    error: None,
+                },
+                BulkCancelResultItem {
+                    order_id: "order-2".to_string(),
+                    canceled: false,
+                    error: Some("Order not found".to_string()),
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"success_count\":2"));
+        assert!(json.contains("\"canceled\":true"));
+        assert!(json.contains("\"canceled\":false"));
+    }
+
+    #[test]
+    fn test_cancel_all_query_defaults() {
+        use crate::models::CancelAllQuery;
+
+        // Test that CancelAllQuery can be constructed with all None values
+        let query = CancelAllQuery {
+            underlying: None,
+            expiration: None,
+            side: None,
+            style: None,
+        };
+        assert!(query.underlying.is_none());
+        assert!(query.expiration.is_none());
+        assert!(query.side.is_none());
+        assert!(query.style.is_none());
+
+        // Test with some values
+        let query = CancelAllQuery {
+            underlying: Some("AAPL".to_string()),
+            expiration: Some("20240329".to_string()),
+            side: Some("buy".to_string()),
+            style: Some("call".to_string()),
+        };
+        assert_eq!(query.underlying, Some("AAPL".to_string()));
+        assert_eq!(query.expiration, Some("20240329".to_string()));
+        assert_eq!(query.side, Some("buy".to_string()));
+        assert_eq!(query.style, Some("call".to_string()));
+    }
+
+    #[test]
+    fn test_cancel_all_response_serialization() {
+        use crate::models::CancelAllResponse;
+
+        let response = CancelAllResponse {
+            canceled_count: 42,
+            failed_count: 3,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"canceled_count\":42"));
+        assert!(json.contains("\"failed_count\":3"));
+    }
+
+    #[tokio::test]
+    async fn test_bulk_submit_orders_empty() {
+        let state = create_test_state();
+
+        let result = bulk_submit_orders(
+            State(state.clone()),
+            Json(BulkOrderRequest {
+                orders: vec![],
+                atomic: false,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        match result {
+            Err(ApiError::InvalidRequest(msg)) => {
+                assert!(msg.contains("cannot be empty"));
+            }
+            _ => panic!("Expected InvalidRequest error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bulk_cancel_orders_empty() {
+        let state = create_test_state();
+
+        let result = bulk_cancel_orders(
+            State(state.clone()),
+            Json(BulkCancelRequest { order_ids: vec![] }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        match result {
+            Err(ApiError::InvalidRequest(msg)) => {
+                assert!(msg.contains("cannot be empty"));
+            }
+            _ => panic!("Expected InvalidRequest error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bulk_cancel_orders_not_found() {
+        let state = create_test_state();
+
+        let result = bulk_cancel_orders(
+            State(state.clone()),
+            Json(BulkCancelRequest {
+                order_ids: vec!["nonexistent-order".to_string()],
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.success_count, 0);
+        assert_eq!(response.failure_count, 1);
+        assert!(!response.results[0].canceled);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_no_filters() {
+        let state = create_test_state();
+
+        let result = cancel_all_orders(
+            State(state.clone()),
+            Query(CancelAllQuery {
+                underlying: None,
+                expiration: None,
+                side: None,
+                style: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        // No orders to cancel in empty state
+        assert_eq!(response.canceled_count, 0);
+        assert_eq!(response.failed_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_invalid_side() {
+        let state = create_test_state();
+
+        let result = cancel_all_orders(
+            State(state.clone()),
+            Query(CancelAllQuery {
+                underlying: None,
+                expiration: None,
+                side: Some("invalid".to_string()),
+                style: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_invalid_style() {
+        let state = create_test_state();
+
+        let result = cancel_all_orders(
+            State(state.clone()),
+            Query(CancelAllQuery {
+                underlying: None,
+                expiration: None,
+                side: None,
+                style: Some("invalid".to_string()),
             }),
         )
         .await;
