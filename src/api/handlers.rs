@@ -2,15 +2,16 @@
 
 use crate::error::ApiError;
 use crate::models::{
-    ATMTermStructurePoint, AddOrderRequest, AddOrderResponse, ApiTimeInForce, BulkCancelRequest,
-    BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
-    BulkOrderResultItem, BulkOrderStatus, CancelAllQuery, CancelAllResponse, CancelOrderResponse,
-    ChainQuery, ChainStrikeRow, EnrichedSnapshotResponse, ExpirationSummary,
-    ExpirationsListResponse, FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse,
-    HealthResponse, LastTradeResponse, LimitOrderStatus, MarketOrderRequest, MarketOrderResponse,
-    MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse, ModifyOrderStatus, OhlcInterval,
-    OhlcQuery, OhlcResponse, OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse,
-    OrderInfo, OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
+    ATMTermStructurePoint, AddOrderRequest, AddOrderResponse, ApiKeyListResponse, ApiTimeInForce,
+    BulkCancelRequest, BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest,
+    BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus, CancelAllQuery, CancelAllResponse,
+    CancelOrderResponse, ChainQuery, ChainStrikeRow, CreateApiKeyRequest, CreateApiKeyResponse,
+    DeleteApiKeyResponse, EnrichedSnapshotResponse, ExpirationSummary, ExpirationsListResponse,
+    FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse, HealthResponse, LastTradeResponse,
+    LimitOrderStatus, MarketOrderRequest, MarketOrderResponse, MarketOrderStatus,
+    ModifyOrderRequest, ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery,
+    OhlcResponse, OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderInfo,
+    OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
     OrderTimeInForce, PositionInfo, PositionQuery, PositionResponse, PositionSummary,
     PositionsListResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth, SnapshotQuery,
     SnapshotStats, StrikeIV, StrikeSummary, StrikesListResponse, UnderlyingSummary,
@@ -126,6 +127,85 @@ pub async fn health_check() -> Json<HealthResponse> {
         status: "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+// ============================================================================
+// Authentication and API Key Management
+// ============================================================================
+
+/// Create a new API key.
+///
+/// Creates a new API key with the specified name, permissions, and rate limit.
+/// The raw API key is only returned once and should be stored securely.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/keys",
+    request_body = CreateApiKeyRequest,
+    responses(
+        (status = 200, description = "API key created", body = CreateApiKeyResponse)
+    ),
+    tag = "Authentication"
+)]
+pub async fn create_api_key(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateApiKeyRequest>,
+) -> Json<CreateApiKeyResponse> {
+    let (key_id, raw_key) = state.api_key_store.create_key(
+        request.name.clone(),
+        request.permissions.clone(),
+        request.rate_limit,
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    Json(CreateApiKeyResponse {
+        key_id,
+        api_key: raw_key,
+        name: request.name,
+        permissions: request.permissions,
+        created_at: now,
+    })
+}
+
+/// List all API keys.
+///
+/// Returns a list of all API keys without the raw key values.
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/keys",
+    responses(
+        (status = 200, description = "List of API keys", body = ApiKeyListResponse)
+    ),
+    tag = "Authentication"
+)]
+pub async fn list_api_keys(State(state): State<Arc<AppState>>) -> Json<ApiKeyListResponse> {
+    let keys = state.api_key_store.list_keys();
+    Json(ApiKeyListResponse { keys })
+}
+
+/// Delete an API key.
+///
+/// Deletes an API key by its ID. Returns success status.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/auth/keys/{key_id}",
+    params(
+        ("key_id" = String, Path, description = "API key ID to delete")
+    ),
+    responses(
+        (status = 200, description = "API key deleted", body = DeleteApiKeyResponse)
+    ),
+    tag = "Authentication"
+)]
+pub async fn delete_api_key(
+    State(state): State<Arc<AppState>>,
+    Path(key_id): Path<String>,
+) -> Json<DeleteApiKeyResponse> {
+    let success = state.api_key_store.delete_key(&key_id);
+    Json(DeleteApiKeyResponse { success })
 }
 
 // ============================================================================
@@ -4811,5 +4891,164 @@ mod tests {
         // Neither
         let quote4 = Quote::new(None, 0, None, 0, 0);
         assert_eq!(calculate_mid_price(&quote4), None);
+    }
+
+    // ========================================================================
+    // Authentication Tests
+    // ========================================================================
+
+    #[test]
+    fn test_permission_serialization() {
+        use crate::models::Permission;
+
+        let read = Permission::Read;
+        let trade = Permission::Trade;
+        let admin = Permission::Admin;
+
+        assert_eq!(serde_json::to_string(&read).unwrap(), "\"read\"");
+        assert_eq!(serde_json::to_string(&trade).unwrap(), "\"trade\"");
+        assert_eq!(serde_json::to_string(&admin).unwrap(), "\"admin\"");
+    }
+
+    #[test]
+    fn test_permission_deserialization() {
+        use crate::models::Permission;
+
+        let read: Permission = serde_json::from_str("\"read\"").unwrap();
+        let trade: Permission = serde_json::from_str("\"trade\"").unwrap();
+        let admin: Permission = serde_json::from_str("\"admin\"").unwrap();
+
+        assert_eq!(read, Permission::Read);
+        assert_eq!(trade, Permission::Trade);
+        assert_eq!(admin, Permission::Admin);
+    }
+
+    #[test]
+    fn test_create_api_key_request_deserialization() {
+        use crate::models::{CreateApiKeyRequest, Permission};
+
+        let json = r#"{"name": "Test Key", "permissions": ["read", "trade"], "rate_limit": 500}"#;
+        let request: CreateApiKeyRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(request.name, "Test Key");
+        assert_eq!(request.permissions.len(), 2);
+        assert!(request.permissions.contains(&Permission::Read));
+        assert!(request.permissions.contains(&Permission::Trade));
+        assert_eq!(request.rate_limit, 500);
+    }
+
+    #[test]
+    fn test_create_api_key_request_default_rate_limit() {
+        use crate::models::CreateApiKeyRequest;
+
+        let json = r#"{"name": "Test Key", "permissions": ["read"]}"#;
+        let request: CreateApiKeyRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(request.rate_limit, 1000); // Default value
+    }
+
+    #[test]
+    fn test_api_key_info_serialization() {
+        use crate::models::{ApiKeyInfo, Permission};
+
+        let info = ApiKeyInfo {
+            key_id: "test-id".to_string(),
+            name: "Test Key".to_string(),
+            permissions: vec![Permission::Read],
+            rate_limit: 1000,
+            created_at: 1709123456789,
+            last_used_at: Some(1709123456800),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"key_id\":\"test-id\""));
+        assert!(json.contains("\"name\":\"Test Key\""));
+        assert!(json.contains("\"permissions\":[\"read\"]"));
+        assert!(json.contains("\"rate_limit\":1000"));
+        assert!(json.contains("\"last_used_at\":1709123456800"));
+    }
+
+    #[test]
+    fn test_api_key_info_skip_none_last_used() {
+        use crate::models::{ApiKeyInfo, Permission};
+
+        let info = ApiKeyInfo {
+            key_id: "test-id".to_string(),
+            name: "Test Key".to_string(),
+            permissions: vec![Permission::Read],
+            rate_limit: 1000,
+            created_at: 1709123456789,
+            last_used_at: None,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("last_used_at"));
+    }
+
+    #[tokio::test]
+    async fn test_create_api_key_handler() {
+        use crate::models::{CreateApiKeyRequest, Permission};
+
+        let state = create_test_state();
+
+        let request = CreateApiKeyRequest {
+            name: "Test Trading Bot".to_string(),
+            permissions: vec![Permission::Read, Permission::Trade],
+            rate_limit: 500,
+        };
+
+        let response = create_api_key(State(state.clone()), Json(request)).await;
+
+        assert!(!response.key_id.is_empty());
+        assert!(response.api_key.starts_with("sk_live_"));
+        assert_eq!(response.name, "Test Trading Bot");
+        assert_eq!(response.permissions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_api_keys_handler() {
+        use crate::models::Permission;
+
+        let state = create_test_state();
+
+        // Create some keys
+        state
+            .api_key_store
+            .create_key("Key 1".to_string(), vec![Permission::Read], 1000);
+        state
+            .api_key_store
+            .create_key("Key 2".to_string(), vec![Permission::Trade], 500);
+
+        let response = list_api_keys(State(state.clone())).await;
+
+        assert_eq!(response.keys.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_delete_api_key_handler() {
+        use crate::models::Permission;
+
+        let state = create_test_state();
+
+        let (key_id, _) =
+            state
+                .api_key_store
+                .create_key("To Delete".to_string(), vec![Permission::Read], 1000);
+
+        // Delete the key
+        let response = delete_api_key(State(state.clone()), Path(key_id.clone())).await;
+        assert!(response.success);
+
+        // Try to delete again - should fail
+        let response2 = delete_api_key(State(state.clone()), Path(key_id)).await;
+        assert!(!response2.success);
+    }
+
+    #[tokio::test]
+    async fn test_delete_api_key_not_found() {
+        let state = create_test_state();
+
+        let response = delete_api_key(State(state.clone()), Path("nonexistent".to_string())).await;
+        assert!(!response.success);
     }
 }

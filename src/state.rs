@@ -1,6 +1,7 @@
 //! Application state management.
 
 use crate::api::websocket::OrderbookSubscriptionManager;
+use crate::auth::ApiKeyStore;
 use crate::config::{AssetConfig, Config};
 use crate::db::DatabasePool;
 use crate::market_maker::MarketMakerEngine;
@@ -36,6 +37,8 @@ pub struct AppState {
     pub orderbook_subscriptions: Arc<OrderbookSubscriptionManager>,
     /// OHLC candlestick data aggregator.
     pub ohlc_aggregator: Arc<OhlcAggregator>,
+    /// API key store for authentication.
+    pub api_key_store: Arc<ApiKeyStore>,
 }
 
 impl AppState {
@@ -56,6 +59,7 @@ impl AppState {
             positions: Arc::new(DashMap::new()),
             orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
+            api_key_store: Arc::new(ApiKeyStore::new()),
         }
     }
 
@@ -79,6 +83,7 @@ impl AppState {
             positions: Arc::new(DashMap::new()),
             orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
+            api_key_store: Arc::new(ApiKeyStore::new()),
         }
     }
 
@@ -117,6 +122,7 @@ impl AppState {
             positions: Arc::new(DashMap::new()),
             orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
+            api_key_store: Arc::new(ApiKeyStore::new()),
         }
     }
 

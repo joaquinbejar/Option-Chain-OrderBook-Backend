@@ -57,6 +57,7 @@ rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
+sha2 = "0.10.9"
 
 [workspace.dependencies]
 # Web framework
