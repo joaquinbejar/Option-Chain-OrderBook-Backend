@@ -1556,3 +1556,68 @@ pub struct ExecutionsListResponse {
     /// Summary statistics.
     pub summary: ExecutionSummary,
 }
+
+// ============================================================================
+// Rate Limiting Types
+// ============================================================================
+
+/// Rate limit information for response headers.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RateLimitInfo {
+    /// Maximum requests allowed per window.
+    pub limit: u32,
+    /// Remaining requests in current window.
+    pub remaining: u32,
+    /// Unix timestamp when the rate limit resets.
+    pub reset: u64,
+}
+
+/// Rate limit configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RateLimitConfig {
+    /// Default requests per minute for unauthenticated requests.
+    #[serde(default = "default_requests_per_minute")]
+    pub default_requests_per_minute: u32,
+    /// Requests per minute for trading endpoints.
+    #[serde(default = "default_trading_requests_per_minute")]
+    pub trading_requests_per_minute: u32,
+    /// WebSocket messages per second.
+    #[serde(default = "default_websocket_messages_per_second")]
+    pub websocket_messages_per_second: u32,
+}
+
+/// Default requests per minute.
+fn default_requests_per_minute() -> u32 {
+    1000
+}
+
+/// Default trading requests per minute.
+fn default_trading_requests_per_minute() -> u32 {
+    100
+}
+
+/// Default WebSocket messages per second.
+fn default_websocket_messages_per_second() -> u32 {
+    50
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            default_requests_per_minute: default_requests_per_minute(),
+            trading_requests_per_minute: default_trading_requests_per_minute(),
+            websocket_messages_per_second: default_websocket_messages_per_second(),
+        }
+    }
+}
+
+/// Response for rate limit exceeded.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RateLimitExceededResponse {
+    /// Error message.
+    pub error: String,
+    /// Rate limit information.
+    pub rate_limit: RateLimitInfo,
+    /// Seconds until rate limit resets.
+    pub retry_after: u64,
+}
