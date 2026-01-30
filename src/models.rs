@@ -1318,3 +1318,83 @@ pub struct VolatilitySurfaceResponse {
     /// ATM term structure.
     pub atm_term_structure: Vec<ATMTermStructurePoint>,
 }
+
+// ============================================================================
+// Authentication and API Key Types
+// ============================================================================
+
+/// Permission levels for API keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    /// Read-only access to market data.
+    Read,
+    /// Trading access (place/cancel orders).
+    Trade,
+    /// Administrative access (manage keys, etc.).
+    Admin,
+}
+
+/// API key metadata (without the raw key).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApiKeyInfo {
+    /// Unique key identifier.
+    pub key_id: String,
+    /// Human-readable name for the key.
+    pub name: String,
+    /// Permissions granted to this key.
+    pub permissions: Vec<Permission>,
+    /// Rate limit in requests per minute.
+    pub rate_limit: u32,
+    /// Creation timestamp in milliseconds.
+    pub created_at: u64,
+    /// Last used timestamp in milliseconds (if ever used).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
+}
+
+/// Request to create a new API key.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateApiKeyRequest {
+    /// Human-readable name for the key.
+    pub name: String,
+    /// Permissions to grant.
+    pub permissions: Vec<Permission>,
+    /// Rate limit in requests per minute (default: 1000).
+    #[serde(default = "default_rate_limit")]
+    pub rate_limit: u32,
+}
+
+/// Default rate limit for API keys.
+fn default_rate_limit() -> u32 {
+    1000
+}
+
+/// Response after creating a new API key.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CreateApiKeyResponse {
+    /// Unique key identifier.
+    pub key_id: String,
+    /// The raw API key (only shown once).
+    pub api_key: String,
+    /// Human-readable name for the key.
+    pub name: String,
+    /// Permissions granted to this key.
+    pub permissions: Vec<Permission>,
+    /// Creation timestamp in milliseconds.
+    pub created_at: u64,
+}
+
+/// Response listing all API keys.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ApiKeyListResponse {
+    /// List of API keys (without raw keys).
+    pub keys: Vec<ApiKeyInfo>,
+}
+
+/// Response after deleting an API key.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DeleteApiKeyResponse {
+    /// Whether the deletion was successful.
+    pub success: bool,
+}
