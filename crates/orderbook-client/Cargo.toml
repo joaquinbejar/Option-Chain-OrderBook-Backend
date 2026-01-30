@@ -1,6 +1,6 @@
 [package]
 name = "orderbook-client"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "HTTP client library for Option Chain OrderBook API"
