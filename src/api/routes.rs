@@ -45,6 +45,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/underlyings/{underlying}/expirations/{expiration}",
             post(handlers::create_expiration).get(handlers::get_expiration),
         )
+        // Volatility Surface
+        .route(
+            "/api/v1/underlyings/{underlying}/volatility-surface",
+            get(handlers::get_volatility_surface),
+        )
         // Option Chain Matrix
         .route(
             "/api/v1/underlyings/{underlying}/expirations/{expiration}/chain",
