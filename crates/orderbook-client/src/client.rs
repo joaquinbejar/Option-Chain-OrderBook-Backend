@@ -5,6 +5,9 @@ use crate::types::*;
 use reqwest::Client;
 use std::time::Duration;
 
+#[cfg(test)]
+mod tests;
+
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -449,6 +452,380 @@ impl OrderbookClient {
     /// Returns error if the request fails.
     pub async fn get_all_prices(&self) -> Result<Vec<LatestPriceResponse>, Error> {
         let url = format!("{}/api/v1/prices", self.base_url);
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // Authentication
+    // ========================================================================
+
+    /// Creates a new API key.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn create_api_key(
+        &self,
+        request: &CreateApiKeyRequest,
+    ) -> Result<CreateApiKeyResponse, Error> {
+        let url = format!("{}/api/v1/auth/keys", self.base_url);
+        let resp = self.client.post(&url).json(request).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Lists all API keys.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn list_api_keys(&self) -> Result<ApiKeyListResponse, Error> {
+        let url = format!("{}/api/v1/auth/keys", self.base_url);
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Deletes an API key.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn delete_api_key(&self, key_id: &str) -> Result<DeleteApiKeyResponse, Error> {
+        let url = format!("{}/api/v1/auth/keys/{}", self.base_url, key_id);
+        let resp = self.client.delete(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // Executions
+    // ========================================================================
+
+    /// Lists executions with optional filters.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn list_executions(
+        &self,
+        query: Option<&ExecutionsQuery>,
+    ) -> Result<ExecutionsListResponse, Error> {
+        let mut url = format!("{}/api/v1/executions", self.base_url);
+        if let Some(q) = query {
+            let params = serde_urlencoded::to_string(q).unwrap_or_default();
+            if !params.is_empty() {
+                url.push_str(&format!("?{}", params));
+            }
+        }
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Gets a specific execution by ID.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_execution(&self, execution_id: &str) -> Result<ExecutionInfo, Error> {
+        let url = format!("{}/api/v1/executions/{}", self.base_url, execution_id);
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // Positions
+    // ========================================================================
+
+    /// Lists positions with optional filters.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn list_positions(
+        &self,
+        query: Option<&PositionQuery>,
+    ) -> Result<PositionsListResponse, Error> {
+        let mut url = format!("{}/api/v1/positions", self.base_url);
+        if let Some(q) = query {
+            let params = serde_urlencoded::to_string(q).unwrap_or_default();
+            if !params.is_empty() {
+                url.push_str(&format!("?{}", params));
+            }
+        }
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Gets a specific position by symbol.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_position(&self, symbol: &str) -> Result<PositionResponse, Error> {
+        let url = format!("{}/api/v1/positions/{}", self.base_url, symbol);
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // Orderbook Snapshots (Persistence)
+    // ========================================================================
+
+    /// Creates a snapshot of all orderbooks.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn create_snapshot(&self) -> Result<CreateSnapshotResponse, Error> {
+        let url = format!("{}/api/v1/admin/snapshot", self.base_url);
+        let resp = self.client.post(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Lists all snapshots.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn list_snapshots(&self) -> Result<SnapshotsListResponse, Error> {
+        let url = format!("{}/api/v1/admin/snapshots", self.base_url);
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Gets a specific snapshot by ID.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Vec<OrderbookSnapshotInfo>, Error> {
+        let url = format!("{}/api/v1/admin/snapshots/{}", self.base_url, snapshot_id);
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Restores orderbooks from a snapshot.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn restore_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<RestoreSnapshotResponse, Error> {
+        let url = format!(
+            "{}/api/v1/admin/snapshots/{}/restore",
+            self.base_url, snapshot_id
+        );
+        let resp = self.client.post(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // Orders (Extended)
+    // ========================================================================
+
+    /// Lists orders with optional filters.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn list_orders(
+        &self,
+        query: Option<&OrderListQuery>,
+    ) -> Result<OrderListResponse, Error> {
+        let mut url = format!("{}/api/v1/orders", self.base_url);
+        if let Some(q) = query {
+            let params = serde_urlencoded::to_string(q).unwrap_or_default();
+            if !params.is_empty() {
+                url.push_str(&format!("?{}", params));
+            }
+        }
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Gets order status by ID.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_order_status(&self, order_id: &str) -> Result<OrderStatusResponse, Error> {
+        let url = format!("{}/api/v1/orders/{}", self.base_url, order_id);
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Modifies an existing order.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn modify_order(
+        &self,
+        path: &OptionPath,
+        order_id: &str,
+        request: &ModifyOrderRequest,
+    ) -> Result<ModifyOrderResponse, Error> {
+        let url = format!(
+            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/orders/{}",
+            self.base_url, path.underlying, path.expiration, path.strike, path.style, order_id
+        );
+        let resp = self.client.patch(&url).json(request).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Submits multiple orders in bulk.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn bulk_submit_orders(
+        &self,
+        request: &BulkOrderRequest,
+    ) -> Result<BulkOrderResponse, Error> {
+        let url = format!("{}/api/v1/orders/bulk", self.base_url);
+        let resp = self.client.post(&url).json(request).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Cancels multiple orders in bulk.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn bulk_cancel_orders(
+        &self,
+        request: &BulkCancelRequest,
+    ) -> Result<BulkCancelResponse, Error> {
+        let url = format!("{}/api/v1/orders/bulk", self.base_url);
+        let resp = self.client.delete(&url).json(request).send().await?;
+        self.handle_response(resp).await
+    }
+
+    /// Cancels all orders with optional filters.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn cancel_all_orders(
+        &self,
+        query: Option<&CancelAllQuery>,
+    ) -> Result<CancelAllResponse, Error> {
+        let mut url = format!("{}/api/v1/orders/cancel-all", self.base_url);
+        if let Some(q) = query {
+            let params = serde_urlencoded::to_string(q).unwrap_or_default();
+            if !params.is_empty() {
+                url.push_str(&format!("?{}", params));
+            }
+        }
+        let resp = self.client.delete(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // Greeks
+    // ========================================================================
+
+    /// Gets option greeks.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_option_greeks(&self, path: &OptionPath) -> Result<GreeksResponse, Error> {
+        let url = format!(
+            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/greeks",
+            self.base_url, path.underlying, path.expiration, path.strike, path.style
+        );
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // Last Trade
+    // ========================================================================
+
+    /// Gets the last trade for an option.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_last_trade(&self, path: &OptionPath) -> Result<LastTradeResponse, Error> {
+        let url = format!(
+            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/last-trade",
+            self.base_url, path.underlying, path.expiration, path.strike, path.style
+        );
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // OHLC
+    // ========================================================================
+
+    /// Gets OHLC candlestick data for an option.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_ohlc(
+        &self,
+        path: &OptionPath,
+        query: Option<&OhlcQuery>,
+    ) -> Result<OhlcResponse, Error> {
+        let mut url = format!(
+            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/ohlc",
+            self.base_url, path.underlying, path.expiration, path.strike, path.style
+        );
+        if let Some(q) = query {
+            let params = serde_urlencoded::to_string(q).unwrap_or_default();
+            if !params.is_empty() {
+                url.push_str(&format!("?{}", params));
+            }
+        }
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // Orderbook Metrics
+    // ========================================================================
+
+    /// Gets orderbook metrics for an option.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_orderbook_metrics(
+        &self,
+        path: &OptionPath,
+    ) -> Result<OrderbookMetricsResponse, Error> {
+        let url = format!(
+            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/metrics",
+            self.base_url, path.underlying, path.expiration, path.strike, path.style
+        );
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // Volatility Surface
+    // ========================================================================
+
+    /// Gets the volatility surface for an underlying.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_volatility_surface(
+        &self,
+        underlying: &str,
+    ) -> Result<VolatilitySurfaceResponse, Error> {
+        let url = format!(
+            "{}/api/v1/underlyings/{}/volatility-surface",
+            self.base_url, underlying
+        );
+        let resp = self.client.get(&url).send().await?;
+        self.handle_response(resp).await
+    }
+
+    // ========================================================================
+    // Option Chain
+    // ========================================================================
+
+    /// Gets the option chain for an expiration.
+    ///
+    /// # Errors
+    /// Returns error if the request fails.
+    pub async fn get_option_chain(
+        &self,
+        underlying: &str,
+        expiration: &str,
+    ) -> Result<OptionChainResponse, Error> {
+        let url = format!(
+            "{}/api/v1/underlyings/{}/expirations/{}/chain",
+            self.base_url, underlying, expiration
+        );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
