@@ -1621,3 +1621,84 @@ pub struct RateLimitExceededResponse {
     /// Seconds until rate limit resets.
     pub retry_after: u64,
 }
+
+// ============================================================================
+// Orderbook Persistence Types
+// ============================================================================
+
+/// Information about a stored orderbook snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OrderbookSnapshotInfo {
+    /// Unique snapshot identifier.
+    pub snapshot_id: String,
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Expiration date string.
+    pub expiration: String,
+    /// Strike price.
+    pub strike: u64,
+    /// Option style (call/put).
+    pub style: String,
+    /// Number of orders in the snapshot.
+    pub order_count: u64,
+    /// Number of bid levels.
+    pub bid_levels: u64,
+    /// Number of ask levels.
+    pub ask_levels: u64,
+    /// Snapshot data as JSON string.
+    pub data: String,
+    /// Creation timestamp in milliseconds.
+    pub created_at: u64,
+}
+
+/// Response for creating a snapshot.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CreateSnapshotResponse {
+    /// Whether the operation was successful.
+    pub success: bool,
+    /// Unique snapshot identifier.
+    pub snapshot_id: String,
+    /// Number of orderbooks saved.
+    pub orderbooks_saved: u64,
+    /// Total number of orders saved.
+    pub orders_saved: u64,
+    /// Timestamp of the snapshot.
+    pub timestamp_ms: u64,
+}
+
+/// Response for listing snapshots.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SnapshotsListResponse {
+    /// List of snapshot summaries.
+    pub snapshots: Vec<SnapshotSummary>,
+    /// Total number of snapshots.
+    pub total: u64,
+}
+
+/// Summary of a snapshot for listing.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SnapshotSummary {
+    /// Unique snapshot identifier.
+    pub snapshot_id: String,
+    /// Number of orderbooks in the snapshot.
+    pub orderbook_count: u64,
+    /// Total number of orders.
+    pub total_orders: u64,
+    /// Creation timestamp in milliseconds.
+    pub created_at: u64,
+}
+
+/// Response for restoring a snapshot.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RestoreSnapshotResponse {
+    /// Whether the operation was successful.
+    pub success: bool,
+    /// Snapshot ID that was restored.
+    pub snapshot_id: String,
+    /// Number of orderbooks restored.
+    pub orderbooks_restored: u64,
+    /// Total number of orders restored.
+    pub orders_restored: u64,
+    /// Timestamp of the restore operation.
+    pub timestamp_ms: u64,
+}
