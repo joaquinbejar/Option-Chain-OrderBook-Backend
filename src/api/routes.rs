@@ -129,5 +129,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Position tracking
         .route("/api/v1/positions", get(handlers::list_positions))
         .route("/api/v1/positions/{symbol}", get(handlers::get_position))
+        // Execution reports
+        .route("/api/v1/executions", get(handlers::list_executions))
+        .route(
+            "/api/v1/executions/{execution_id}",
+            get(handlers::get_execution),
+        )
         .with_state(state)
 }

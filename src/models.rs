@@ -1470,3 +1470,89 @@ pub struct OrderbookMetricsResponse {
     /// Market impact metrics.
     pub market_impact: MarketImpactMetrics,
 }
+
+// ============================================================================
+// Execution Reports Types
+// ============================================================================
+
+/// Information about a single execution (fill).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExecutionInfo {
+    /// Unique execution identifier.
+    pub execution_id: String,
+    /// Order ID that was filled.
+    pub order_id: String,
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
+    pub symbol: String,
+    /// Side of the execution.
+    pub side: OrderSide,
+    /// Execution price in cents.
+    pub price: u64,
+    /// Executed quantity.
+    pub quantity: u64,
+    /// Execution timestamp in milliseconds.
+    pub timestamp_ms: u64,
+    /// Counterparty order ID (if available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterparty_order_id: Option<String>,
+    /// Whether this execution was as a maker (resting order).
+    pub is_maker: bool,
+    /// Fee charged for this execution.
+    pub fee: u64,
+    /// Edge captured (difference from fair value).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge: Option<i64>,
+}
+
+/// Summary statistics for executions.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ExecutionSummary {
+    /// Total number of executions.
+    pub total_executions: u64,
+    /// Total volume executed.
+    pub total_volume: u64,
+    /// Total edge captured.
+    pub total_edge: i64,
+    /// Ratio of maker executions (0.0 to 1.0).
+    pub maker_ratio: f64,
+}
+
+/// Query parameters for listing executions.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ExecutionsQuery {
+    /// Filter by start date (ISO 8601 format).
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Filter by end date (ISO 8601 format).
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Filter by underlying symbol.
+    #[serde(default)]
+    pub underlying: Option<String>,
+    /// Filter by option symbol.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    /// Filter by side (buy/sell).
+    #[serde(default)]
+    pub side: Option<String>,
+    /// Maximum number of results.
+    #[serde(default = "default_executions_limit")]
+    pub limit: u64,
+    /// Offset for pagination.
+    #[serde(default)]
+    pub offset: u64,
+}
+
+/// Default limit for executions query.
+fn default_executions_limit() -> u64 {
+    1000
+}
+
+/// Response for listing executions.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ExecutionsListResponse {
+    /// List of executions.
+    pub executions: Vec<ExecutionInfo>,
+    /// Summary statistics.
+    pub summary: ExecutionSummary,
+}
