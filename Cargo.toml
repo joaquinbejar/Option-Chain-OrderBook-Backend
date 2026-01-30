@@ -104,6 +104,7 @@ futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
 tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 url = "2.5"
+serde_urlencoded = "0.7"
 
 [dev-dependencies]
 

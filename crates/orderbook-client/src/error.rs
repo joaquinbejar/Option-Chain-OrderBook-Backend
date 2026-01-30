@@ -2,6 +2,9 @@
 
 use thiserror::Error;
 
+#[cfg(test)]
+mod tests;
+
 /// Client error types.
 #[derive(Debug, Error)]
 pub enum Error {

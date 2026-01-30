@@ -5,6 +5,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
+#[cfg(test)]
+mod tests;
+
 /// API error response body.
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
