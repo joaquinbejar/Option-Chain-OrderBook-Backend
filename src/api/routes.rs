@@ -1,8 +1,9 @@
 //! Route configuration.
 
-use crate::api::{controls, handlers, websocket};
+use crate::api::{controls, handlers, middleware, websocket};
 use crate::state::AppState;
 use axum::Router;
+use axum::middleware as axum_middleware;
 use axum::routing::{delete, get, post};
 use std::sync::Arc;
 
@@ -135,5 +136,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/executions/{execution_id}",
             get(handlers::get_execution),
         )
+        // Apply rate limiting middleware
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit_middleware,
+        ))
         .with_state(state)
 }

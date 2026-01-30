@@ -5862,4 +5862,83 @@ mod tests {
 
         assert!(result.is_err());
     }
+
+    // ========================================================================
+    // Rate Limiting Tests
+    // ========================================================================
+
+    #[test]
+    fn test_rate_limit_info_serialization() {
+        use crate::models::RateLimitInfo;
+
+        let info = RateLimitInfo {
+            limit: 1000,
+            remaining: 950,
+            reset: 1704067260,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"limit\":1000"));
+        assert!(json.contains("\"remaining\":950"));
+        assert!(json.contains("\"reset\":1704067260"));
+    }
+
+    #[test]
+    fn test_rate_limit_config_serialization() {
+        use crate::models::RateLimitConfig;
+
+        let config = RateLimitConfig {
+            default_requests_per_minute: 1000,
+            trading_requests_per_minute: 100,
+            websocket_messages_per_second: 50,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"default_requests_per_minute\":1000"));
+        assert!(json.contains("\"trading_requests_per_minute\":100"));
+        assert!(json.contains("\"websocket_messages_per_second\":50"));
+    }
+
+    #[test]
+    fn test_rate_limit_config_deserialization() {
+        use crate::models::RateLimitConfig;
+
+        let json = r#"{"default_requests_per_minute": 500, "trading_requests_per_minute": 50}"#;
+        let config: RateLimitConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.default_requests_per_minute, 500);
+        assert_eq!(config.trading_requests_per_minute, 50);
+        assert_eq!(config.websocket_messages_per_second, 50); // Default value
+    }
+
+    #[test]
+    fn test_rate_limit_config_defaults() {
+        use crate::models::RateLimitConfig;
+
+        let config = RateLimitConfig::default();
+
+        assert_eq!(config.default_requests_per_minute, 1000);
+        assert_eq!(config.trading_requests_per_minute, 100);
+        assert_eq!(config.websocket_messages_per_second, 50);
+    }
+
+    #[test]
+    fn test_rate_limit_exceeded_response_serialization() {
+        use crate::models::{RateLimitExceededResponse, RateLimitInfo};
+
+        let response = RateLimitExceededResponse {
+            error: "Rate limit exceeded".to_string(),
+            rate_limit: RateLimitInfo {
+                limit: 100,
+                remaining: 0,
+                reset: 1704067260,
+            },
+            retry_after: 60,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"error\":\"Rate limit exceeded\""));
+        assert!(json.contains("\"rate_limit\""));
+        assert!(json.contains("\"retry_after\":60"));
+    }
 }
