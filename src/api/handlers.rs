@@ -6,18 +6,19 @@ use crate::models::{
     BulkCancelRequest, BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest,
     BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus, CancelAllQuery, CancelAllResponse,
     CancelOrderResponse, ChainQuery, ChainStrikeRow, CreateApiKeyRequest, CreateApiKeyResponse,
-    DeleteApiKeyResponse, DepthMetrics, EnrichedSnapshotResponse, ExecutionInfo, ExecutionSummary,
-    ExecutionsListResponse, ExecutionsQuery, ExpirationSummary, ExpirationsListResponse, FillInfo,
-    GlobalStatsResponse, GreeksData, GreeksResponse, HealthResponse, ImpactMetrics,
-    LastTradeResponse, LimitOrderStatus, MarketImpactMetrics, MarketOrderRequest,
-    MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse,
-    ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse, OptionChainResponse, OptionQuoteData,
-    OrderBookSnapshotResponse, OrderInfo, OrderListQuery, OrderListResponse, OrderSide,
-    OrderStatus, OrderStatusResponse, OrderTimeInForce, OrderbookMetricsResponse, PositionInfo,
-    PositionQuery, PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo,
-    PriceMetrics, QuoteResponse, SnapshotDepth, SnapshotQuery, SnapshotStats, SpreadMetrics,
-    StrikeIV, StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
-    VolatilitySurfaceResponse,
+    CreateSnapshotResponse, DeleteApiKeyResponse, DepthMetrics, EnrichedSnapshotResponse,
+    ExecutionInfo, ExecutionSummary, ExecutionsListResponse, ExecutionsQuery, ExpirationSummary,
+    ExpirationsListResponse, FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse,
+    HealthResponse, ImpactMetrics, LastTradeResponse, LimitOrderStatus, MarketImpactMetrics,
+    MarketOrderRequest, MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest,
+    ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse,
+    OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderInfo, OrderListQuery,
+    OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse, OrderTimeInForce,
+    OrderbookMetricsResponse, OrderbookSnapshotInfo, PositionInfo, PositionQuery, PositionResponse,
+    PositionSummary, PositionsListResponse, PriceLevelInfo, PriceMetrics, QuoteResponse,
+    RestoreSnapshotResponse, SnapshotDepth, SnapshotQuery, SnapshotStats, SnapshotSummary,
+    SnapshotsListResponse, SpreadMetrics, StrikeIV, StrikeSummary, StrikesListResponse,
+    UnderlyingSummary, UnderlyingsListResponse, VolatilitySurfaceResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -338,6 +339,243 @@ pub async fn get_execution(
         .get(&execution_id)
         .map(|entry| Json(entry.value().clone()))
         .ok_or_else(|| ApiError::NotFound(format!("Execution {} not found", execution_id)))
+}
+
+// ============================================================================
+// Orderbook Persistence
+// ============================================================================
+
+/// Create a snapshot of all orderbooks.
+///
+/// Saves the current state of all orderbooks for later recovery.
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/snapshot",
+    responses(
+        (status = 200, description = "Snapshot created", body = CreateSnapshotResponse)
+    ),
+    tag = "Admin"
+)]
+pub async fn create_snapshot(State(state): State<Arc<AppState>>) -> Json<CreateSnapshotResponse> {
+    let snapshot_id = uuid::Uuid::new_v4().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let mut orderbooks_saved: u64 = 0;
+    let mut orders_saved: u64 = 0;
+    let mut snapshot_infos: Vec<OrderbookSnapshotInfo> = Vec::new();
+
+    // Iterate through all underlyings
+    for underlying_symbol in state.manager.underlying_symbols() {
+        if let Ok(underlying) = state.manager.get(&underlying_symbol) {
+            // Iterate through all expirations
+            for exp_entry in underlying.expirations().iter() {
+                let exp: ExpirationDate = *exp_entry.key();
+                if let Ok(exp_book) = underlying.get_expiration(&exp) {
+                    let exp_str = format_expiration(&exp);
+
+                    // Iterate through all strikes
+                    for strike in exp_book.strike_prices() {
+                        if let Ok(strike_book) = exp_book.get_strike(strike) {
+                            // Snapshot both call and put
+                            for style in [OptionStyle::Call, OptionStyle::Put] {
+                                let option_book = strike_book.get(style);
+                                let snapshot = option_book.inner().create_snapshot(usize::MAX);
+
+                                let style_str = match style {
+                                    OptionStyle::Call => "call",
+                                    OptionStyle::Put => "put",
+                                };
+
+                                let order_count = snapshot
+                                    .bids
+                                    .iter()
+                                    .map(|l| l.orders.len())
+                                    .sum::<usize>()
+                                    + snapshot.asks.iter().map(|l| l.orders.len()).sum::<usize>();
+
+                                if order_count > 0 {
+                                    let data = serde_json::to_string(&snapshot).unwrap_or_default();
+
+                                    let info = OrderbookSnapshotInfo {
+                                        snapshot_id: snapshot_id.clone(),
+                                        underlying: underlying_symbol.clone(),
+                                        expiration: exp_str.clone(),
+                                        strike,
+                                        style: style_str.to_string(),
+                                        order_count: order_count as u64,
+                                        bid_levels: snapshot.bids.len() as u64,
+                                        ask_levels: snapshot.asks.len() as u64,
+                                        data,
+                                        created_at: now,
+                                    };
+
+                                    orders_saved += order_count as u64;
+                                    orderbooks_saved += 1;
+                                    snapshot_infos.push(info);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Store the snapshot
+    state.snapshots.insert(snapshot_id.clone(), snapshot_infos);
+
+    Json(CreateSnapshotResponse {
+        success: true,
+        snapshot_id,
+        orderbooks_saved,
+        orders_saved,
+        timestamp_ms: now,
+    })
+}
+
+/// List all snapshots.
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/snapshots",
+    responses(
+        (status = 200, description = "List of snapshots", body = SnapshotsListResponse)
+    ),
+    tag = "Admin"
+)]
+pub async fn list_snapshots(State(state): State<Arc<AppState>>) -> Json<SnapshotsListResponse> {
+    let mut snapshots: Vec<SnapshotSummary> = Vec::new();
+
+    for entry in state.snapshots.iter() {
+        let snapshot_id: String = entry.key().clone();
+        let infos: &Vec<OrderbookSnapshotInfo> = entry.value();
+        let total_orders: u64 = infos.iter().map(|i| i.order_count).sum();
+        let created_at = infos.first().map(|i| i.created_at).unwrap_or(0);
+
+        snapshots.push(SnapshotSummary {
+            snapshot_id,
+            orderbook_count: infos.len() as u64,
+            total_orders,
+            created_at,
+        });
+    }
+
+    let total = snapshots.len() as u64;
+
+    Json(SnapshotsListResponse { snapshots, total })
+}
+
+/// Get a specific snapshot by ID.
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/snapshots/{snapshot_id}",
+    params(
+        ("snapshot_id" = String, Path, description = "Snapshot ID")
+    ),
+    responses(
+        (status = 200, description = "Snapshot details", body = Vec<OrderbookSnapshotInfo>),
+        (status = 404, description = "Snapshot not found")
+    ),
+    tag = "Admin"
+)]
+pub async fn get_snapshot(
+    State(state): State<Arc<AppState>>,
+    Path(snapshot_id): Path<String>,
+) -> Result<Json<Vec<OrderbookSnapshotInfo>>, ApiError> {
+    match state.snapshots.get(&snapshot_id) {
+        Some(entry) => {
+            let infos: Vec<OrderbookSnapshotInfo> = entry.value().clone();
+            Ok(Json(infos))
+        }
+        None => Err(ApiError::NotFound(format!(
+            "Snapshot {} not found",
+            snapshot_id
+        ))),
+    }
+}
+
+/// Restore orderbooks from a snapshot.
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/snapshots/{snapshot_id}/restore",
+    params(
+        ("snapshot_id" = String, Path, description = "Snapshot ID to restore")
+    ),
+    responses(
+        (status = 200, description = "Snapshot restored", body = RestoreSnapshotResponse),
+        (status = 404, description = "Snapshot not found")
+    ),
+    tag = "Admin"
+)]
+pub async fn restore_snapshot(
+    State(state): State<Arc<AppState>>,
+    Path(snapshot_id): Path<String>,
+) -> Result<Json<RestoreSnapshotResponse>, ApiError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let snapshot_infos: Vec<OrderbookSnapshotInfo> = match state.snapshots.get(&snapshot_id) {
+        Some(entry) => entry.value().clone(),
+        None => {
+            return Err(ApiError::NotFound(format!(
+                "Snapshot {} not found",
+                snapshot_id
+            )));
+        }
+    };
+
+    let mut orderbooks_restored: u64 = 0;
+    let mut orders_restored: u64 = 0;
+
+    for info in &snapshot_infos {
+        // Parse the snapshot data
+        let snapshot: orderbook_rs::OrderBookSnapshot = match serde_json::from_str(&info.data) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Get or create the underlying
+        let underlying = state.manager.get_or_create(&info.underlying);
+
+        // Parse expiration
+        let exp = match parse_expiration(&info.expiration) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // Get or create expiration book
+        let exp_book = underlying.get_or_create_expiration(exp);
+
+        // Get or create strike book
+        let strike_book = exp_book.get_or_create_strike(info.strike);
+
+        // Get option style
+        let style = match info.style.as_str() {
+            "call" => OptionStyle::Call,
+            "put" => OptionStyle::Put,
+            _ => continue,
+        };
+
+        let option_book = strike_book.get(style);
+
+        // Restore the snapshot
+        if option_book.inner().restore_from_snapshot(snapshot).is_ok() {
+            orderbooks_restored += 1;
+            orders_restored += info.order_count;
+        }
+    }
+
+    Ok(Json(RestoreSnapshotResponse {
+        success: true,
+        snapshot_id,
+        orderbooks_restored,
+        orders_restored,
+        timestamp_ms: now,
+    }))
 }
 
 // ============================================================================
@@ -5940,5 +6178,202 @@ mod tests {
         assert!(json.contains("\"error\":\"Rate limit exceeded\""));
         assert!(json.contains("\"rate_limit\""));
         assert!(json.contains("\"retry_after\":60"));
+    }
+
+    // ========================================================================
+    // Orderbook Persistence Tests
+    // ========================================================================
+
+    #[test]
+    fn test_orderbook_snapshot_info_serialization() {
+        use crate::models::OrderbookSnapshotInfo;
+
+        let info = OrderbookSnapshotInfo {
+            snapshot_id: "snap-123".to_string(),
+            underlying: "AAPL".to_string(),
+            expiration: "20240329".to_string(),
+            strike: 15000,
+            style: "call".to_string(),
+            order_count: 10,
+            bid_levels: 5,
+            ask_levels: 5,
+            data: r#"{"bids":[],"asks":[]}"#.to_string(),
+            created_at: 1704067200000,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"snapshot_id\":\"snap-123\""));
+        assert!(json.contains("\"underlying\":\"AAPL\""));
+        assert!(json.contains("\"strike\":15000"));
+        assert!(json.contains("\"style\":\"call\""));
+        assert!(json.contains("\"order_count\":10"));
+    }
+
+    #[test]
+    fn test_orderbook_snapshot_info_deserialization() {
+        use crate::models::OrderbookSnapshotInfo;
+
+        let json = r#"{
+            "snapshot_id": "snap-456",
+            "underlying": "SPY",
+            "expiration": "20240315",
+            "strike": 50000,
+            "style": "put",
+            "order_count": 5,
+            "bid_levels": 3,
+            "ask_levels": 2,
+            "data": "{}",
+            "created_at": 1704067200000
+        }"#;
+
+        let info: OrderbookSnapshotInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.snapshot_id, "snap-456");
+        assert_eq!(info.underlying, "SPY");
+        assert_eq!(info.strike, 50000);
+        assert_eq!(info.style, "put");
+        assert_eq!(info.order_count, 5);
+    }
+
+    #[test]
+    fn test_create_snapshot_response_serialization() {
+        use crate::models::CreateSnapshotResponse;
+
+        let response = CreateSnapshotResponse {
+            success: true,
+            snapshot_id: "snap-789".to_string(),
+            orderbooks_saved: 150,
+            orders_saved: 5000,
+            timestamp_ms: 1704067200000,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"snapshot_id\":\"snap-789\""));
+        assert!(json.contains("\"orderbooks_saved\":150"));
+        assert!(json.contains("\"orders_saved\":5000"));
+    }
+
+    #[test]
+    fn test_snapshot_summary_serialization() {
+        use crate::models::SnapshotSummary;
+
+        let summary = SnapshotSummary {
+            snapshot_id: "snap-abc".to_string(),
+            orderbook_count: 100,
+            total_orders: 2500,
+            created_at: 1704067200000,
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"snapshot_id\":\"snap-abc\""));
+        assert!(json.contains("\"orderbook_count\":100"));
+        assert!(json.contains("\"total_orders\":2500"));
+    }
+
+    #[test]
+    fn test_snapshots_list_response_serialization() {
+        use crate::models::{SnapshotSummary, SnapshotsListResponse};
+
+        let response = SnapshotsListResponse {
+            snapshots: vec![SnapshotSummary {
+                snapshot_id: "snap-1".to_string(),
+                orderbook_count: 50,
+                total_orders: 1000,
+                created_at: 1704067200000,
+            }],
+            total: 1,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"snapshots\""));
+        assert!(json.contains("\"total\":1"));
+    }
+
+    #[test]
+    fn test_restore_snapshot_response_serialization() {
+        use crate::models::RestoreSnapshotResponse;
+
+        let response = RestoreSnapshotResponse {
+            success: true,
+            snapshot_id: "snap-restore".to_string(),
+            orderbooks_restored: 75,
+            orders_restored: 1500,
+            timestamp_ms: 1704067200000,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"snapshot_id\":\"snap-restore\""));
+        assert!(json.contains("\"orderbooks_restored\":75"));
+        assert!(json.contains("\"orders_restored\":1500"));
+    }
+
+    #[tokio::test]
+    async fn test_create_snapshot_empty() {
+        let state = create_test_state();
+
+        let response = create_snapshot(State(state.clone())).await;
+
+        assert!(response.0.success);
+        assert!(!response.0.snapshot_id.is_empty());
+        assert_eq!(response.0.orderbooks_saved, 0);
+        assert_eq!(response.0.orders_saved, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_snapshots_empty() {
+        let state = create_test_state();
+
+        let response = list_snapshots(State(state.clone())).await;
+
+        assert_eq!(response.0.total, 0);
+        assert!(response.0.snapshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_snapshots_after_create() {
+        let state = create_test_state();
+
+        // Create a snapshot
+        let create_response = create_snapshot(State(state.clone())).await;
+        let snapshot_id = create_response.0.snapshot_id.clone();
+
+        // List snapshots
+        let list_response = list_snapshots(State(state.clone())).await;
+
+        assert_eq!(list_response.0.total, 1);
+        assert_eq!(list_response.0.snapshots[0].snapshot_id, snapshot_id);
+    }
+
+    #[tokio::test]
+    async fn test_get_snapshot_not_found() {
+        let state = create_test_state();
+
+        let result = get_snapshot(State(state.clone()), Path("nonexistent".to_string())).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_snapshot_found() {
+        let state = create_test_state();
+
+        // Create a snapshot
+        let create_response = create_snapshot(State(state.clone())).await;
+        let snapshot_id = create_response.0.snapshot_id.clone();
+
+        // Get the snapshot
+        let result = get_snapshot(State(state.clone()), Path(snapshot_id)).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_restore_snapshot_not_found() {
+        let state = create_test_state();
+
+        let result = restore_snapshot(State(state.clone()), Path("nonexistent".to_string())).await;
+
+        assert!(result.is_err());
     }
 }

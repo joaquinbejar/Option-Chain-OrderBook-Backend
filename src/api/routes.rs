@@ -136,6 +136,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/executions/{execution_id}",
             get(handlers::get_execution),
         )
+        // Admin - Orderbook persistence
+        .route("/api/v1/admin/snapshot", post(handlers::create_snapshot))
+        .route("/api/v1/admin/snapshots", get(handlers::list_snapshots))
+        .route(
+            "/api/v1/admin/snapshots/{snapshot_id}",
+            get(handlers::get_snapshot),
+        )
+        .route(
+            "/api/v1/admin/snapshots/{snapshot_id}/restore",
+            post(handlers::restore_snapshot),
+        )
         // Apply rate limiting middleware
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

@@ -5,7 +5,7 @@ use crate::auth::ApiKeyStore;
 use crate::config::{AssetConfig, Config};
 use crate::db::DatabasePool;
 use crate::market_maker::MarketMakerEngine;
-use crate::models::{ExecutionInfo, LastTradeInfo, OrderInfo, PositionInfo};
+use crate::models::{ExecutionInfo, LastTradeInfo, OrderInfo, OrderbookSnapshotInfo, PositionInfo};
 use crate::ohlc::OhlcAggregator;
 use crate::simulation::PriceSimulator;
 use dashmap::DashMap;
@@ -41,6 +41,8 @@ pub struct AppState {
     pub api_key_store: Arc<ApiKeyStore>,
     /// Storage for execution reports by execution ID.
     pub executions: Arc<DashMap<String, ExecutionInfo>>,
+    /// Storage for orderbook snapshots by snapshot ID.
+    pub snapshots: Arc<DashMap<String, Vec<OrderbookSnapshotInfo>>>,
 }
 
 impl AppState {
@@ -63,6 +65,7 @@ impl AppState {
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
             api_key_store: Arc::new(ApiKeyStore::new()),
             executions: Arc::new(DashMap::new()),
+            snapshots: Arc::new(DashMap::new()),
         }
     }
 
@@ -88,6 +91,7 @@ impl AppState {
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
             api_key_store: Arc::new(ApiKeyStore::new()),
             executions: Arc::new(DashMap::new()),
+            snapshots: Arc::new(DashMap::new()),
         }
     }
 
@@ -128,6 +132,7 @@ impl AppState {
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
             api_key_store: Arc::new(ApiKeyStore::new()),
             executions: Arc::new(DashMap::new()),
+            snapshots: Arc::new(DashMap::new()),
         }
     }
 
