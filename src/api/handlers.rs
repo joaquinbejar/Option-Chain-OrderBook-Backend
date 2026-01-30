@@ -6,17 +6,18 @@ use crate::models::{
     BulkCancelRequest, BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest,
     BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus, CancelAllQuery, CancelAllResponse,
     CancelOrderResponse, ChainQuery, ChainStrikeRow, CreateApiKeyRequest, CreateApiKeyResponse,
-    DeleteApiKeyResponse, DepthMetrics, EnrichedSnapshotResponse, ExpirationSummary,
-    ExpirationsListResponse, FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse,
-    HealthResponse, ImpactMetrics, LastTradeResponse, LimitOrderStatus, MarketImpactMetrics,
-    MarketOrderRequest, MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest,
-    ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse,
-    OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderInfo, OrderListQuery,
-    OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse, OrderTimeInForce,
-    OrderbookMetricsResponse, PositionInfo, PositionQuery, PositionResponse, PositionSummary,
-    PositionsListResponse, PriceLevelInfo, PriceMetrics, QuoteResponse, SnapshotDepth,
-    SnapshotQuery, SnapshotStats, SpreadMetrics, StrikeIV, StrikeSummary, StrikesListResponse,
-    UnderlyingSummary, UnderlyingsListResponse, VolatilitySurfaceResponse,
+    DeleteApiKeyResponse, DepthMetrics, EnrichedSnapshotResponse, ExecutionInfo, ExecutionSummary,
+    ExecutionsListResponse, ExecutionsQuery, ExpirationSummary, ExpirationsListResponse, FillInfo,
+    GlobalStatsResponse, GreeksData, GreeksResponse, HealthResponse, ImpactMetrics,
+    LastTradeResponse, LimitOrderStatus, MarketImpactMetrics, MarketOrderRequest,
+    MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse,
+    ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse, OptionChainResponse, OptionQuoteData,
+    OrderBookSnapshotResponse, OrderInfo, OrderListQuery, OrderListResponse, OrderSide,
+    OrderStatus, OrderStatusResponse, OrderTimeInForce, OrderbookMetricsResponse, PositionInfo,
+    PositionQuery, PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo,
+    PriceMetrics, QuoteResponse, SnapshotDepth, SnapshotQuery, SnapshotStats, SpreadMetrics,
+    StrikeIV, StrikeSummary, StrikesListResponse, UnderlyingSummary, UnderlyingsListResponse,
+    VolatilitySurfaceResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -207,6 +208,136 @@ pub async fn delete_api_key(
 ) -> Json<DeleteApiKeyResponse> {
     let success = state.api_key_store.delete_key(&key_id);
     Json(DeleteApiKeyResponse { success })
+}
+
+// ============================================================================
+// Execution Reports
+// ============================================================================
+
+/// List executions with optional filters.
+///
+/// Returns a list of executions with summary statistics.
+#[utoipa::path(
+    get,
+    path = "/api/v1/executions",
+    params(
+        ("from" = Option<String>, Query, description = "Start date filter (ISO 8601)"),
+        ("to" = Option<String>, Query, description = "End date filter (ISO 8601)"),
+        ("underlying" = Option<String>, Query, description = "Filter by underlying"),
+        ("symbol" = Option<String>, Query, description = "Filter by symbol"),
+        ("side" = Option<String>, Query, description = "Filter by side (buy/sell)"),
+        ("limit" = Option<u64>, Query, description = "Maximum results (default 1000)"),
+        ("offset" = Option<u64>, Query, description = "Offset for pagination")
+    ),
+    responses(
+        (status = 200, description = "List of executions", body = ExecutionsListResponse)
+    ),
+    tag = "Executions"
+)]
+pub async fn list_executions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ExecutionsQuery>,
+) -> Json<ExecutionsListResponse> {
+    let mut executions: Vec<ExecutionInfo> = state
+        .executions
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect();
+
+    // Apply filters
+    if let Some(ref underlying) = query.underlying {
+        executions.retain(|e| e.symbol.starts_with(underlying));
+    }
+
+    if let Some(ref symbol) = query.symbol {
+        executions.retain(|e| e.symbol == *symbol);
+    }
+
+    if let Some(ref side) = query.side {
+        let side_filter = match side.to_lowercase().as_str() {
+            "buy" => Some(OrderSide::Buy),
+            "sell" => Some(OrderSide::Sell),
+            _ => None,
+        };
+        if let Some(s) = side_filter {
+            executions.retain(|e| e.side == s);
+        }
+    }
+
+    if let Some(ref from) = query.from
+        && let Ok(from_date) = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d")
+    {
+        let from_ts = from_date
+            .and_hms_opt(0, 0, 0)
+            .map(|dt| dt.and_utc().timestamp_millis() as u64)
+            .unwrap_or(0);
+        executions.retain(|e| e.timestamp_ms >= from_ts);
+    }
+
+    if let Some(ref to) = query.to
+        && let Ok(to_date) = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d")
+    {
+        let to_ts = to_date
+            .and_hms_opt(23, 59, 59)
+            .map(|dt| dt.and_utc().timestamp_millis() as u64)
+            .unwrap_or(u64::MAX);
+        executions.retain(|e| e.timestamp_ms <= to_ts);
+    }
+
+    // Sort by timestamp descending (most recent first)
+    executions.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+
+    // Calculate summary before pagination
+    let total_executions = executions.len() as u64;
+    let total_volume: u64 = executions.iter().map(|e| e.quantity).sum();
+    let total_edge: i64 = executions.iter().filter_map(|e| e.edge).sum();
+    let maker_count = executions.iter().filter(|e| e.is_maker).count() as f64;
+    let maker_ratio = if total_executions > 0 {
+        maker_count / total_executions as f64
+    } else {
+        0.0
+    };
+
+    // Apply pagination
+    let offset = query.offset as usize;
+    let limit = query.limit as usize;
+    let executions: Vec<ExecutionInfo> = executions.into_iter().skip(offset).take(limit).collect();
+
+    let summary = ExecutionSummary {
+        total_executions,
+        total_volume,
+        total_edge,
+        maker_ratio,
+    };
+
+    Json(ExecutionsListResponse {
+        executions,
+        summary,
+    })
+}
+
+/// Get a single execution by ID.
+#[utoipa::path(
+    get,
+    path = "/api/v1/executions/{execution_id}",
+    params(
+        ("execution_id" = String, Path, description = "Execution ID")
+    ),
+    responses(
+        (status = 200, description = "Execution details", body = ExecutionInfo),
+        (status = 404, description = "Execution not found")
+    ),
+    tag = "Executions"
+)]
+pub async fn get_execution(
+    State(state): State<Arc<AppState>>,
+    Path(execution_id): Path<String>,
+) -> Result<Json<ExecutionInfo>, ApiError> {
+    state
+        .executions
+        .get(&execution_id)
+        .map(|entry| Json(entry.value().clone()))
+        .ok_or_else(|| ApiError::NotFound(format!("Execution {} not found", execution_id)))
 }
 
 // ============================================================================
@@ -5413,5 +5544,322 @@ mod tests {
         assert_eq!(response.depth.ask_depth_total, 100);
         // Should have mid price
         assert!(response.prices.mid_price.is_some());
+    }
+
+    // ========================================================================
+    // Execution Reports Tests
+    // ========================================================================
+
+    #[test]
+    fn test_execution_info_serialization() {
+        use crate::models::ExecutionInfo;
+
+        let execution = ExecutionInfo {
+            execution_id: "exec-123".to_string(),
+            order_id: "order-456".to_string(),
+            symbol: "AAPL-20240329-150-C".to_string(),
+            side: OrderSide::Buy,
+            price: 525,
+            quantity: 100,
+            timestamp_ms: 1704067200000,
+            counterparty_order_id: Some("counter-789".to_string()),
+            is_maker: true,
+            fee: 0,
+            edge: Some(5),
+        };
+
+        let json = serde_json::to_string(&execution).unwrap();
+        assert!(json.contains("\"execution_id\":\"exec-123\""));
+        assert!(json.contains("\"order_id\":\"order-456\""));
+        assert!(json.contains("\"symbol\":\"AAPL-20240329-150-C\""));
+        assert!(json.contains("\"side\":\"buy\""));
+        assert!(json.contains("\"price\":525"));
+        assert!(json.contains("\"quantity\":100"));
+        assert!(json.contains("\"is_maker\":true"));
+        assert!(json.contains("\"edge\":5"));
+    }
+
+    #[test]
+    fn test_execution_info_skip_none_fields() {
+        use crate::models::ExecutionInfo;
+
+        let execution = ExecutionInfo {
+            execution_id: "exec-123".to_string(),
+            order_id: "order-456".to_string(),
+            symbol: "AAPL-20240329-150-C".to_string(),
+            side: OrderSide::Sell,
+            price: 525,
+            quantity: 100,
+            timestamp_ms: 1704067200000,
+            counterparty_order_id: None,
+            is_maker: false,
+            fee: 10,
+            edge: None,
+        };
+
+        let json = serde_json::to_string(&execution).unwrap();
+        assert!(!json.contains("counterparty_order_id"));
+        assert!(!json.contains("edge"));
+    }
+
+    #[test]
+    fn test_execution_summary_serialization() {
+        use crate::models::ExecutionSummary;
+
+        let summary = ExecutionSummary {
+            total_executions: 150,
+            total_volume: 15000,
+            total_edge: 750,
+            maker_ratio: 0.65,
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"total_executions\":150"));
+        assert!(json.contains("\"total_volume\":15000"));
+        assert!(json.contains("\"total_edge\":750"));
+        assert!(json.contains("\"maker_ratio\":0.65"));
+    }
+
+    #[test]
+    fn test_executions_query_deserialization() {
+        use crate::models::ExecutionsQuery;
+
+        let json =
+            r#"{"from": "2024-01-01", "to": "2024-01-31", "underlying": "AAPL", "limit": 500}"#;
+        let query: ExecutionsQuery = serde_json::from_str(json).unwrap();
+
+        assert_eq!(query.from, Some("2024-01-01".to_string()));
+        assert_eq!(query.to, Some("2024-01-31".to_string()));
+        assert_eq!(query.underlying, Some("AAPL".to_string()));
+        assert_eq!(query.limit, 500);
+    }
+
+    #[test]
+    fn test_executions_query_defaults() {
+        use crate::models::ExecutionsQuery;
+
+        let json = r#"{}"#;
+        let query: ExecutionsQuery = serde_json::from_str(json).unwrap();
+
+        assert!(query.from.is_none());
+        assert!(query.to.is_none());
+        assert!(query.underlying.is_none());
+        assert_eq!(query.limit, 1000); // Default value
+        assert_eq!(query.offset, 0);
+    }
+
+    #[test]
+    fn test_executions_list_response_serialization() {
+        use crate::models::{ExecutionInfo, ExecutionSummary, ExecutionsListResponse};
+
+        let response = ExecutionsListResponse {
+            executions: vec![ExecutionInfo {
+                execution_id: "exec-1".to_string(),
+                order_id: "order-1".to_string(),
+                symbol: "AAPL-20240329-150-C".to_string(),
+                side: OrderSide::Buy,
+                price: 525,
+                quantity: 100,
+                timestamp_ms: 1704067200000,
+                counterparty_order_id: None,
+                is_maker: true,
+                fee: 0,
+                edge: Some(5),
+            }],
+            summary: ExecutionSummary {
+                total_executions: 1,
+                total_volume: 100,
+                total_edge: 5,
+                maker_ratio: 1.0,
+            },
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"executions\""));
+        assert!(json.contains("\"summary\""));
+        assert!(json.contains("\"total_executions\":1"));
+    }
+
+    #[tokio::test]
+    async fn test_list_executions_empty() {
+        use crate::models::ExecutionsQuery;
+
+        let state = create_test_state();
+
+        let result = list_executions(
+            State(state.clone()),
+            Query(ExecutionsQuery {
+                from: None,
+                to: None,
+                underlying: None,
+                symbol: None,
+                side: None,
+                limit: 1000,
+                offset: 0,
+            }),
+        )
+        .await;
+
+        assert_eq!(result.executions.len(), 0);
+        assert_eq!(result.summary.total_executions, 0);
+        assert_eq!(result.summary.total_volume, 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_executions_with_data() {
+        use crate::models::{ExecutionInfo, ExecutionsQuery};
+
+        let state = create_test_state();
+
+        // Add some executions
+        state.executions.insert(
+            "exec-1".to_string(),
+            ExecutionInfo {
+                execution_id: "exec-1".to_string(),
+                order_id: "order-1".to_string(),
+                symbol: "AAPL-20240329-150-C".to_string(),
+                side: OrderSide::Buy,
+                price: 525,
+                quantity: 100,
+                timestamp_ms: 1704067200000,
+                counterparty_order_id: None,
+                is_maker: true,
+                fee: 0,
+                edge: Some(5),
+            },
+        );
+        state.executions.insert(
+            "exec-2".to_string(),
+            ExecutionInfo {
+                execution_id: "exec-2".to_string(),
+                order_id: "order-2".to_string(),
+                symbol: "AAPL-20240329-150-C".to_string(),
+                side: OrderSide::Sell,
+                price: 530,
+                quantity: 50,
+                timestamp_ms: 1704067300000,
+                counterparty_order_id: None,
+                is_maker: false,
+                fee: 5,
+                edge: Some(-2),
+            },
+        );
+
+        let result = list_executions(
+            State(state.clone()),
+            Query(ExecutionsQuery {
+                from: None,
+                to: None,
+                underlying: None,
+                symbol: None,
+                side: None,
+                limit: 1000,
+                offset: 0,
+            }),
+        )
+        .await;
+
+        assert_eq!(result.executions.len(), 2);
+        assert_eq!(result.summary.total_executions, 2);
+        assert_eq!(result.summary.total_volume, 150);
+        assert_eq!(result.summary.total_edge, 3); // 5 + (-2)
+        assert!((result.summary.maker_ratio - 0.5).abs() < 0.01); // 1 maker out of 2
+    }
+
+    #[tokio::test]
+    async fn test_list_executions_with_side_filter() {
+        use crate::models::{ExecutionInfo, ExecutionsQuery};
+
+        let state = create_test_state();
+
+        state.executions.insert(
+            "exec-1".to_string(),
+            ExecutionInfo {
+                execution_id: "exec-1".to_string(),
+                order_id: "order-1".to_string(),
+                symbol: "AAPL-20240329-150-C".to_string(),
+                side: OrderSide::Buy,
+                price: 525,
+                quantity: 100,
+                timestamp_ms: 1704067200000,
+                counterparty_order_id: None,
+                is_maker: true,
+                fee: 0,
+                edge: None,
+            },
+        );
+        state.executions.insert(
+            "exec-2".to_string(),
+            ExecutionInfo {
+                execution_id: "exec-2".to_string(),
+                order_id: "order-2".to_string(),
+                symbol: "AAPL-20240329-150-C".to_string(),
+                side: OrderSide::Sell,
+                price: 530,
+                quantity: 50,
+                timestamp_ms: 1704067300000,
+                counterparty_order_id: None,
+                is_maker: false,
+                fee: 0,
+                edge: None,
+            },
+        );
+
+        let result = list_executions(
+            State(state.clone()),
+            Query(ExecutionsQuery {
+                from: None,
+                to: None,
+                underlying: None,
+                symbol: None,
+                side: Some("buy".to_string()),
+                limit: 1000,
+                offset: 0,
+            }),
+        )
+        .await;
+
+        assert_eq!(result.executions.len(), 1);
+        assert_eq!(result.executions[0].side, OrderSide::Buy);
+    }
+
+    #[tokio::test]
+    async fn test_get_execution_found() {
+        use crate::models::ExecutionInfo;
+
+        let state = create_test_state();
+
+        state.executions.insert(
+            "exec-123".to_string(),
+            ExecutionInfo {
+                execution_id: "exec-123".to_string(),
+                order_id: "order-456".to_string(),
+                symbol: "AAPL-20240329-150-C".to_string(),
+                side: OrderSide::Buy,
+                price: 525,
+                quantity: 100,
+                timestamp_ms: 1704067200000,
+                counterparty_order_id: None,
+                is_maker: true,
+                fee: 0,
+                edge: Some(5),
+            },
+        );
+
+        let result = get_execution(State(state.clone()), Path("exec-123".to_string())).await;
+
+        assert!(result.is_ok());
+        let execution = result.unwrap().0;
+        assert_eq!(execution.execution_id, "exec-123");
+        assert_eq!(execution.order_id, "order-456");
+    }
+
+    #[tokio::test]
+    async fn test_get_execution_not_found() {
+        let state = create_test_state();
+
+        let result = get_execution(State(state.clone()), Path("nonexistent".to_string())).await;
+
+        assert!(result.is_err());
     }
 }
