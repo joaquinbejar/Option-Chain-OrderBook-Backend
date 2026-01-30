@@ -110,6 +110,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/ohlc",
             get(handlers::get_ohlc),
         )
+        .route(
+            "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/metrics",
+            get(handlers::get_orderbook_metrics),
+        )
         // Order status and query
         .route("/api/v1/orders", get(handlers::list_orders))
         .route("/api/v1/orders/{order_id}", get(handlers::get_order_status))
