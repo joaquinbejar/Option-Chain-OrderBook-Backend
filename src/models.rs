@@ -1398,3 +1398,75 @@ pub struct DeleteApiKeyResponse {
     /// Whether the deletion was successful.
     pub success: bool,
 }
+
+// ============================================================================
+// Orderbook Metrics Types
+// ============================================================================
+
+/// Spread metrics for an orderbook.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SpreadMetrics {
+    /// Current spread in price units.
+    pub current: Option<u64>,
+    /// Spread in basis points.
+    pub spread_bps: Option<f64>,
+}
+
+/// Depth metrics for an orderbook.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DepthMetrics {
+    /// Total bid depth (quantity).
+    pub bid_depth_total: u64,
+    /// Total ask depth (quantity).
+    pub ask_depth_total: u64,
+    /// Order book imbalance (-1 to 1, positive = more bids).
+    pub imbalance: f64,
+}
+
+/// Price metrics for an orderbook.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PriceMetrics {
+    /// Mid price (average of best bid and ask).
+    pub mid_price: Option<f64>,
+    /// Micro price (volume-weighted mid price).
+    pub micro_price: Option<f64>,
+    /// Volume-weighted average price on bid side.
+    pub vwap_bid: Option<f64>,
+    /// Volume-weighted average price on ask side.
+    pub vwap_ask: Option<f64>,
+}
+
+/// Market impact metrics for a single side.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ImpactMetrics {
+    /// Average execution price.
+    pub avg_price: Option<f64>,
+    /// Slippage in basis points from mid price.
+    pub slippage_bps: Option<f64>,
+}
+
+/// Market impact metrics for buy and sell sides.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MarketImpactMetrics {
+    /// Impact for buying 100 units.
+    pub buy_100: ImpactMetrics,
+    /// Impact for selling 100 units.
+    pub sell_100: ImpactMetrics,
+}
+
+/// Complete orderbook metrics response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OrderbookMetricsResponse {
+    /// Option symbol.
+    pub symbol: String,
+    /// Timestamp of metrics calculation in milliseconds.
+    pub timestamp_ms: u64,
+    /// Spread metrics.
+    pub spread: SpreadMetrics,
+    /// Depth metrics.
+    pub depth: DepthMetrics,
+    /// Price metrics.
+    pub prices: PriceMetrics,
+    /// Market impact metrics.
+    pub market_impact: MarketImpactMetrics,
+}

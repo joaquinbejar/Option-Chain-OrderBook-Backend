@@ -6,16 +6,17 @@ use crate::models::{
     BulkCancelRequest, BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest,
     BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus, CancelAllQuery, CancelAllResponse,
     CancelOrderResponse, ChainQuery, ChainStrikeRow, CreateApiKeyRequest, CreateApiKeyResponse,
-    DeleteApiKeyResponse, EnrichedSnapshotResponse, ExpirationSummary, ExpirationsListResponse,
-    FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse, HealthResponse, LastTradeResponse,
-    LimitOrderStatus, MarketOrderRequest, MarketOrderResponse, MarketOrderStatus,
-    ModifyOrderRequest, ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery,
-    OhlcResponse, OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderInfo,
-    OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
-    OrderTimeInForce, PositionInfo, PositionQuery, PositionResponse, PositionSummary,
-    PositionsListResponse, PriceLevelInfo, QuoteResponse, SnapshotDepth, SnapshotQuery,
-    SnapshotStats, StrikeIV, StrikeSummary, StrikesListResponse, UnderlyingSummary,
-    UnderlyingsListResponse, VolatilitySurfaceResponse,
+    DeleteApiKeyResponse, DepthMetrics, EnrichedSnapshotResponse, ExpirationSummary,
+    ExpirationsListResponse, FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse,
+    HealthResponse, ImpactMetrics, LastTradeResponse, LimitOrderStatus, MarketImpactMetrics,
+    MarketOrderRequest, MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest,
+    ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse,
+    OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderInfo, OrderListQuery,
+    OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse, OrderTimeInForce,
+    OrderbookMetricsResponse, PositionInfo, PositionQuery, PositionResponse, PositionSummary,
+    PositionsListResponse, PriceLevelInfo, PriceMetrics, QuoteResponse, SnapshotDepth,
+    SnapshotQuery, SnapshotStats, SpreadMetrics, StrikeIV, StrikeSummary, StrikesListResponse,
+    UnderlyingSummary, UnderlyingsListResponse, VolatilitySurfaceResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -1486,6 +1487,135 @@ pub async fn get_option_snapshot(
         bids,
         asks,
         stats,
+    }))
+}
+
+// ============================================================================
+// Orderbook Metrics
+// ============================================================================
+
+/// Get orderbook metrics and analytics.
+///
+/// Returns market microstructure metrics including spread, depth, prices,
+/// and market impact estimates for an option orderbook.
+#[utoipa::path(
+    get,
+    path = "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}/metrics",
+    params(
+        ("underlying" = String, Path, description = "Underlying symbol"),
+        ("expiration" = String, Path, description = "Expiration date (YYYYMMDD)"),
+        ("strike" = u64, Path, description = "Strike price in cents"),
+        ("style" = String, Path, description = "Option style: call or put")
+    ),
+    responses(
+        (status = 200, description = "Orderbook metrics", body = OrderbookMetricsResponse),
+        (status = 404, description = "Resource not found")
+    ),
+    tag = "Metrics"
+)]
+pub async fn get_orderbook_metrics(
+    State(state): State<Arc<AppState>>,
+    Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
+) -> Result<Json<OrderbookMetricsResponse>, ApiError> {
+    let option_style = parse_option_style(&style)?;
+
+    let underlying_book = state
+        .manager
+        .get(&underlying)
+        .map_err(|_| ApiError::UnderlyingNotFound(underlying.clone()))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &exp_str)
+        .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
+
+    let exp_book = underlying_book
+        .get_expiration(&expiration)
+        .map_err(|_| ApiError::ExpirationNotFound(exp_str))?;
+
+    let strike_book = exp_book
+        .get_strike(strike)
+        .map_err(|_| ApiError::StrikeNotFound(strike))?;
+
+    let option_book = strike_book.get(option_style);
+
+    // Get enriched snapshot for base metrics (use depth 10 for calculations)
+    let enriched = option_book.inner().enriched_snapshot(10);
+
+    // Build symbol string
+    let style_str = match option_style {
+        OptionStyle::Call => "C",
+        OptionStyle::Put => "P",
+    };
+    let symbol = format!(
+        "{}_{}_{}_{}",
+        underlying,
+        format_expiration(&expiration),
+        strike,
+        style_str
+    );
+
+    // Calculate spread metrics from bids/asks
+    let best_bid = enriched.bids.first().map(|l| l.price);
+    let best_ask = enriched.asks.first().map(|l| l.price);
+    let current_spread = match (best_bid, best_ask) {
+        (Some(bid), Some(ask)) if ask > bid => Some(ask - bid),
+        _ => None,
+    };
+
+    let spread = SpreadMetrics {
+        current: current_spread.map(|s| s as u64),
+        spread_bps: enriched.spread_bps,
+    };
+
+    // Calculate depth metrics
+    let depth = DepthMetrics {
+        bid_depth_total: enriched.bid_depth_total,
+        ask_depth_total: enriched.ask_depth_total,
+        imbalance: enriched.order_book_imbalance,
+    };
+
+    // Calculate price metrics
+    let micro_price = option_book.inner().micro_price();
+
+    let prices = PriceMetrics {
+        mid_price: enriched.mid_price,
+        micro_price,
+        vwap_bid: enriched.vwap_bid,
+        vwap_ask: enriched.vwap_ask,
+    };
+
+    // Calculate market impact for standard quantity (100 units)
+    let impact_quantity = 100;
+    let buy_impact = option_book
+        .inner()
+        .market_impact(impact_quantity, Side::Buy);
+    let sell_impact = option_book
+        .inner()
+        .market_impact(impact_quantity, Side::Sell);
+
+    let buy_100 = ImpactMetrics {
+        avg_price: Some(buy_impact.avg_price),
+        slippage_bps: Some(buy_impact.slippage_bps),
+    };
+
+    let sell_100 = ImpactMetrics {
+        avg_price: Some(sell_impact.avg_price),
+        slippage_bps: Some(sell_impact.slippage_bps),
+    };
+
+    let market_impact = MarketImpactMetrics { buy_100, sell_100 };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    Ok(Json(OrderbookMetricsResponse {
+        symbol,
+        timestamp_ms: now,
+        spread,
+        depth,
+        prices,
+        market_impact,
     }))
 }
 
@@ -5050,5 +5180,238 @@ mod tests {
 
         let response = delete_api_key(State(state.clone()), Path("nonexistent".to_string())).await;
         assert!(!response.success);
+    }
+
+    // ========================================================================
+    // Orderbook Metrics Tests
+    // ========================================================================
+
+    #[test]
+    fn test_spread_metrics_serialization() {
+        use crate::models::SpreadMetrics;
+
+        let metrics = SpreadMetrics {
+            current: Some(10),
+            spread_bps: Some(6.67),
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"current\":10"));
+        assert!(json.contains("\"spread_bps\":6.67"));
+    }
+
+    #[test]
+    fn test_spread_metrics_none_values() {
+        use crate::models::SpreadMetrics;
+
+        let metrics = SpreadMetrics {
+            current: None,
+            spread_bps: None,
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"current\":null"));
+        assert!(json.contains("\"spread_bps\":null"));
+    }
+
+    #[test]
+    fn test_depth_metrics_serialization() {
+        use crate::models::DepthMetrics;
+
+        let metrics = DepthMetrics {
+            bid_depth_total: 1000,
+            ask_depth_total: 1200,
+            imbalance: 0.09,
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"bid_depth_total\":1000"));
+        assert!(json.contains("\"ask_depth_total\":1200"));
+        assert!(json.contains("\"imbalance\":0.09"));
+    }
+
+    #[test]
+    fn test_price_metrics_serialization() {
+        use crate::models::PriceMetrics;
+
+        let metrics = PriceMetrics {
+            mid_price: Some(150.05),
+            micro_price: Some(150.03),
+            vwap_bid: Some(149.95),
+            vwap_ask: Some(150.15),
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"mid_price\":150.05"));
+        assert!(json.contains("\"micro_price\":150.03"));
+        assert!(json.contains("\"vwap_bid\":149.95"));
+        assert!(json.contains("\"vwap_ask\":150.15"));
+    }
+
+    #[test]
+    fn test_impact_metrics_serialization() {
+        use crate::models::ImpactMetrics;
+
+        let metrics = ImpactMetrics {
+            avg_price: Some(150.12),
+            slippage_bps: Some(4.67),
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"avg_price\":150.12"));
+        assert!(json.contains("\"slippage_bps\":4.67"));
+    }
+
+    #[test]
+    fn test_market_impact_metrics_serialization() {
+        use crate::models::{ImpactMetrics, MarketImpactMetrics};
+
+        let metrics = MarketImpactMetrics {
+            buy_100: ImpactMetrics {
+                avg_price: Some(150.12),
+                slippage_bps: Some(4.67),
+            },
+            sell_100: ImpactMetrics {
+                avg_price: Some(149.88),
+                slippage_bps: Some(11.33),
+            },
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("\"buy_100\""));
+        assert!(json.contains("\"sell_100\""));
+    }
+
+    #[test]
+    fn test_orderbook_metrics_response_serialization() {
+        use crate::models::{
+            DepthMetrics, ImpactMetrics, MarketImpactMetrics, OrderbookMetricsResponse,
+            PriceMetrics, SpreadMetrics,
+        };
+
+        let response = OrderbookMetricsResponse {
+            symbol: "AAPL_20240329_15000_C".to_string(),
+            timestamp_ms: 1709123456789,
+            spread: SpreadMetrics {
+                current: Some(10),
+                spread_bps: Some(6.67),
+            },
+            depth: DepthMetrics {
+                bid_depth_total: 1000,
+                ask_depth_total: 1200,
+                imbalance: 0.09,
+            },
+            prices: PriceMetrics {
+                mid_price: Some(150.05),
+                micro_price: Some(150.03),
+                vwap_bid: Some(149.95),
+                vwap_ask: Some(150.15),
+            },
+            market_impact: MarketImpactMetrics {
+                buy_100: ImpactMetrics {
+                    avg_price: Some(150.12),
+                    slippage_bps: Some(4.67),
+                },
+                sell_100: ImpactMetrics {
+                    avg_price: Some(149.88),
+                    slippage_bps: Some(11.33),
+                },
+            },
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"symbol\":\"AAPL_20240329_15000_C\""));
+        assert!(json.contains("\"timestamp_ms\":1709123456789"));
+        assert!(json.contains("\"spread\""));
+        assert!(json.contains("\"depth\""));
+        assert!(json.contains("\"prices\""));
+        assert!(json.contains("\"market_impact\""));
+    }
+
+    #[tokio::test]
+    async fn test_get_orderbook_metrics_underlying_not_found() {
+        let state = create_test_state();
+
+        let result = get_orderbook_metrics(
+            State(state.clone()),
+            Path((
+                "NONEXISTENT".to_string(),
+                "20240329".to_string(),
+                15000,
+                "call".to_string(),
+            )),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_orderbook_metrics_empty_book() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, and strike
+        let underlying = state.manager.get_or_create("METRICS1");
+        let exp = ExpirationDate::Days(optionstratlib::prelude::Positive::new(30.0).unwrap());
+        let exp_book = underlying.get_or_create_expiration(exp);
+        exp_book.get_or_create_strike(15000);
+
+        // Get the expiration string
+        let exp_str = exp.get_date().unwrap().format("%Y%m%d").to_string();
+
+        let result = get_orderbook_metrics(
+            State(state.clone()),
+            Path(("METRICS1".to_string(), exp_str, 15000, "call".to_string())),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert!(response.symbol.contains("METRICS1"));
+        assert!(response.symbol.contains("15000"));
+        assert!(response.symbol.contains("C"));
+        // Empty book should have zero depth
+        assert_eq!(response.depth.bid_depth_total, 0);
+        assert_eq!(response.depth.ask_depth_total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_orderbook_metrics_with_orders() {
+        let state = create_test_state();
+
+        // Create underlying, expiration, and strike
+        let underlying = state.manager.get_or_create("METRICS2");
+        let exp = ExpirationDate::Days(optionstratlib::prelude::Positive::new(30.0).unwrap());
+        let exp_book = underlying.get_or_create_expiration(exp);
+        let strike_book = exp_book.get_or_create_strike(15000);
+        let call_book = strike_book.get(OptionStyle::Call);
+
+        // Add some orders using the option_book API
+        call_book
+            .add_limit_order(OrderId::new(), Side::Buy, 10000, 100) // bid at 100.00
+            .unwrap();
+        call_book
+            .add_limit_order(OrderId::new(), Side::Sell, 10100, 100) // ask at 101.00
+            .unwrap();
+
+        // Get the expiration string
+        let exp_str = exp.get_date().unwrap().format("%Y%m%d").to_string();
+
+        let result = get_orderbook_metrics(
+            State(state.clone()),
+            Path(("METRICS2".to_string(), exp_str, 15000, "call".to_string())),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert!(response.symbol.contains("METRICS2"));
+        // Should have spread (100 = 101.00 - 100.00)
+        assert_eq!(response.spread.current, Some(100));
+        // Should have depth
+        assert_eq!(response.depth.bid_depth_total, 100);
+        assert_eq!(response.depth.ask_depth_total, 100);
+        // Should have mid price
+        assert!(response.prices.mid_price.is_some());
     }
 }
