@@ -1,7 +1,7 @@
 //! Application state management.
 
 use crate::api::websocket::OrderbookSubscriptionManager;
-use crate::auth::ApiKeyStore;
+use crate::auth::JwtAuth;
 use crate::config::{AssetConfig, Config};
 use crate::db::DatabasePool;
 use crate::market_maker::MarketMakerEngine;
@@ -37,8 +37,11 @@ pub struct AppState {
     pub orderbook_subscriptions: Arc<OrderbookSubscriptionManager>,
     /// OHLC candlestick data aggregator.
     pub ohlc_aggregator: Arc<OhlcAggregator>,
-    /// API key store for authentication.
-    pub api_key_store: Arc<ApiKeyStore>,
+    /// JWT authentication core (signing/verification keys + rate limiter).
+    pub auth: Arc<JwtAuth>,
+    /// Operator bootstrap secret for the token-issuance endpoint. `None` disables
+    /// `POST /api/v1/auth/token` (tokens must then be minted out-of-band).
+    pub bootstrap_secret: Option<String>,
     /// Storage for execution reports by execution ID.
     pub executions: Arc<DashMap<String, ExecutionInfo>>,
     /// Storage for orderbook snapshots by snapshot ID.
@@ -63,7 +66,8 @@ impl AppState {
             positions: Arc::new(DashMap::new()),
             orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
-            api_key_store: Arc::new(ApiKeyStore::new()),
+            auth: Arc::new(JwtAuth::dev()),
+            bootstrap_secret: None,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
         }
@@ -89,7 +93,8 @@ impl AppState {
             positions: Arc::new(DashMap::new()),
             orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
-            api_key_store: Arc::new(ApiKeyStore::new()),
+            auth: Arc::new(JwtAuth::dev()),
+            bootstrap_secret: None,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
         }
@@ -130,7 +135,8 @@ impl AppState {
             positions: Arc::new(DashMap::new()),
             orderbook_subscriptions: Arc::new(OrderbookSubscriptionManager::new()),
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
-            api_key_store: Arc::new(ApiKeyStore::new()),
+            auth: Arc::new(JwtAuth::dev()),
+            bootstrap_secret: None,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
         }

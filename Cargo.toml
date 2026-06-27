@@ -57,7 +57,9 @@ rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
-sha2 = { workspace = true }
+
+# Authentication (JWT signed with an x509 key pair)
+jsonwebtoken = { workspace = true }
 
 [workspace.dependencies]
 # Web framework
@@ -106,7 +108,10 @@ tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 url = "2.5"
 serde_urlencoded = "0.7"
 
-sha2 = "0.11.0"
+# Authentication (JWT signed with an x509 key pair).
+# Pure-Rust crypto backend (`rust_crypto`) avoids a C toolchain dependency;
+# `use_pem` enables loading keys/certs from PEM (incl. x509 CERTIFICATE blocks).
+jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "rust_crypto"] }
 
 [dev-dependencies]
 

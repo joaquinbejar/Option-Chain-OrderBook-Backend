@@ -486,7 +486,7 @@ impl OptionPath {
 // Authentication
 // ============================================================================
 
-/// Permission level for API keys.
+/// Permission level carried by a JWT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
@@ -498,70 +498,25 @@ pub enum Permission {
     Admin,
 }
 
-/// Request to create an API key.
+/// Request body for `POST /api/v1/auth/token`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateApiKeyRequest {
-    /// Human-readable name for the key.
-    pub name: String,
-    /// Permissions granted to this key.
+pub struct TokenRequest {
+    /// Operator bootstrap secret (`AUTH_BOOTSTRAP_SECRET`).
+    pub secret: String,
+    /// Permissions to embed in the token.
     pub permissions: Vec<Permission>,
-    /// Rate limit in requests per minute.
-    #[serde(default = "default_rate_limit")]
-    pub rate_limit: u32,
+    /// Optional token lifetime in seconds (defaults to the server's TTL).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ttl_secs: Option<u64>,
 }
 
-fn default_rate_limit() -> u32 {
-    1000
-}
-
-/// Response after creating an API key.
+/// Response for `POST /api/v1/auth/token`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateApiKeyResponse {
-    /// Unique key identifier.
-    pub key_id: String,
-    /// The raw API key (only returned once).
-    pub api_key: String,
-    /// Human-readable name.
-    pub name: String,
-    /// Permissions granted.
-    pub permissions: Vec<Permission>,
-    /// Rate limit.
-    pub rate_limit: u32,
-    /// Creation timestamp in milliseconds.
-    pub created_at: u64,
-}
-
-/// API key information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiKeyInfo {
-    /// Unique key identifier.
-    pub key_id: String,
-    /// Human-readable name.
-    pub name: String,
-    /// Permissions granted.
-    pub permissions: Vec<Permission>,
-    /// Rate limit.
-    pub rate_limit: u32,
-    /// Creation timestamp in milliseconds.
-    pub created_at: u64,
-    /// Last used timestamp in milliseconds.
-    pub last_used_at: Option<u64>,
-}
-
-/// Response for listing API keys.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiKeyListResponse {
-    /// List of API keys.
-    pub keys: Vec<ApiKeyInfo>,
-}
-
-/// Response for deleting an API key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteApiKeyResponse {
-    /// Whether the operation was successful.
-    pub success: bool,
-    /// Message describing the result.
-    pub message: String,
+pub struct TokenResponse {
+    /// The signed JWT (use as `Authorization: Bearer <token>`).
+    pub token: String,
+    /// Token expiration as an ISO-8601 / RFC3339 timestamp (UTC).
+    pub expires_at: String,
 }
 
 // ============================================================================

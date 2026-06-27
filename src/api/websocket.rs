@@ -1,7 +1,10 @@
 //! WebSocket handler for real-time updates.
 
+use crate::auth::Claims;
 use crate::market_maker::MarketMakerEvent;
+use crate::models::Permission;
 use crate::state::AppState;
+use axum::Extension;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -377,23 +380,37 @@ impl Default for OrderbookSubscriptionManager {
 }
 
 /// WebSocket upgrade handler.
+///
+/// The upgrade is authenticated by `auth_middleware`, which verifies the JWT from
+/// the `?token=<jwt>` query parameter (browser) or the `Authorization: Bearer`
+/// header (SDK) and injects the caller's [`Claims`]. An unauthorized upgrade is
+/// rejected with `401` before reaching this handler.
 #[utoipa::path(
     get,
     path = "/ws",
     responses(
-        (status = 101, description = "WebSocket connection established")
+        (status = 101, description = "WebSocket connection established"),
+        (status = 401, description = "Missing or invalid authentication token")
     ),
+    security(("bearer_auth" = [])),
     tag = "WebSocket"
 )]
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    Extension(claims): Extension<Claims>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, claims))
 }
 
 /// Handle an individual WebSocket connection.
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+///
+/// `claims` are the authenticated caller's claims; their permissions gate the
+/// market-maker control commands (`kill`, `enable`, `set_*`), which require
+/// `Admin`.
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) {
+    let subject = claims.sub.clone();
+    let permissions = claims.permissions.clone();
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(tokio::sync::Mutex::new(sender));
 
@@ -422,7 +439,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         let _ = sender.lock().await.send(Message::Text(json.into())).await;
     }
 
-    info!("WebSocket client connected");
+    info!(sub = %subject, "WebSocket client connected");
 
     // Spawn task to handle incoming messages (for ping/pong and commands)
     let state_clone = Arc::clone(&state);
@@ -441,6 +458,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         &sender_clone,
                         &subscribed_symbols_clone,
                         &subscribed_trades_clone,
+                        &permissions,
                     )
                     .await;
                 }
@@ -654,12 +672,18 @@ struct ClientCommand {
 type WsSender = Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, Message>>>;
 
 /// Handle incoming client messages.
+///
+/// `permissions` are the authenticated caller's permissions; the market-maker
+/// control commands (`kill`, `enable`, `set_spread`, `set_size`, `set_skew`)
+/// require `Admin` and are rejected with an error message otherwise. Subscription
+/// and read commands require only `Read`, already enforced at the upgrade.
 async fn handle_client_message(
     text: &str,
     state: &Arc<AppState>,
     sender: &WsSender,
     subscribed_symbols: &Arc<tokio::sync::RwLock<HashSet<String>>>,
     subscribed_trades: &Arc<tokio::sync::RwLock<HashSet<String>>>,
+    permissions: &[Permission],
 ) {
     if let Ok(cmd) = serde_json::from_str::<ClientCommand>(text) {
         match cmd.action.as_str() {
@@ -698,26 +722,41 @@ async fn handle_client_message(
                     debug!("Client unsubscribed from {:?}", cmd.symbol);
                 }
             }
-            "set_spread" => {
-                if let Some(value) = cmd.value {
-                    state.market_maker.set_spread_multiplier(value);
+            action @ ("set_spread" | "set_size" | "set_skew" | "kill" | "enable") => {
+                // Market-maker control commands require Admin (Admin implies all).
+                if !permissions.contains(&Permission::Admin) {
+                    let error_msg = WsMessage::Error {
+                        message: "forbidden: admin permission required".to_string(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&error_msg) {
+                        let _ = sender.lock().await.send(Message::Text(json.into())).await;
+                    }
+                    return;
                 }
-            }
-            "set_size" => {
-                if let Some(value) = cmd.value {
-                    state.market_maker.set_size_scalar(value / 100.0);
+                match action {
+                    "set_spread" => {
+                        if let Some(value) = cmd.value {
+                            state.market_maker.set_spread_multiplier(value);
+                        }
+                    }
+                    "set_size" => {
+                        if let Some(value) = cmd.value {
+                            state.market_maker.set_size_scalar(value / 100.0);
+                        }
+                    }
+                    "set_skew" => {
+                        if let Some(value) = cmd.value {
+                            state.market_maker.set_directional_skew(value);
+                        }
+                    }
+                    "kill" => {
+                        state.market_maker.set_enabled(false);
+                    }
+                    "enable" => {
+                        state.market_maker.set_enabled(true);
+                    }
+                    _ => {}
                 }
-            }
-            "set_skew" => {
-                if let Some(value) = cmd.value {
-                    state.market_maker.set_directional_skew(value);
-                }
-            }
-            "kill" => {
-                state.market_maker.set_enabled(false);
-            }
-            "enable" => {
-                state.market_maker.set_enabled(true);
             }
             "batch_subscribe" => {
                 handle_batch_subscribe(state, sender, subscribed_symbols, subscribed_trades, &cmd)

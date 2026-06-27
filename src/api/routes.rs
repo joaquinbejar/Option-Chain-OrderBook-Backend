@@ -16,15 +16,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/ws", get(websocket::ws_handler))
         // Statistics
         .route("/api/v1/stats", get(handlers::get_global_stats))
-        // Authentication
-        .route(
-            "/api/v1/auth/keys",
-            post(handlers::create_api_key).get(handlers::list_api_keys),
-        )
-        .route(
-            "/api/v1/auth/keys/{key_id}",
-            delete(handlers::delete_api_key),
-        )
+        // Authentication (JWT issuance; gated by the operator bootstrap secret)
+        .route("/api/v1/auth/token", post(handlers::issue_token))
         // Controls
         .route("/api/v1/controls", get(controls::get_controls))
         .route("/api/v1/controls/kill-switch", post(controls::kill_switch))
@@ -147,10 +140,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/admin/snapshots/{snapshot_id}/restore",
             post(handlers::restore_snapshot),
         )
-        // Apply rate limiting middleware
+        // Apply authentication + rate-limiting middleware
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
-            middleware::rate_limit_middleware,
+            middleware::auth_middleware,
         ))
         .with_state(state)
 }

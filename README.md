@@ -34,9 +34,14 @@ provides OpenAPI/Swagger documentation via [utoipa](https://crates.io/crates/uto
 
 - **Orderbook Persistence**: Snapshot and restore orderbook state.
 
-- **Rate Limiting**: Configurable per-key rate limiting for API access.
+- **Rate Limiting**: Sliding-window rate limiting keyed by the JWT subject.
 
-- **API Key Authentication**: Secure API access with permission-based keys.
+- **JWT Authentication (x509)**: All endpoints except `/health` and token
+  issuance require a valid JWT (`Authorization: Bearer <jwt>` for REST, or
+  `?token=<jwt>` for the WebSocket upgrade). Tokens are signed by the backend
+  with an RSA private key and verified with the public key from its x509
+  certificate. Permissions (`read` / `trade` / `admin`, where `admin` implies
+  all) are carried in the token claims and enforced per route.
 
 - **OpenAPI Documentation**: Auto-generated Swagger UI for API exploration
   and testing at `/swagger-ui/`.
@@ -65,7 +70,7 @@ The API follows the hierarchical structure of the Option Chain OrderBook library
 | Module | Description |
 |--------|-------------|
 | [`api`] | Route handlers, WebSocket, and router configuration |
-| [`auth`] | API key authentication and rate limiting |
+| [`auth`] | JWT (x509) authentication, claims, and rate limiting |
 | [`config`] | Server and market maker configuration |
 | [`db`] | Database connection pool and schema |
 | [`error`] | API error types with `IntoResponse` implementation |
@@ -88,9 +93,13 @@ The API follows the hierarchical structure of the Option Chain OrderBook library
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/v1/auth/keys` | Create API key |
-| GET | `/api/v1/auth/keys` | List API keys |
-| DELETE | `/api/v1/auth/keys/{key_id}` | Delete API key |
+| POST | `/api/v1/auth/token` | Issue a JWT (gated by `AUTH_BOOTSTRAP_SECRET`) |
+
+Tokens may also be minted offline with the `mint-token` CLI subcommand:
+
+```bash
+option-chain-orderbook-backend mint-token --permissions read,trade --ttl 3600
+```
 
 #### Controls (Market Maker)
 
@@ -346,6 +355,7 @@ let snapshot = client.create_snapshot().await?;
 - **dashmap** (6.1): Concurrent hash maps
 - **serde** (1.0): Serialization/deserialization
 - **tracing** (0.1): Structured logging
+- **jsonwebtoken** (10.4): JWT signing/verification (RS256, x509 PEM)
 
 
 ## 🛠 Makefile Commands

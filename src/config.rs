@@ -5,6 +5,34 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+/// Default token issuer (`iss` claim) when none is configured.
+pub const DEFAULT_ISSUER: &str = "option-chain-orderbook-backend";
+
+/// Default minted-token lifetime in seconds (1 hour).
+pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
+
+/// Built-in DEV private-key path (relative to the crate root).
+pub const DEV_PRIVATE_KEY_PATH: &str = "tests/fixtures/dev-private-key.pem";
+
+/// Built-in DEV x509 certificate path (relative to the crate root).
+pub const DEV_CERT_PATH: &str = "tests/fixtures/dev-cert.pem";
+
+/// Environment variable overriding the private-key PEM path.
+pub const ENV_PRIVATE_KEY_PATH: &str = "AUTH_PRIVATE_KEY_PATH";
+
+/// Environment variable overriding the x509 certificate PEM path.
+pub const ENV_CERT_PATH: &str = "AUTH_CERT_PATH";
+
+/// Environment variable overriding the token issuer.
+pub const ENV_ISSUER: &str = "AUTH_ISSUER";
+
+/// Environment variable overriding the default token TTL (seconds).
+pub const ENV_DEFAULT_TTL_SECS: &str = "AUTH_DEFAULT_TTL_SECS";
+
+/// Environment variable holding the operator bootstrap secret. When unset, the
+/// `POST /api/v1/auth/token` endpoint is disabled.
+pub const ENV_BOOTSTRAP_SECRET: &str = "AUTH_BOOTSTRAP_SECRET";
+
 /// Configuration error types.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -29,8 +57,97 @@ pub struct Config {
     /// Cleanup configuration.
     #[serde(default)]
     pub cleanup: CleanupConfig,
+    /// Authentication configuration (JWT + x509). Optional in the file; env vars
+    /// and built-in dev defaults fill any gaps (see [`AuthConfig::resolved`]).
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
     /// List of configured assets.
     pub assets: Vec<AssetConfig>,
+}
+
+/// Authentication configuration: PEM key/cert paths, issuer, and default TTL.
+///
+/// All fields fall back to built-in DEV defaults so local `cargo run` works out
+/// of the box; production deployments override the paths via the `[auth]` section
+/// or the `AUTH_*` environment variables. The operator bootstrap secret is NOT
+/// stored here — it comes only from `AUTH_BOOTSTRAP_SECRET`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthConfig {
+    /// Path to the PEM-encoded RSA private signing key.
+    #[serde(default = "default_private_key_path")]
+    pub private_key_path: String,
+    /// Path to the PEM-encoded x509 certificate (holds the public key).
+    #[serde(default = "default_cert_path")]
+    pub cert_path: String,
+    /// Token issuer (the `iss` claim).
+    #[serde(default = "default_issuer")]
+    pub issuer: String,
+    /// Default minted-token lifetime in seconds.
+    #[serde(default = "default_token_ttl_secs")]
+    pub default_ttl_secs: u64,
+}
+
+fn default_private_key_path() -> String {
+    DEV_PRIVATE_KEY_PATH.to_string()
+}
+
+fn default_cert_path() -> String {
+    DEV_CERT_PATH.to_string()
+}
+
+fn default_issuer() -> String {
+    DEFAULT_ISSUER.to_string()
+}
+
+fn default_token_ttl_secs() -> u64 {
+    DEFAULT_TOKEN_TTL_SECS
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            private_key_path: default_private_key_path(),
+            cert_path: default_cert_path(),
+            issuer: default_issuer(),
+            default_ttl_secs: default_token_ttl_secs(),
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Resolves the effective auth configuration, layering (highest precedence
+    /// first): `AUTH_*` environment variables, the `[auth]` config section, then
+    /// built-in DEV defaults.
+    #[must_use]
+    pub fn resolved(config: Option<&Config>) -> Self {
+        let base = config.and_then(|c| c.auth.clone()).unwrap_or_default();
+        Self {
+            private_key_path: std::env::var(ENV_PRIVATE_KEY_PATH).unwrap_or(base.private_key_path),
+            cert_path: std::env::var(ENV_CERT_PATH).unwrap_or(base.cert_path),
+            issuer: std::env::var(ENV_ISSUER).unwrap_or(base.issuer),
+            default_ttl_secs: std::env::var(ENV_DEFAULT_TTL_SECS)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(base.default_ttl_secs),
+        }
+    }
+
+    /// Returns true if this configuration points at the built-in DEV key pair.
+    #[must_use]
+    pub fn is_dev(&self) -> bool {
+        self.private_key_path == DEV_PRIVATE_KEY_PATH && self.cert_path == DEV_CERT_PATH
+    }
+
+    /// Reads the operator bootstrap secret from `AUTH_BOOTSTRAP_SECRET`.
+    ///
+    /// Returns `None` when unset, which disables the token-issuance endpoint.
+    #[must_use]
+    pub fn bootstrap_secret() -> Option<String> {
+        match std::env::var(ENV_BOOTSTRAP_SECRET) {
+            Ok(s) if !s.is_empty() => Some(s),
+            _ => None,
+        }
+    }
 }
 
 /// Server configuration.
@@ -175,6 +292,14 @@ impl Config {
 
     /// Validates the configuration values.
     fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(auth) = &self.auth
+            && auth.default_ttl_secs == 0
+        {
+            return Err(ConfigError::InvalidValue(
+                "auth default_ttl_secs must be positive".to_string(),
+            ));
+        }
+
         if self.assets.is_empty() {
             return Err(ConfigError::InvalidValue(
                 "at least one asset must be configured".to_string(),
@@ -229,6 +354,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             simulation: SimulationConfig::default(),
             cleanup: CleanupConfig::default(),
+            auth: None,
             assets: vec![AssetConfig {
                 symbol: "BTC".to_string(),
                 name: "Bitcoin".to_string(),
@@ -304,11 +430,82 @@ strike_spacing = 1000.0
     }
 
     #[test]
+    fn test_auth_config_defaults_are_dev() {
+        let auth = AuthConfig::default();
+        assert!(auth.is_dev());
+        assert_eq!(auth.issuer, DEFAULT_ISSUER);
+        assert_eq!(auth.default_ttl_secs, DEFAULT_TOKEN_TTL_SECS);
+    }
+
+    #[test]
+    fn test_parse_config_with_auth_section() {
+        let toml_content = r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[simulation]
+enabled = true
+interval_ms = 500
+walk_type = "geometric_brownian"
+
+[auth]
+private_key_path = "/etc/ocob/key.pem"
+cert_path = "/etc/ocob/cert.pem"
+issuer = "prod-issuer"
+default_ttl_secs = 900
+
+[[assets]]
+symbol = "BTC"
+name = "Bitcoin"
+initial_price = 100000.0
+volatility = 0.65
+drift = 0.05
+expirations = ["20251231"]
+num_strikes = 10
+strike_spacing = 1000.0
+"#;
+
+        let config = Config::parse(toml_content).expect("should parse");
+        let auth = config.auth.expect("auth section present");
+        assert_eq!(auth.private_key_path, "/etc/ocob/key.pem");
+        assert_eq!(auth.cert_path, "/etc/ocob/cert.pem");
+        assert_eq!(auth.issuer, "prod-issuer");
+        assert_eq!(auth.default_ttl_secs, 900);
+        assert!(!auth.is_dev());
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_ttl() {
+        let config = Config {
+            server: ServerConfig::default(),
+            simulation: SimulationConfig::default(),
+            cleanup: CleanupConfig::default(),
+            auth: Some(AuthConfig {
+                default_ttl_secs: 0,
+                ..AuthConfig::default()
+            }),
+            assets: vec![AssetConfig {
+                symbol: "BTC".to_string(),
+                name: "Bitcoin".to_string(),
+                initial_price: 100.0,
+                volatility: 0.2,
+                drift: 0.0,
+                expirations: vec!["20251231".to_string()],
+                num_strikes: 2,
+                strike_spacing: 10.0,
+            }],
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn test_validation_empty_assets() {
         let config = Config {
             server: ServerConfig::default(),
             simulation: SimulationConfig::default(),
             cleanup: CleanupConfig::default(),
+            auth: None,
             assets: vec![],
         };
         assert!(config.validate().is_err());

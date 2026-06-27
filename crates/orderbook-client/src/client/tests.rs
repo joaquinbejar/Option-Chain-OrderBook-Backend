@@ -19,6 +19,7 @@ fn test_client_config_custom() {
     let config = ClientConfig {
         base_url: "http://api.example.com:9000".to_string(),
         timeout: Duration::from_secs(60),
+        token: None,
     };
 
     assert_eq!(config.base_url, "http://api.example.com:9000");
@@ -30,6 +31,7 @@ fn test_client_config_clone() {
     let config = ClientConfig {
         base_url: "http://test.com".to_string(),
         timeout: Duration::from_secs(10),
+        token: None,
     };
 
     let cloned = config.clone();
@@ -78,10 +80,24 @@ fn test_orderbook_client_ws_url_https() {
 }
 
 #[test]
+fn test_orderbook_client_ws_url_with_token() {
+    let client = OrderbookClient::with_token("http://localhost:8080", "abc.def.ghi").unwrap();
+
+    assert_eq!(client.ws_url(), "ws://localhost:8080/ws?token=abc.def.ghi");
+}
+
+#[test]
+fn test_orderbook_client_with_token_builds() {
+    let client = OrderbookClient::with_token("http://localhost:8080", "abc.def.ghi");
+    assert!(client.is_ok());
+}
+
+#[test]
 fn test_orderbook_client_custom_timeout() {
     let config = ClientConfig {
         base_url: "http://localhost:8080".to_string(),
         timeout: Duration::from_secs(5),
+        token: None,
     };
 
     let client = OrderbookClient::new(config);
