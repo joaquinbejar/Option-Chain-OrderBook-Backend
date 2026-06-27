@@ -6,11 +6,12 @@ use crate::models::Permission;
 use crate::state::AppState;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{Method, Request, header::AUTHORIZATION},
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -61,10 +62,10 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Token issuance is unauthenticated but rate-limited by client IP.
+    // Token issuance is unauthenticated but rate-limited by the trusted peer
+    // address (never a spoofable client header unless a proxy is trusted).
     if method == Method::POST && path == TOKEN_PATH {
-        let ip = extract_client_ip(&request);
-        let key = format!("token_issue:{ip}");
+        let key = token_rate_limit_key(&request, state.trust_proxy);
         if !state.auth.check_rate_limit(&key, TOKEN_ISSUE_RATE_LIMIT) {
             return rate_limited_response(TOKEN_ISSUE_RATE_LIMIT);
         }
@@ -188,22 +189,63 @@ fn add_rate_limit_headers(response: &mut Response, limit: u32) {
     }
 }
 
-/// Extracts the client IP from forwarding headers, defaulting to `"unknown"`.
-fn extract_client_ip(request: &Request<Body>) -> String {
+/// Derives the rate-limit bucket key for the unauthenticated token endpoint.
+///
+/// By default the identity is the trusted socket peer address provided by axum's
+/// [`ConnectInfo`] (wired via `into_make_service_with_connect_info` in
+/// `main.rs`), so a client cannot influence its own bucket — this closes the
+/// spoofable-`X-Forwarded-For` rate-limit bypass from issue #48. A
+/// client-supplied `X-Forwarded-For` / `X-Real-IP` header is honored ONLY when
+/// `trust_proxy` is enabled (the operator asserts a trusted reverse proxy
+/// terminates the connection). The constant `"unknown"` shared bucket is never
+/// used as a catch-all under normal operation.
+fn token_rate_limit_key(request: &Request<Body>, trust_proxy: bool) -> String {
+    if trust_proxy && let Some(ip) = forwarded_ip(request) {
+        return format!("token_issue:fwd:{ip}");
+    }
+
+    match request.extensions().get::<ConnectInfo<SocketAddr>>() {
+        Some(ConnectInfo(addr)) => format!("token_issue:peer:{}", addr.ip()),
+        None => {
+            // ConnectInfo is always injected in production (see `main.rs`); its
+            // absence means the service was built without connect-info wiring.
+            // Apply the limit under a single fallback bucket and warn so the
+            // misconfiguration is visible rather than silently un-limited.
+            tracing::warn!(
+                "token-endpoint rate limit could not resolve a peer address; \
+                 using a fallback bucket (check into_make_service_with_connect_info)"
+            );
+            "token_issue:peer:unresolved".to_string()
+        }
+    }
+}
+
+/// Extracts a client IP from `X-Forwarded-For` (first hop) or `X-Real-IP`.
+///
+/// Only consulted when the immediate peer is a configured trusted proxy
+/// (`trust_proxy`); these headers are client-controlled and must never be
+/// trusted for rate-limit identity by default.
+fn forwarded_ip(request: &Request<Body>) -> Option<String> {
     if let Some(forwarded) = request.headers().get("X-Forwarded-For")
         && let Ok(value) = forwarded.to_str()
-        && let Some(ip) = value.split(',').next()
+        && let Some(first) = value.split(',').next()
     {
-        return ip.trim().to_string();
+        let ip = first.trim();
+        if !ip.is_empty() {
+            return Some(ip.to_string());
+        }
     }
 
     if let Some(real_ip) = request.headers().get("X-Real-IP")
         && let Ok(value) = real_ip.to_str()
     {
-        return value.to_string();
+        let ip = value.trim();
+        if !ip.is_empty() {
+            return Some(ip.to_string());
+        }
     }
 
-    "unknown".to_string()
+    None
 }
 
 #[cfg(test)]
@@ -220,30 +262,113 @@ mod tests {
             .expect("request builds")
     }
 
+    /// Builds a request with a `ConnectInfo<SocketAddr>` extension, mimicking
+    /// axum's `into_make_service_with_connect_info` wiring.
+    fn req_with_peer(method: Method, uri: &str, peer: &str) -> Request<Body> {
+        let addr: SocketAddr = peer.parse().expect("valid socket addr");
+        let mut request = req(method, uri);
+        request.extensions_mut().insert(ConnectInfo(addr));
+        request
+    }
+
     #[test]
-    fn test_extract_client_ip_forwarded() {
+    fn test_forwarded_ip_xff_first_hop() {
         let request = Request::builder()
             .uri("/test")
             .header("X-Forwarded-For", "192.168.1.1, 10.0.0.1")
             .body(Body::empty())
             .expect("request builds");
-        assert_eq!(extract_client_ip(&request), "192.168.1.1");
+        assert_eq!(forwarded_ip(&request), Some("192.168.1.1".to_string()));
     }
 
     #[test]
-    fn test_extract_client_ip_real_ip() {
+    fn test_forwarded_ip_real_ip() {
         let request = Request::builder()
             .uri("/test")
             .header("X-Real-IP", "192.168.1.2")
             .body(Body::empty())
             .expect("request builds");
-        assert_eq!(extract_client_ip(&request), "192.168.1.2");
+        assert_eq!(forwarded_ip(&request), Some("192.168.1.2".to_string()));
     }
 
     #[test]
-    fn test_extract_client_ip_unknown() {
+    fn test_forwarded_ip_absent() {
         let request = req(Method::GET, "/test");
-        assert_eq!(extract_client_ip(&request), "unknown");
+        assert_eq!(forwarded_ip(&request), None);
+    }
+
+    #[test]
+    fn test_token_key_uses_peer_addr_by_default() {
+        // With trust_proxy off, the key derives from the socket peer, NOT the
+        // (spoofable) forwarding header.
+        let mut request = req_with_peer(Method::POST, TOKEN_PATH, "203.0.113.7:54321");
+        request
+            .headers_mut()
+            .insert("X-Forwarded-For", "1.2.3.4".parse().expect("header value"));
+        assert_eq!(
+            token_rate_limit_key(&request, false),
+            "token_issue:peer:203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn test_token_key_forged_xff_does_not_change_bucket() {
+        // Two requests from the same peer but with different forged XFF headers
+        // must land in the SAME bucket when proxies are not trusted.
+        let mut a = req_with_peer(Method::POST, TOKEN_PATH, "203.0.113.7:1111");
+        a.headers_mut()
+            .insert("X-Forwarded-For", "9.9.9.9".parse().expect("header value"));
+        let mut b = req_with_peer(Method::POST, TOKEN_PATH, "203.0.113.7:2222");
+        b.headers_mut()
+            .insert("X-Forwarded-For", "8.8.8.8".parse().expect("header value"));
+        assert_eq!(
+            token_rate_limit_key(&a, false),
+            token_rate_limit_key(&b, false)
+        );
+    }
+
+    #[test]
+    fn test_token_key_distinct_peers_distinct_buckets() {
+        let a = req_with_peer(Method::POST, TOKEN_PATH, "203.0.113.7:1111");
+        let b = req_with_peer(Method::POST, TOKEN_PATH, "198.51.100.2:1111");
+        assert_ne!(
+            token_rate_limit_key(&a, false),
+            token_rate_limit_key(&b, false)
+        );
+    }
+
+    #[test]
+    fn test_token_key_honors_proxy_when_trusted() {
+        // With trust_proxy on, the forwarded header is honored.
+        let mut request = req_with_peer(Method::POST, TOKEN_PATH, "203.0.113.7:54321");
+        request
+            .headers_mut()
+            .insert("X-Forwarded-For", "1.2.3.4".parse().expect("header value"));
+        assert_eq!(
+            token_rate_limit_key(&request, true),
+            "token_issue:fwd:1.2.3.4"
+        );
+    }
+
+    #[test]
+    fn test_token_key_trusted_proxy_without_header_falls_back_to_peer() {
+        // trust_proxy on but no forwarding header present: fall back to the peer.
+        let request = req_with_peer(Method::POST, TOKEN_PATH, "203.0.113.7:54321");
+        assert_eq!(
+            token_rate_limit_key(&request, true),
+            "token_issue:peer:203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn test_token_key_without_connect_info_uses_fallback_bucket() {
+        // No ConnectInfo extension (e.g. service built without connect-info): a
+        // single fallback bucket is used rather than a constant "unknown".
+        let request = req(Method::POST, TOKEN_PATH);
+        assert_eq!(
+            token_rate_limit_key(&request, false),
+            "token_issue:peer:unresolved"
+        );
     }
 
     #[test]
