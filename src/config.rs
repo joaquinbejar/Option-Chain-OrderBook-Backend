@@ -41,6 +41,23 @@ pub const ENV_BOOTSTRAP_SECRET: &str = "AUTH_BOOTSTRAP_SECRET";
 /// `X-Real-IP` is honored for the rate-limit identity (issue #48).
 pub const ENV_TRUST_PROXY: &str = "AUTH_TRUST_PROXY";
 
+/// Environment variable holding the comma-separated CORS allowlist of exact
+/// origins (e.g. `http://localhost:5173,https://app.example.com`).
+///
+/// When set, it overrides the `[server] cors_allowed_origins` config field. When
+/// neither is set, the server falls back to built-in local dev defaults
+/// ([`DEFAULT_CORS_ALLOWED_ORIGINS`]) and never to a permissive wildcard.
+pub const ENV_CORS_ALLOWED_ORIGINS: &str = "CORS_ALLOWED_ORIGINS";
+
+/// Built-in, dev-friendly default CORS allowlist used when no origins are
+/// configured via env or the config file. These are the common local frontend
+/// dev origins; production deployments MUST set `CORS_ALLOWED_ORIGINS`.
+pub const DEFAULT_CORS_ALLOWED_ORIGINS: [&str; 3] = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8080",
+];
+
 /// Configuration error types.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -182,6 +199,12 @@ pub struct ServerConfig {
     pub host: String,
     /// Port number to listen on.
     pub port: u16,
+    /// CORS allowlist of exact origins (`scheme://host[:port]`). When empty, the
+    /// server falls back to built-in dev defaults unless `CORS_ALLOWED_ORIGINS`
+    /// is set. The `CORS_ALLOWED_ORIGINS` environment variable (comma-separated)
+    /// overrides this list. A permissive wildcard is never used.
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -189,8 +212,95 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 8080,
+            cors_allowed_origins: Vec::new(),
         }
     }
+}
+
+/// Where the effective CORS allowlist was sourced from (for logging).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorsOriginsSource {
+    /// Resolved from the `CORS_ALLOWED_ORIGINS` environment variable.
+    Env,
+    /// Resolved from the `[server] cors_allowed_origins` config field.
+    Config,
+    /// Built-in local dev defaults (nothing explicitly configured).
+    Default,
+}
+
+/// The resolved CORS allowlist together with where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorsOrigins {
+    /// Effective allowlist of origin strings (trimmed, non-empty).
+    pub origins: Vec<String>,
+    /// Where [`CorsOrigins::origins`] was sourced from.
+    pub source: CorsOriginsSource,
+}
+
+/// Parses a comma-separated list of CORS origins.
+///
+/// Entries are split on `,`, trimmed of surrounding whitespace, and blank
+/// entries are skipped. The returned strings are raw origins; conversion to a
+/// validated HTTP header value (and skipping of invalid entries) happens at the
+/// transport layer.
+#[must_use]
+pub fn parse_cors_origins_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Resolves the effective CORS allowlist from an explicit env value and the
+/// config-file list, applying precedence (env > config > built-in defaults).
+///
+/// Factored out of [`resolved_cors_origins`] so the precedence logic is unit
+/// testable without mutating process-wide environment variables.
+#[must_use]
+fn resolve_cors_origins_from(env: Option<&str>, config_origins: &[String]) -> CorsOrigins {
+    if let Some(raw) = env {
+        let parsed = parse_cors_origins_csv(raw);
+        if !parsed.is_empty() {
+            return CorsOrigins {
+                origins: parsed,
+                source: CorsOriginsSource::Env,
+            };
+        }
+    }
+
+    let from_config: Vec<String> = config_origins
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !from_config.is_empty() {
+        return CorsOrigins {
+            origins: from_config,
+            source: CorsOriginsSource::Config,
+        };
+    }
+
+    CorsOrigins {
+        origins: DEFAULT_CORS_ALLOWED_ORIGINS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        source: CorsOriginsSource::Default,
+    }
+}
+
+/// Resolves the effective CORS allowlist, layering (highest precedence first):
+/// the `CORS_ALLOWED_ORIGINS` environment variable (comma-separated), the
+/// `[server] cors_allowed_origins` config field, then the built-in dev defaults
+/// ([`DEFAULT_CORS_ALLOWED_ORIGINS`]). Never falls back to a permissive wildcard.
+#[must_use]
+pub fn resolved_cors_origins(config: Option<&Config>) -> CorsOrigins {
+    let env = std::env::var(ENV_CORS_ALLOWED_ORIGINS).ok();
+    let config_origins: &[String] = config
+        .map(|c| c.server.cors_allowed_origins.as_slice())
+        .unwrap_or(&[]);
+    resolve_cors_origins_from(env.as_deref(), config_origins)
 }
 
 /// Price simulation configuration.
@@ -522,6 +632,66 @@ strike_spacing = 1000.0
             }],
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_parse_cors_origins_csv_split_and_trim() {
+        let parsed = parse_cors_origins_csv("http://a.com, http://b.com ,http://c.com");
+        assert_eq!(
+            parsed,
+            vec![
+                "http://a.com".to_string(),
+                "http://b.com".to_string(),
+                "http://c.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_cors_origins_csv_skips_blanks() {
+        assert!(parse_cors_origins_csv("").is_empty());
+        assert!(parse_cors_origins_csv("   ").is_empty());
+        assert!(parse_cors_origins_csv(" , ,, ").is_empty());
+        assert_eq!(
+            parse_cors_origins_csv("  http://only.com  ,, "),
+            vec!["http://only.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_cors_origins_env_overrides_config() {
+        let resolved = resolve_cors_origins_from(
+            Some("http://env-a.com, http://env-b.com"),
+            &["http://cfg.com".to_string()],
+        );
+        assert_eq!(resolved.source, CorsOriginsSource::Env);
+        assert_eq!(
+            resolved.origins,
+            vec![
+                "http://env-a.com".to_string(),
+                "http://env-b.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_resolve_cors_origins_blank_env_falls_through_to_config() {
+        let resolved = resolve_cors_origins_from(Some("  , , "), &["http://cfg.com".to_string()]);
+        assert_eq!(resolved.source, CorsOriginsSource::Config);
+        assert_eq!(resolved.origins, vec!["http://cfg.com".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_cors_origins_defaults_when_unset() {
+        let resolved = resolve_cors_origins_from(None, &[]);
+        assert_eq!(resolved.source, CorsOriginsSource::Default);
+        assert_eq!(resolved.origins.len(), DEFAULT_CORS_ALLOWED_ORIGINS.len());
+        assert!(
+            resolved
+                .origins
+                .iter()
+                .any(|o| o == "http://localhost:5173")
+        );
     }
 
     #[test]

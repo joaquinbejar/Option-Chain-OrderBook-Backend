@@ -2,11 +2,11 @@
 //!
 //! REST API server for interacting with the Option Chain OrderBook library.
 
-use axum::http::Method;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use option_chain_orderbook_backend::api::create_router;
+use option_chain_orderbook_backend::api::{build_cors_layer, create_router};
 use option_chain_orderbook_backend::auth::JwtAuth;
-use option_chain_orderbook_backend::config::{AuthConfig, Config};
+use option_chain_orderbook_backend::config::{
+    AuthConfig, Config, CorsOriginsSource, resolved_cors_origins,
+};
 use option_chain_orderbook_backend::db::DatabasePool;
 use option_chain_orderbook_backend::models::Permission;
 use option_chain_orderbook_backend::state::AppState;
@@ -16,7 +16,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -322,20 +321,35 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
-    // Configure CORS deliberately: any origin (no credentials), explicit methods,
-    // and the `Authorization` + `Content-Type` headers required for JWT auth.
-    // Credentials are intentionally NOT enabled, so this is not a permissive
-    // wildcard-with-credentials configuration.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PATCH,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
+    // Resolve the CORS allowlist (env > config > built-in dev defaults) and build
+    // a restrictive CORS layer. Origins are an explicit allowlist, never `Any`;
+    // methods and headers stay explicit and credentials are off (auth is the
+    // bearer header, not cookies).
+    let cors_origins = resolved_cors_origins(state.config.as_ref());
+    match cors_origins.source {
+        CorsOriginsSource::Default => {
+            info!(
+                origins = ?cors_origins.origins,
+                "CORS allowlist using built-in dev defaults"
+            );
+            warn!(
+                "CORS_ALLOWED_ORIGINS not set; using local dev defaults. Set CORS_ALLOWED_ORIGINS (or [server] cors_allowed_origins) explicitly in production."
+            );
+        }
+        CorsOriginsSource::Env => {
+            info!(
+                origins = ?cors_origins.origins,
+                "CORS allowlist loaded from CORS_ALLOWED_ORIGINS"
+            );
+        }
+        CorsOriginsSource::Config => {
+            info!(
+                origins = ?cors_origins.origins,
+                "CORS allowlist loaded from config"
+            );
+        }
+    }
+    let cors = build_cors_layer(&cors_origins.origins);
 
     // Build the router
     let app = create_router(state)
