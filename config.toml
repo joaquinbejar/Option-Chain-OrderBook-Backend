@@ -4,6 +4,15 @@
 [server]
 host = "0.0.0.0"
 port = 8080
+# CORS allowlist of exact origins (scheme://host[:port]). The CORS_ALLOWED_ORIGINS
+# environment variable (comma-separated) overrides this list. When both are unset
+# the server falls back to safe local dev defaults; set this explicitly in
+# production. A permissive wildcard ("*") is never used.
+cors_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8080",
+]
 
 # Authentication (JWT signed with an x509 key pair).
 # The AUTH_* environment variables override these values. For local dev the

@@ -46,7 +46,9 @@ provides OpenAPI/Swagger documentation via [utoipa](https://crates.io/crates/uto
 - **OpenAPI Documentation**: Auto-generated Swagger UI for API exploration
   and testing at `/swagger-ui/`.
 
-- **CORS Support**: Cross-origin resource sharing enabled for frontend integration.
+- **CORS Allowlist**: Cross-origin requests are restricted to a configured
+  origin allowlist (`CORS_ALLOWED_ORIGINS` / `[server] cors_allowed_origins`),
+  never a wildcard.
 
 - **Structured Logging**: Request tracing with `tower-http` for debugging
   and monitoring.
