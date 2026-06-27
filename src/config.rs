@@ -5,6 +5,16 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+/// Maximum accepted asset `initial_price` in dollars.
+///
+/// Bounds the downstream cents conversion (`initial_price * 100.0`) and strike
+/// generation so they cannot overflow `u64`/`u128` or produce absurd books. A
+/// trillion dollars is far beyond any real underlying yet leaves huge headroom.
+pub const MAX_INITIAL_PRICE: f64 = 1e12;
+
+/// Maximum accepted asset `volatility` (annualized, as a fraction).
+pub const MAX_VOLATILITY: f64 = 5.0;
+
 /// Default token issuer (`iss` claim) when none is configured.
 pub const DEFAULT_ISSUER: &str = "option-chain-orderbook-backend";
 
@@ -435,6 +445,14 @@ impl Config {
             ));
         }
 
+        // A zero interval makes `tokio::time::interval` panic in the simulation
+        // ticker ("interval period must be non-zero"); reject it at load.
+        if self.simulation.interval_ms == 0 {
+            return Err(ConfigError::InvalidValue(
+                "simulation interval_ms must be greater than zero".to_string(),
+            ));
+        }
+
         if self.assets.is_empty() {
             return Err(ConfigError::InvalidValue(
                 "at least one asset must be configured".to_string(),
@@ -447,16 +465,44 @@ impl Config {
                     "asset symbol cannot be empty".to_string(),
                 ));
             }
-            if asset.initial_price <= 0.0 {
+            // Reject non-finite (NaN/±Inf) before any range comparison: IEEE-754
+            // comparisons against NaN are always false, so a bare `<= 0.0` lets
+            // NaN/Inf slip through into generate_strikes() and the pricer.
+            if !asset.initial_price.is_finite() {
                 return Err(ConfigError::InvalidValue(format!(
-                    "asset {} initial_price must be positive",
-                    asset.symbol
+                    "asset {} initial_price must be finite, got {}",
+                    asset.symbol, asset.initial_price
                 )));
             }
-            if asset.volatility <= 0.0 || asset.volatility > 5.0 {
+            if asset.initial_price <= 0.0 {
                 return Err(ConfigError::InvalidValue(format!(
-                    "asset {} volatility must be between 0 and 5",
-                    asset.symbol
+                    "asset {} initial_price must be positive, got {}",
+                    asset.symbol, asset.initial_price
+                )));
+            }
+            if asset.initial_price > MAX_INITIAL_PRICE {
+                return Err(ConfigError::InvalidValue(format!(
+                    "asset {} initial_price {} exceeds maximum {}",
+                    asset.symbol, asset.initial_price, MAX_INITIAL_PRICE
+                )));
+            }
+            if !asset.volatility.is_finite() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "asset {} volatility must be finite, got {}",
+                    asset.symbol, asset.volatility
+                )));
+            }
+            if asset.volatility <= 0.0 || asset.volatility > MAX_VOLATILITY {
+                return Err(ConfigError::InvalidValue(format!(
+                    "asset {} volatility must be between 0 and {}, got {}",
+                    asset.symbol, MAX_VOLATILITY, asset.volatility
+                )));
+            }
+            // Drift may be negative (a down-trending underlying) but never NaN/Inf.
+            if !asset.drift.is_finite() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "asset {} drift must be finite, got {}",
+                    asset.symbol, asset.drift
                 )));
             }
             if asset.expirations.is_empty() {
@@ -471,10 +517,16 @@ impl Config {
                     asset.symbol
                 )));
             }
+            if !asset.strike_spacing.is_finite() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "asset {} strike_spacing must be finite, got {}",
+                    asset.symbol, asset.strike_spacing
+                )));
+            }
             if asset.strike_spacing <= 0.0 {
                 return Err(ConfigError::InvalidValue(format!(
-                    "asset {} strike_spacing must be positive",
-                    asset.symbol
+                    "asset {} strike_spacing must be positive, got {}",
+                    asset.symbol, asset.strike_spacing
                 )));
             }
         }
@@ -704,5 +756,182 @@ strike_spacing = 1000.0
             assets: vec![],
         };
         assert!(config.validate().is_err());
+    }
+
+    /// Builds a known-good asset for validation tests; mutate one field per case.
+    fn valid_asset() -> AssetConfig {
+        AssetConfig {
+            symbol: "BTC".to_string(),
+            name: "Bitcoin".to_string(),
+            initial_price: 100.0,
+            volatility: 0.2,
+            drift: 0.0,
+            expirations: vec!["20251231".to_string()],
+            num_strikes: 4,
+            strike_spacing: 10.0,
+        }
+    }
+
+    /// Builds a known-good config wrapping a single asset.
+    fn config_with(asset: AssetConfig) -> Config {
+        Config {
+            server: ServerConfig::default(),
+            simulation: SimulationConfig::default(),
+            cleanup: CleanupConfig::default(),
+            auth: None,
+            assets: vec![asset],
+        }
+    }
+
+    /// Asserts validation fails and the message mentions the offending field.
+    fn assert_invalid(config: &Config, needle: &str) {
+        match config.validate() {
+            Err(ConfigError::InvalidValue(msg)) => {
+                assert!(
+                    msg.contains(needle),
+                    "expected error to mention {needle:?}, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidValue, got {other:?}"),
+            Ok(()) => panic!("expected validation to fail for {needle:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validation_accepts_valid_config() {
+        assert!(config_with(valid_asset()).validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_accepts_negative_drift() {
+        let asset = AssetConfig {
+            drift: -0.25,
+            ..valid_asset()
+        };
+        assert!(config_with(asset).validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_rejects_nan_initial_price() {
+        let asset = AssetConfig {
+            initial_price: f64::NAN,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "initial_price");
+    }
+
+    #[test]
+    fn test_validation_rejects_inf_initial_price() {
+        let asset = AssetConfig {
+            initial_price: f64::INFINITY,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "initial_price");
+    }
+
+    #[test]
+    fn test_validation_rejects_negative_initial_price() {
+        let asset = AssetConfig {
+            initial_price: -1.0,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "initial_price");
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_initial_price() {
+        let asset = AssetConfig {
+            initial_price: 0.0,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "initial_price");
+    }
+
+    #[test]
+    fn test_validation_rejects_over_cap_initial_price() {
+        let asset = AssetConfig {
+            initial_price: MAX_INITIAL_PRICE * 2.0,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "initial_price");
+    }
+
+    #[test]
+    fn test_validation_accepts_at_cap_initial_price() {
+        let asset = AssetConfig {
+            initial_price: MAX_INITIAL_PRICE,
+            ..valid_asset()
+        };
+        assert!(config_with(asset).validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_rejects_nan_volatility() {
+        let asset = AssetConfig {
+            volatility: f64::NAN,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "volatility");
+    }
+
+    #[test]
+    fn test_validation_rejects_inf_volatility() {
+        let asset = AssetConfig {
+            volatility: f64::INFINITY,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "volatility");
+    }
+
+    #[test]
+    fn test_validation_rejects_nan_drift() {
+        let asset = AssetConfig {
+            drift: f64::NAN,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "drift");
+    }
+
+    #[test]
+    fn test_validation_rejects_inf_drift() {
+        let asset = AssetConfig {
+            drift: f64::NEG_INFINITY,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "drift");
+    }
+
+    #[test]
+    fn test_validation_rejects_nan_strike_spacing() {
+        let asset = AssetConfig {
+            strike_spacing: f64::NAN,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "strike_spacing");
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_strike_spacing() {
+        let asset = AssetConfig {
+            strike_spacing: 0.0,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "strike_spacing");
+    }
+
+    #[test]
+    fn test_validation_rejects_negative_strike_spacing() {
+        let asset = AssetConfig {
+            strike_spacing: -5.0,
+            ..valid_asset()
+        };
+        assert_invalid(&config_with(asset), "strike_spacing");
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_interval_ms() {
+        let mut config = config_with(valid_asset());
+        config.simulation.interval_ms = 0;
+        assert_invalid(&config, "interval_ms");
     }
 }
