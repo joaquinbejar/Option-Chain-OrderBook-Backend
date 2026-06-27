@@ -244,3 +244,177 @@ fn test_instruments_list_response_empty() {
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("\"instruments\":[]"));
 }
+
+// ============================================================================
+// dollars_to_cents Helper Tests
+// ============================================================================
+
+#[test]
+fn test_dollars_to_cents_valid_conversion() {
+    // 123.45 dollars -> 12345 cents (issue acceptance criterion).
+    assert_eq!(dollars_to_cents("price", 123.45).unwrap(), 12345);
+    assert_eq!(dollars_to_cents("price", 0.0).unwrap(), 0);
+    assert_eq!(dollars_to_cents("price", 1.0).unwrap(), 100);
+    assert_eq!(dollars_to_cents("price", 150.50).unwrap(), 15050);
+    // Sub-cent rounding to the nearest cent.
+    assert_eq!(dollars_to_cents("price", 0.005).unwrap(), 1);
+    assert_eq!(dollars_to_cents("price", 0.004).unwrap(), 0);
+}
+
+#[test]
+fn test_dollars_to_cents_rejects_negative() {
+    let err = dollars_to_cents("price", -0.01).unwrap_err();
+    assert!(matches!(err, ApiError::InvalidRequest(_)));
+    // Error message carries the offending field name and value, no secrets.
+    let msg = err.to_string();
+    assert!(msg.contains("price"));
+    assert!(msg.contains("-0.01"));
+}
+
+#[test]
+fn test_dollars_to_cents_rejects_nan() {
+    let err = dollars_to_cents("bid", f64::NAN).unwrap_err();
+    assert!(matches!(err, ApiError::InvalidRequest(_)));
+    assert!(err.to_string().contains("bid"));
+}
+
+#[test]
+fn test_dollars_to_cents_rejects_infinite() {
+    assert!(matches!(
+        dollars_to_cents("ask", f64::INFINITY),
+        Err(ApiError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        dollars_to_cents("ask", f64::NEG_INFINITY),
+        Err(ApiError::InvalidRequest(_))
+    ));
+}
+
+#[test]
+fn test_dollars_to_cents_rejects_too_large() {
+    let err = dollars_to_cents("price", MAX_PRICE_DOLLARS * 10.0).unwrap_err();
+    assert!(matches!(err, ApiError::InvalidRequest(_)));
+    assert!(err.to_string().contains("price"));
+    // The cap itself is still accepted (and never overflows u64/i64).
+    let cents = dollars_to_cents("price", MAX_PRICE_DOLLARS).unwrap();
+    assert!(cents_to_i64("price", cents).is_ok());
+}
+
+// ============================================================================
+// insert_price Handler Validation Tests
+// ============================================================================
+
+fn insert_price_request(price: f64, bid: Option<f64>, ask: Option<f64>) -> InsertPriceRequest {
+    InsertPriceRequest {
+        symbol: "TEST".to_string(),
+        price,
+        bid,
+        ask,
+        volume: None,
+        source: Some("unit-test".to_string()),
+    }
+}
+
+#[tokio::test]
+async fn test_insert_price_valid_succeeds() {
+    let state = Arc::new(AppState::new());
+    let req = insert_price_request(123.45, Some(123.40), Some(123.50));
+
+    let resp = insert_price(State(Arc::clone(&state)), Json(req))
+        .await
+        .expect("valid positive price should succeed");
+
+    // 123.45 dollars -> 12345 cents, reflected in the response and the
+    // in-memory market maker.
+    assert!(resp.0.success);
+    assert_eq!(resp.0.symbol, "TEST");
+    assert_eq!(resp.0.price_cents, 12345);
+    assert_eq!(state.market_maker.get_price("TEST"), Some(12345));
+}
+
+#[tokio::test]
+async fn test_insert_price_negative_rejected_no_update() {
+    let state = Arc::new(AppState::new());
+    let req = insert_price_request(-1.0, None, None);
+
+    let result = insert_price(State(Arc::clone(&state)), Json(req)).await;
+
+    assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
+    // Market maker (and, by ordering, the DB) is never touched.
+    assert_eq!(state.market_maker.get_price("TEST"), None);
+}
+
+#[tokio::test]
+async fn test_insert_price_nan_rejected_no_update() {
+    let state = Arc::new(AppState::new());
+    let req = insert_price_request(f64::NAN, None, None);
+
+    let result = insert_price(State(Arc::clone(&state)), Json(req)).await;
+
+    assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
+    assert_eq!(state.market_maker.get_price("TEST"), None);
+}
+
+#[tokio::test]
+async fn test_insert_price_infinite_rejected_no_update() {
+    let state = Arc::new(AppState::new());
+    let req = insert_price_request(f64::INFINITY, None, None);
+
+    let result = insert_price(State(Arc::clone(&state)), Json(req)).await;
+
+    assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
+    assert_eq!(state.market_maker.get_price("TEST"), None);
+}
+
+#[tokio::test]
+async fn test_insert_price_absurdly_large_rejected_no_update() {
+    let state = Arc::new(AppState::new());
+    let req = insert_price_request(MAX_PRICE_DOLLARS * 100.0, None, None);
+
+    let result = insert_price(State(Arc::clone(&state)), Json(req)).await;
+
+    assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
+    assert_eq!(state.market_maker.get_price("TEST"), None);
+}
+
+#[tokio::test]
+async fn test_insert_price_bad_bid_rejected_all_or_nothing() {
+    // The price is valid but the bid is invalid: the whole request is rejected
+    // and the (valid) price is NOT applied to the market maker.
+    for bad_bid in [-5.0, f64::NAN, f64::INFINITY, MAX_PRICE_DOLLARS * 2.0] {
+        let state = Arc::new(AppState::new());
+        let req = insert_price_request(100.0, Some(bad_bid), None);
+
+        let result = insert_price(State(Arc::clone(&state)), Json(req)).await;
+
+        assert!(
+            matches!(result, Err(ApiError::InvalidRequest(_))),
+            "bid {bad_bid} should be rejected"
+        );
+        assert_eq!(
+            state.market_maker.get_price("TEST"),
+            None,
+            "market maker must not be updated when bid {bad_bid} is invalid"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_insert_price_bad_ask_rejected_all_or_nothing() {
+    for bad_ask in [-5.0, f64::NAN, f64::NEG_INFINITY, MAX_PRICE_DOLLARS * 2.0] {
+        let state = Arc::new(AppState::new());
+        let req = insert_price_request(100.0, None, Some(bad_ask));
+
+        let result = insert_price(State(Arc::clone(&state)), Json(req)).await;
+
+        assert!(
+            matches!(result, Err(ApiError::InvalidRequest(_))),
+            "ask {bad_ask} should be rejected"
+        );
+        assert_eq!(
+            state.market_maker.get_price("TEST"),
+            None,
+            "market maker must not be updated when ask {bad_ask} is invalid"
+        );
+    }
+}

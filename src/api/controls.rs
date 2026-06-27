@@ -281,6 +281,62 @@ pub async fn list_instruments(State(state): State<Arc<AppState>>) -> Json<Instru
 // Price Handlers
 // ============================================================================
 
+/// Maximum accepted monetary value, in dollars, for any inbound price field.
+///
+/// Inbound dollar amounts are multiplied by 100 to obtain integer cents. Capping
+/// the input at one quadrillion dollars guarantees the resulting cents value
+/// (`<= 1e17`) stays well within both `u64` and `i64` range, so the conversion
+/// can never overflow or wrap. No real instrument price approaches this bound.
+const MAX_PRICE_DOLLARS: f64 = 1e15;
+
+/// Converts a dollar amount to integer cents with full validation.
+///
+/// Rejects non-finite (`NaN` / infinite), negative, and out-of-range values
+/// (above [`MAX_PRICE_DOLLARS`]) so a bad `f64` can never wrap or saturate into a
+/// corrupt cents value. The rounded result is only produced from a verified,
+/// in-range value. The `field` name and the offending `value` are included in the
+/// error message (no secrets).
+///
+/// # Errors
+/// Returns [`ApiError::InvalidRequest`] when `value` is `NaN`, infinite,
+/// negative, or greater than [`MAX_PRICE_DOLLARS`].
+#[inline]
+#[must_use = "the validated cents value (or rejection) must be handled"]
+fn dollars_to_cents(field: &str, value: f64) -> Result<u64, ApiError> {
+    if !value.is_finite() {
+        return Err(ApiError::InvalidRequest(format!(
+            "{field} must be a finite number, got {value}"
+        )));
+    }
+    if value < 0.0 {
+        return Err(ApiError::InvalidRequest(format!(
+            "{field} must be non-negative, got {value}"
+        )));
+    }
+    if value > MAX_PRICE_DOLLARS {
+        return Err(ApiError::InvalidRequest(format!(
+            "{field} exceeds maximum allowed value of {MAX_PRICE_DOLLARS}, got {value}"
+        )));
+    }
+    // Safe: `value` is finite and in `[0, MAX_PRICE_DOLLARS]`, so the rounded
+    // cents value lies in `[0, 1e17]`, well below `u64::MAX`. The cast cannot
+    // overflow or wrap.
+    Ok((value * 100.0).round() as u64)
+}
+
+/// Converts a validated cents value to the signed representation used by the
+/// response DTO and the `price_cents` / `bid_cents` / `ask_cents` DB columns.
+///
+/// # Errors
+/// Returns [`ApiError::InvalidRequest`] if the value does not fit in `i64`. With
+/// inputs bounded by [`MAX_PRICE_DOLLARS`] this branch is unreachable in
+/// practice, but the conversion stays checked rather than a silent `as` cast.
+#[inline]
+fn cents_to_i64(field: &str, cents: u64) -> Result<i64, ApiError> {
+    i64::try_from(cents)
+        .map_err(|_| ApiError::InvalidRequest(format!("{field} is too large to store: {cents}")))
+}
+
 /// Insert a new underlying price.
 #[utoipa::path(
     post,
@@ -296,19 +352,33 @@ pub async fn insert_price(
     State(state): State<Arc<AppState>>,
     Json(body): Json<InsertPriceRequest>,
 ) -> Result<Json<InsertPriceResponse>, ApiError> {
-    let price_cents = (body.price * 100.0).round() as i64;
+    // Validate and convert EVERY monetary input up front, before mutating any
+    // state. If any field is invalid we return 400 and touch neither the
+    // in-memory market maker nor the database, so the two never diverge.
+    let price_cents_u64 = dollars_to_cents("price", body.price)?;
+    let bid_cents_u64 = body.bid.map(|b| dollars_to_cents("bid", b)).transpose()?;
+    let ask_cents_u64 = body.ask.map(|a| dollars_to_cents("ask", a)).transpose()?;
+
+    // Signed representations for the response DTO and the i64 DB columns.
+    let price_cents = cents_to_i64("price", price_cents_u64)?;
+    let bid_cents = bid_cents_u64.map(|c| cents_to_i64("bid", c)).transpose()?;
+    let ask_cents = ask_cents_u64.map(|c| cents_to_i64("ask", c)).transpose()?;
+
     let timestamp = Utc::now();
 
-    // Update the market maker with the new price
+    // All inputs are valid: update the in-memory market maker first...
     state
         .market_maker
-        .update_price(&body.symbol, price_cents as u64);
+        .update_price(&body.symbol, price_cents_u64);
 
-    // If we have a database, persist the price
+    tracing::debug!(
+        symbol = %body.symbol,
+        price_cents = price_cents,
+        "price inserted"
+    );
+
+    // ...then persist the same validated values so memory and DB agree.
     if let Some(ref db) = state.db {
-        let bid_cents = body.bid.map(|b| (b * 100.0).round() as i64);
-        let ask_cents = body.ask.map(|a| (a * 100.0).round() as i64);
-
         sqlx::query(
             r#"
             INSERT INTO underlying_prices (symbol, price_cents, bid_cents, ask_cents, volume, timestamp, source)
