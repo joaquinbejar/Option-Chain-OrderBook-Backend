@@ -29,7 +29,8 @@ use option_chain_orderbook_backend::api::controls::{
 };
 use option_chain_orderbook_backend::db::{InsertPriceRequest, UpdateParametersRequest};
 use option_chain_orderbook_backend::models::{
-    AddOrderRequest, AddOrderResponse, CancelOrderResponse, ExpirationSummary,
+    AddOrderRequest, AddOrderResponse, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
+    BulkOrderResultItem, BulkOrderStatus, CancelOrderResponse, ExpirationSummary,
     ExpirationsListResponse, GlobalStatsResponse, HealthResponse, OrderBookSnapshotResponse,
     QuoteResponse, StrikeSummary, StrikesListResponse, TokenRequest, TokenResponse,
     UnderlyingSummary, UnderlyingsListResponse,
@@ -99,6 +100,7 @@ impl utoipa::Modify for SecurityAddon {
         option_chain_orderbook_backend::api::handlers::add_order,
         option_chain_orderbook_backend::api::handlers::cancel_order,
         option_chain_orderbook_backend::api::handlers::get_option_quote,
+        option_chain_orderbook_backend::api::handlers::bulk_submit_orders,
         option_chain_orderbook_backend::api::controls::get_controls,
         option_chain_orderbook_backend::api::controls::kill_switch,
         option_chain_orderbook_backend::api::controls::enable_quoting,
@@ -126,6 +128,11 @@ impl utoipa::Modify for SecurityAddon {
             QuoteResponse,
             AddOrderRequest,
             AddOrderResponse,
+            BulkOrderRequest,
+            BulkOrderItem,
+            BulkOrderResponse,
+            BulkOrderResultItem,
+            BulkOrderStatus,
             CancelOrderResponse,
             SystemControlResponse,
             KillSwitchResponse,

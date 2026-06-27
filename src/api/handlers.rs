@@ -11,13 +11,13 @@ use crate::models::{
     HealthResponse, ImpactMetrics, LastTradeResponse, LimitOrderStatus, MarketImpactMetrics,
     MarketOrderRequest, MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest,
     ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse,
-    OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderInfo, OrderListQuery,
-    OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse, OrderTimeInForce,
-    OrderbookMetricsResponse, OrderbookSnapshotInfo, PositionInfo, PositionQuery, PositionResponse,
-    PositionSummary, PositionsListResponse, PriceLevelInfo, PriceMetrics, QuoteResponse,
-    RestoreSnapshotResponse, SnapshotDepth, SnapshotQuery, SnapshotStats, SnapshotSummary,
-    SnapshotsListResponse, SpreadMetrics, StrikeIV, StrikeSummary, StrikesListResponse,
-    TokenRequest, TokenResponse, UnderlyingSummary, UnderlyingsListResponse,
+    OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderFillInfo, OrderInfo,
+    OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
+    OrderTimeInForce, OrderbookMetricsResponse, OrderbookSnapshotInfo, PositionInfo, PositionQuery,
+    PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo, PriceMetrics,
+    QuoteResponse, RestoreSnapshotResponse, SnapshotDepth, SnapshotQuery, SnapshotStats,
+    SnapshotSummary, SnapshotsListResponse, SpreadMetrics, StrikeIV, StrikeSummary,
+    StrikesListResponse, TokenRequest, TokenResponse, UnderlyingSummary, UnderlyingsListResponse,
     VolatilitySurfaceResponse,
 };
 use crate::state::AppState;
@@ -2379,11 +2379,29 @@ pub async fn list_orders(
 // Bulk Order Operations
 // ============================================================================
 
+/// An order accepted by the book during a bulk submission, with the fill that
+/// executed immediately on submit captured from the `TradeResult`.
+///
+/// A GTC limit order can (partially) fill on submit and rest only its
+/// remainder. `filled_quantity` records the executed amount so an atomic
+/// rollback can classify the order honestly: a fill cannot be un-filled, no
+/// matter what `cancel_order` later reports about the resting remainder.
+struct AcceptedBulkOrder {
+    /// The accepted order's id.
+    order_id: OrderId,
+    /// Quantity that executed immediately on submit (cents-agnostic count).
+    filled_quantity: u64,
+}
+
 /// Helper function to submit a single order from a bulk request.
+///
+/// Uses the fill-capturing [`add_limit_order_full`] variant so the executed
+/// quantity is known at accept time and the tracked [`OrderInfo`] reflects the
+/// real fill/remaining state rather than assuming the order rested untouched.
 fn submit_single_order(
     state: &Arc<AppState>,
     item: &BulkOrderItem,
-) -> Result<(OrderId, String), String> {
+) -> Result<AcceptedBulkOrder, String> {
     // Parse option style
     let option_style = match item.style.to_lowercase().as_str() {
         "call" => OptionStyle::Call,
@@ -2418,11 +2436,37 @@ fn submit_single_order(
     // Get option book
     let option_book = strike_book.get(option_style);
 
-    // Generate order ID and submit
+    // Generate order ID and submit, capturing the trade result so we know what
+    // (if anything) filled immediately. The fill is the source of truth for an
+    // atomic rollback — a marketable limit order can fill on submit.
     let order_id = OrderId::new();
-    option_book
-        .add_limit_order(order_id, side, item.price, item.quantity)
+    let trade_result = option_book
+        .add_limit_order_full(order_id, side, item.price, item.quantity)
         .map_err(|e| format!("Failed to add order: {}", e))?;
+
+    let match_result = &trade_result.match_result;
+    let filled_quantity = match_result
+        .executed_quantity()
+        .map(|q| q.as_u64())
+        .unwrap_or(0);
+    let remaining_quantity = match_result.remaining_quantity().as_u64();
+    let status = if match_result.is_complete() {
+        OrderStatus::Filled
+    } else if filled_quantity > 0 {
+        OrderStatus::Partial
+    } else {
+        OrderStatus::Active
+    };
+    let fills: Vec<OrderFillInfo> = match_result
+        .trades()
+        .as_vec()
+        .iter()
+        .map(|t| OrderFillInfo {
+            price: t.price().as_u128(),
+            quantity: t.quantity().as_u64(),
+            timestamp_ms: t.timestamp().as_u64(),
+        })
+        .collect();
 
     // Build symbol for tracking
     let style_char = match option_style {
@@ -2434,7 +2478,7 @@ fn submit_single_order(
         item.underlying, item.expiration, item.strike, style_char
     );
 
-    // Track order in AppState
+    // Track order in AppState with the REAL fill/remaining state.
     let order_side = match side {
         Side::Buy => OrderSide::Buy,
         Side::Sell => OrderSide::Sell,
@@ -2442,7 +2486,7 @@ fn submit_single_order(
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let order_info = OrderInfo {
         order_id: order_id.to_string(),
-        symbol: symbol.clone(),
+        symbol,
         underlying: item.underlying.clone(),
         expiration: item.expiration.clone(),
         strike: item.strike,
@@ -2450,22 +2494,322 @@ fn submit_single_order(
         side: order_side,
         price: item.price,
         original_quantity: item.quantity,
-        remaining_quantity: item.quantity,
-        filled_quantity: 0,
-        status: OrderStatus::Active,
+        remaining_quantity,
+        filled_quantity,
+        status,
         time_in_force: OrderTimeInForce::Gtc,
         created_at_ms: now,
         updated_at_ms: now,
-        fills: Vec::new(),
+        fills,
     };
     state.orders.insert(order_id.to_string(), order_info);
 
-    Ok((order_id, symbol))
+    Ok(AcceptedBulkOrder {
+        order_id,
+        filled_quantity,
+    })
+}
+
+/// Cancels a previously-accepted bulk order in the real order book.
+///
+/// Resolves the order's option book via the originating [`BulkOrderItem`] path —
+/// the same lookup [`bulk_cancel_orders`] uses — and delegates the cancel to the
+/// upstream order book.
+///
+/// # Returns
+/// - `Ok(true)` — the order was resting and is now cancelled.
+/// - `Ok(false)` — the order is no longer resting because it already
+///   (partially) filled. A fill cannot be un-filled, so the order (and any
+///   resulting position) remains.
+/// - `Err(msg)` — the book path could not be resolved or the cancel failed.
+fn cancel_bulk_item_order(
+    state: &Arc<AppState>,
+    item: &BulkOrderItem,
+    order_id: OrderId,
+) -> Result<bool, String> {
+    let option_style = match item.style.to_lowercase().as_str() {
+        "call" => OptionStyle::Call,
+        "put" => OptionStyle::Put,
+        _ => return Err(format!("invalid option style: {}", item.style)),
+    };
+
+    let underlying_book = state
+        .manager
+        .get(&item.underlying)
+        .map_err(|e| format!("underlying not found: {}", e))?;
+
+    let expiration = find_expiration_by_str(&underlying_book, &item.expiration)
+        .ok_or_else(|| format!("expiration not found: {}", item.expiration))?;
+
+    let exp_book = underlying_book
+        .get_expiration(&expiration)
+        .map_err(|e| format!("failed to get expiration: {}", e))?;
+
+    let strike_book = exp_book
+        .get_strike(item.strike)
+        .map_err(|e| format!("strike not found: {}", e))?;
+
+    let option_book = strike_book.get(option_style);
+
+    option_book
+        .cancel_order(order_id)
+        .map_err(|e| format!("cancel failed: {}", e))
+}
+
+/// The fate of one previously-accepted order during an atomic rollback.
+enum RollbackOutcome {
+    /// No fill executed and the resting order was cancelled — fully undone and
+    /// removed from tracking.
+    CleanlyRolledBack,
+    /// Could NOT be undone: a fill executed on submit (a fill cannot be
+    /// un-filled), or the cancel of the resting order failed. The order remains
+    /// live; it is kept in tracking, reported `accepted`, and counted as
+    /// un-rollbackable.
+    Unrollbackable {
+        /// The live order's id.
+        order_id: String,
+        /// Human-readable explanation surfaced to the caller.
+        warning: String,
+    },
+    /// Unexpected: the order was accepted, never filled, yet is no longer
+    /// resting. Nothing is live, so it is removed from tracking and reported
+    /// `rejected`, but the anomaly is surfaced as a warning.
+    Phantom {
+        /// Human-readable explanation surfaced to the caller.
+        warning: String,
+    },
+}
+
+/// Rolls back an atomic bulk submission after the order at `failed_index` failed.
+///
+/// For every previously-accepted order this ALWAYS attempts to cancel the
+/// resting order/remainder in the *real* order book (via the originating
+/// [`BulkOrderItem`] path), then classifies the order by the fill captured at
+/// submit time — NOT by the cancel boolean. `cancel_order` returns `Ok(true)`
+/// whenever the order was still resting, which includes the rested remainder of
+/// a partial fill; the boolean therefore cannot tell a clean cancel from a
+/// partially-filled-then-rested order.
+///
+/// Classification:
+/// - any prior fill (`filled_quantity > 0`) → un-rollbackable: the executed
+///   trade cannot be undone. The resting remainder (if any) is cancelled, the
+///   tracked [`OrderInfo`] is updated to the real filled/remaining quantities,
+///   the order is kept, counted in `success_count`, reported `accepted`, listed
+///   in [`BulkOrderResponse::rollback_warnings`], and logged at WARN.
+/// - no fill + cancel `Ok(true)` → clean rollback: removed from tracking and
+///   reported `rejected`.
+/// - no fill + cancel `Ok(false)` / `Err` → unexpected: logged at WARN and
+///   surfaced. `Ok(false)` (not resting, never filled) is removed; `Err` (the
+///   order may still rest) is kept and counted as un-rollbackable.
+///
+/// The response therefore reflects the true book state rather than claiming a
+/// clean rollback.
+fn rollback_atomic_bulk(
+    state: &Arc<AppState>,
+    items: &[BulkOrderItem],
+    accepted: &[(usize, OrderId, u64)],
+    failed_index: usize,
+    failed_error: &str,
+) -> BulkOrderResponse {
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let mut outcomes: std::collections::HashMap<usize, RollbackOutcome> =
+        std::collections::HashMap::new();
+
+    for &(index, order_id, filled_quantity) in accepted {
+        let order_id_str = order_id.to_string();
+        let Some(item) = items.get(index) else {
+            // Defensive: index always points into `items`, but never panic.
+            continue;
+        };
+
+        // Always attempt to cancel the resting order/remainder.
+        let cancel = cancel_bulk_item_order(state, item, order_id);
+
+        if filled_quantity > 0 {
+            // A trade executed on submit; it cannot be un-filled regardless of
+            // what the cancel reports about the resting remainder.
+            let remainder_note = match &cancel {
+                Ok(true) => "resting remainder cancelled".to_string(),
+                Ok(false) => "no remainder was resting (order fully filled)".to_string(),
+                Err(e) => format!("resting remainder could NOT be cancelled: {e}"),
+            };
+            // C2: reconcile tracked state with reality. After the remainder is
+            // cancelled there is nothing left working; only the executed fill
+            // remains.
+            let remainder_cleared = cancel.is_ok();
+            if let Some(mut entry) = state.orders.get_mut(&order_id_str) {
+                entry.filled_quantity = filled_quantity;
+                if remainder_cleared {
+                    entry.remaining_quantity = 0;
+                    entry.status = if filled_quantity >= entry.original_quantity {
+                        OrderStatus::Filled
+                    } else {
+                        // Partially filled, remainder cancelled by the rollback.
+                        OrderStatus::Canceled
+                    };
+                } else {
+                    // Cancel failed — the remainder may still be resting. The
+                    // engine never fills more than was submitted; clamp first so
+                    // the subtraction can never underflow.
+                    let filled = filled_quantity.min(entry.original_quantity);
+                    entry.remaining_quantity = entry.original_quantity - filled;
+                    entry.status = OrderStatus::Partial;
+                }
+                entry.updated_at_ms = now;
+            }
+            let warning = format!(
+                "order {order_id_str} (index {index}) could not be fully rolled back: \
+                 {filled_quantity} unit(s) already filled; a fill cannot be un-filled \
+                 ({remainder_note})"
+            );
+            tracing::warn!(
+                order_id = %order_id_str,
+                index,
+                filled_quantity,
+                "atomic bulk rollback: order already (partially) filled, cannot be un-filled"
+            );
+            outcomes.insert(
+                index,
+                RollbackOutcome::Unrollbackable {
+                    order_id: order_id_str,
+                    warning,
+                },
+            );
+            continue;
+        }
+
+        // No fill captured at submit.
+        match cancel {
+            Ok(true) => {
+                // Cleanly cancelled in the book — drop from tracking.
+                state.orders.remove(&order_id_str);
+                outcomes.insert(index, RollbackOutcome::CleanlyRolledBack);
+            }
+            Ok(false) => {
+                // Unexpected: accepted, never filled, yet no longer resting.
+                let warning = format!(
+                    "order {order_id_str} (index {index}) could not be rolled back: \
+                     no fill recorded yet it is no longer resting in the book"
+                );
+                tracing::warn!(
+                    order_id = %order_id_str,
+                    index,
+                    "atomic bulk rollback: order not resting despite no recorded fill"
+                );
+                state.orders.remove(&order_id_str);
+                outcomes.insert(index, RollbackOutcome::Phantom { warning });
+            }
+            Err(e) => {
+                // Cancel failed; the order may still be resting. Keep it and flag
+                // it as un-rollbackable.
+                let warning = format!(
+                    "order {order_id_str} (index {index}) could not be rolled back: \
+                     cancel failed: {e}"
+                );
+                tracing::warn!(
+                    order_id = %order_id_str,
+                    index,
+                    error = %e,
+                    "atomic bulk rollback: cancel failed"
+                );
+                outcomes.insert(
+                    index,
+                    RollbackOutcome::Unrollbackable {
+                        order_id: order_id_str,
+                        warning,
+                    },
+                );
+            }
+        }
+    }
+
+    // Orders left live (un-rollbackable) are the real outcome of an
+    // otherwise-rolled-back batch.
+    let success_count = outcomes
+        .values()
+        .filter(|o| matches!(o, RollbackOutcome::Unrollbackable { .. }))
+        .count();
+    // `success_count` counts a subset of the accepted orders, which are a subset
+    // of `items`, so this subtraction can never underflow.
+    let failure_count = items.len() - success_count.min(items.len());
+
+    let mut rollback_warnings: Vec<String> = outcomes
+        .values()
+        .filter_map(|o| match o {
+            RollbackOutcome::Unrollbackable { warning, .. }
+            | RollbackOutcome::Phantom { warning } => Some(warning.clone()),
+            RollbackOutcome::CleanlyRolledBack => None,
+        })
+        .collect();
+    rollback_warnings.sort();
+
+    let results = items
+        .iter()
+        .enumerate()
+        .map(|(i, _)| match outcomes.get(&i) {
+            Some(RollbackOutcome::Unrollbackable { order_id, warning }) => BulkOrderResultItem {
+                index: i,
+                order_id: Some(order_id.clone()),
+                status: BulkOrderStatus::Accepted,
+                error: Some(warning.clone()),
+            },
+            Some(RollbackOutcome::Phantom { warning }) => BulkOrderResultItem {
+                index: i,
+                order_id: None,
+                status: BulkOrderStatus::Rejected,
+                error: Some(warning.clone()),
+            },
+            Some(RollbackOutcome::CleanlyRolledBack) => BulkOrderResultItem {
+                index: i,
+                order_id: None,
+                status: BulkOrderStatus::Rejected,
+                error: Some("Rolled back due to atomic failure".to_string()),
+            },
+            None => {
+                if i == failed_index {
+                    BulkOrderResultItem {
+                        index: i,
+                        order_id: None,
+                        status: BulkOrderStatus::Rejected,
+                        error: Some(failed_error.to_string()),
+                    }
+                } else {
+                    // i > failed_index: never attempted. (Every i < failed_index
+                    // was accepted and therefore has an outcome above.)
+                    BulkOrderResultItem {
+                        index: i,
+                        order_id: None,
+                        status: BulkOrderStatus::Rejected,
+                        error: Some("Not attempted due to atomic failure".to_string()),
+                    }
+                }
+            }
+        })
+        .collect();
+
+    BulkOrderResponse {
+        success_count,
+        failure_count,
+        results,
+        rolled_back: true,
+        rollback_warnings,
+    }
 }
 
 /// Submit multiple orders in a single request.
 ///
 /// Supports atomic mode where all orders must succeed or none are submitted.
+///
+/// # Atomic rollback caveat
+/// In atomic mode (`atomic = true`), if any order fails, every order already
+/// accepted in this batch is cancelled in the real order book before responding,
+/// so no order from the batch is left resting. The rollback is best-effort: an
+/// accepted order that had already (partially) filled on submit cannot be
+/// un-filled — a marketable limit order can execute immediately and rest only
+/// its remainder. The executed quantity is captured at submit time (not inferred
+/// from the cancel result), so such orders are reported honestly: status
+/// `accepted`, counted in `success_count`, listed in `rollback_warnings`, with
+/// `rolled_back` set to `true`.
 #[utoipa::path(
     post,
     path = "/api/v1/orders/bulk",
@@ -2489,78 +2833,45 @@ pub async fn bulk_submit_orders(
     let mut results: Vec<BulkOrderResultItem> = Vec::with_capacity(body.orders.len());
     let mut success_count = 0;
     let mut failure_count = 0;
-    let mut submitted_order_ids: Vec<String> = Vec::new();
+    // Track each accepted order as (request index, OrderId, filled quantity) so
+    // an atomic rollback can resolve the order's option book (via the request
+    // item's path), cancel the resting remainder in the real order book, and
+    // classify the order by the fill captured at submit time — a fill cannot be
+    // un-filled.
+    let mut accepted: Vec<(usize, OrderId, u64)> = Vec::with_capacity(body.orders.len());
 
     for (index, item) in body.orders.iter().enumerate() {
         match submit_single_order(&state, item) {
-            Ok((order_id, _symbol)) => {
-                let order_id_str = order_id.to_string();
-                submitted_order_ids.push(order_id_str.clone());
+            Ok(order) => {
+                accepted.push((index, order.order_id, order.filled_quantity));
                 results.push(BulkOrderResultItem {
                     index,
-                    order_id: Some(order_id_str),
+                    order_id: Some(order.order_id.to_string()),
                     status: BulkOrderStatus::Accepted,
                     error: None,
                 });
                 success_count += 1;
             }
             Err(error) => {
+                // In atomic mode the first failure aborts the batch and rolls
+                // back every order already placed in the real order book.
+                if body.atomic {
+                    return Ok(Json(rollback_atomic_bulk(
+                        &state,
+                        &body.orders,
+                        &accepted,
+                        index,
+                        &error,
+                    )));
+                }
+
                 results.push(BulkOrderResultItem {
                     index,
                     order_id: None,
                     status: BulkOrderStatus::Rejected,
-                    error: Some(error.clone()),
+                    error: Some(error),
                 });
                 failure_count += 1;
-
-                // If atomic mode and we have a failure, rollback all submitted orders
-                if body.atomic {
-                    // Cancel all previously submitted orders
-                    for order_id_str in &submitted_order_ids {
-                        // Remove from tracking
-                        state.orders.remove(order_id_str);
-                        // Note: We can't easily cancel from the order book without
-                        // knowing the full path, so we just remove from tracking
-                    }
-
-                    return Ok(Json(BulkOrderResponse {
-                        success_count: 0,
-                        failure_count: body.orders.len(),
-                        results: body
-                            .orders
-                            .iter()
-                            .enumerate()
-                            .map(|(i, _)| {
-                                if i == index {
-                                    BulkOrderResultItem {
-                                        index: i,
-                                        order_id: None,
-                                        status: BulkOrderStatus::Rejected,
-                                        error: Some(error.clone()),
-                                    }
-                                } else if i < index {
-                                    BulkOrderResultItem {
-                                        index: i,
-                                        order_id: None,
-                                        status: BulkOrderStatus::Rejected,
-                                        error: Some(
-                                            "Rolled back due to atomic failure".to_string(),
-                                        ),
-                                    }
-                                } else {
-                                    BulkOrderResultItem {
-                                        index: i,
-                                        order_id: None,
-                                        status: BulkOrderStatus::Rejected,
-                                        error: Some(
-                                            "Not attempted due to atomic failure".to_string(),
-                                        ),
-                                    }
-                                }
-                            })
-                            .collect(),
-                    }));
-                }
             }
         }
     }
@@ -2569,6 +2880,8 @@ pub async fn bulk_submit_orders(
         success_count,
         failure_count,
         results,
+        rolled_back: false,
+        rollback_warnings: Vec::new(),
     }))
 }
 
@@ -4898,6 +5211,8 @@ mod tests {
                     error: Some("Invalid style".to_string()),
                 },
             ],
+            rolled_back: false,
+            rollback_warnings: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -4905,6 +5220,9 @@ mod tests {
         assert!(json.contains("\"failure_count\":1"));
         assert!(json.contains("\"status\":\"accepted\""));
         assert!(json.contains("\"status\":\"rejected\""));
+        assert!(json.contains("\"rolled_back\":false"));
+        // Empty rollback warnings must be omitted from the wire.
+        assert!(!json.contains("rollback_warnings"));
     }
 
     #[test]
@@ -5007,6 +5325,302 @@ mod tests {
             }
             _ => panic!("Expected InvalidRequest error"),
         }
+    }
+
+    /// Builds an underlying with a single expiration and the given strikes so
+    /// bulk orders that target those strikes can be accepted in tests.
+    ///
+    /// Returns the canonical expiration string as `find_expiration_by_str`
+    /// resolves it — i.e. `format_expiration` of the stored `ExpirationDate`.
+    /// Bulk items must carry this exact string so the handler's lookup matches
+    /// (an 8-digit `YYYYMMDD` input is otherwise consumed by the numeric "days"
+    /// branch and would not round-trip).
+    fn seed_book_with_strikes(state: &Arc<AppState>, underlying: &str, strikes: &[u64]) -> String {
+        let expiration = parse_expiration("30").expect("fixture expiration is valid");
+        let underlying_book = state.manager.get_or_create(underlying);
+        let exp_book = underlying_book.get_or_create_expiration(expiration);
+        for &strike in strikes {
+            exp_book.get_or_create_strike(strike);
+        }
+        underlying_book
+            .expirations()
+            .iter()
+            .map(|(exp, _)| format_expiration(&exp))
+            .next()
+            .expect("seeded underlying has an expiration")
+    }
+
+    /// Returns the number of resting orders in the call book at `strike`.
+    fn call_order_count(state: &Arc<AppState>, underlying: &str, exp: &str, strike: u64) -> usize {
+        let underlying_book = state
+            .manager
+            .get(underlying)
+            .expect("underlying exists in fixture");
+        let expiration =
+            find_expiration_by_str(&underlying_book, exp).expect("expiration exists in fixture");
+        let exp_book = underlying_book
+            .get_expiration(&expiration)
+            .expect("expiration book exists");
+        let strike_book = exp_book
+            .get_strike(strike)
+            .expect("strike exists in fixture");
+        strike_book.get(OptionStyle::Call).order_count()
+    }
+
+    fn bulk_item(underlying: &str, exp: &str, strike: u64) -> BulkOrderItem {
+        BulkOrderItem {
+            underlying: underlying.to_string(),
+            expiration: exp.to_string(),
+            strike,
+            style: "call".to_string(),
+            side: "buy".to_string(),
+            price: 100,
+            quantity: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bulk_submit_atomic_rollback_cancels_accepted_orders() {
+        // Issue #46: in atomic mode, when a later order fails, every earlier
+        // order that was already placed must be cancelled in the REAL order
+        // book — not merely dropped from tracking. Strike 99999 is never seeded,
+        // so the third order fails and triggers the rollback.
+        let state = create_test_state();
+        let underlying = "TEST";
+        let exp = seed_book_with_strikes(&state, underlying, &[10000, 11000]);
+
+        let request = BulkOrderRequest {
+            orders: vec![
+                bulk_item(underlying, &exp, 10000),
+                bulk_item(underlying, &exp, 11000),
+                bulk_item(underlying, &exp, 99999), // not seeded -> fails
+            ],
+            atomic: true,
+        };
+
+        let Json(response) = bulk_submit_orders(State(state.clone()), Json(request))
+            .await
+            .expect("atomic bulk submit returns a response");
+
+        // The rollback was performed and no order had filled, so nothing is live.
+        assert!(response.rolled_back);
+        assert_eq!(response.success_count, 0);
+        assert_eq!(response.failure_count, 3);
+        assert!(
+            response.rollback_warnings.is_empty(),
+            "no order filled, so there are no rollback warnings"
+        );
+
+        // The real books must hold ZERO resting orders from the batch.
+        assert_eq!(call_order_count(&state, underlying, &exp, 10000), 0);
+        assert_eq!(call_order_count(&state, underlying, &exp, 11000), 0);
+
+        // Tracking must match the book: every accepted order was removed.
+        assert_eq!(state.orders.len(), 0);
+
+        // Results truthfully describe each item.
+        assert_eq!(response.results.len(), 3);
+        assert_eq!(response.results[0].status, BulkOrderStatus::Rejected);
+        assert!(response.results[0].order_id.is_none());
+        assert!(
+            response.results[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Rolled back"))
+        );
+        assert_eq!(response.results[1].status, BulkOrderStatus::Rejected);
+        assert_eq!(response.results[2].status, BulkOrderStatus::Rejected);
+        assert!(
+            response.results[2]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.to_lowercase().contains("strike"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bulk_submit_non_atomic_keeps_accepted_orders() {
+        // Non-atomic batches are best-effort: a failing order must NOT roll back
+        // the orders that already succeeded.
+        let state = create_test_state();
+        let underlying = "TEST";
+        let exp = seed_book_with_strikes(&state, underlying, &[10000, 11000]);
+
+        let request = BulkOrderRequest {
+            orders: vec![
+                bulk_item(underlying, &exp, 10000),
+                bulk_item(underlying, &exp, 99999), // not seeded -> fails
+                bulk_item(underlying, &exp, 11000),
+            ],
+            atomic: false,
+        };
+
+        let Json(response) = bulk_submit_orders(State(state.clone()), Json(request))
+            .await
+            .expect("non-atomic bulk submit returns a response");
+
+        assert!(!response.rolled_back);
+        assert_eq!(response.success_count, 2);
+        assert_eq!(response.failure_count, 1);
+        assert!(response.rollback_warnings.is_empty());
+
+        // Both successful orders remain resting in their books.
+        assert_eq!(call_order_count(&state, underlying, &exp, 10000), 1);
+        assert_eq!(call_order_count(&state, underlying, &exp, 11000), 1);
+        assert_eq!(state.orders.len(), 2);
+
+        assert_eq!(response.results[0].status, BulkOrderStatus::Accepted);
+        assert_eq!(response.results[1].status, BulkOrderStatus::Rejected);
+        assert_eq!(response.results[2].status, BulkOrderStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_submit_atomic_rollback_path_uses_book_cancel() {
+        // Exercises the cancel-on-rollback path end to end: a single accepted
+        // order must be removed from its book when a later order fails. This is
+        // the path that previously only dropped tracking (issue #46). The
+        // filled-order-cannot-be-un-filled caveat is documented on
+        // `bulk_submit_orders` and surfaced via `rollback_warnings`; it is not
+        // reproduced here because forcing a partial fill depends on upstream
+        // matching internals.
+        let state = create_test_state();
+        let underlying = "ROLL";
+        let exp = seed_book_with_strikes(&state, underlying, &[12000]);
+
+        let request = BulkOrderRequest {
+            orders: vec![
+                bulk_item(underlying, &exp, 12000),
+                bulk_item(underlying, &exp, 13000), // not seeded -> fails
+            ],
+            atomic: true,
+        };
+
+        // Sanity: nothing resting before the call.
+        assert_eq!(call_order_count(&state, underlying, &exp, 12000), 0);
+
+        let Json(response) = bulk_submit_orders(State(state.clone()), Json(request))
+            .await
+            .expect("atomic bulk submit returns a response");
+
+        assert!(response.rolled_back);
+        assert_eq!(call_order_count(&state, underlying, &exp, 12000), 0);
+        assert_eq!(state.orders.len(), 0);
+        assert!(response.rollback_warnings.is_empty());
+    }
+
+    /// Places a resting limit order directly on a seeded call book (bypassing the
+    /// bulk tracking) so a later batch order can cross and (partially) fill.
+    fn place_resting_call(
+        state: &Arc<AppState>,
+        underlying: &str,
+        exp: &str,
+        strike: u64,
+        side: Side,
+        price: u128,
+        quantity: u64,
+    ) {
+        let underlying_book = state
+            .manager
+            .get(underlying)
+            .expect("underlying exists in fixture");
+        let expiration =
+            find_expiration_by_str(&underlying_book, exp).expect("expiration exists in fixture");
+        let exp_book = underlying_book
+            .get_expiration(&expiration)
+            .expect("expiration book exists");
+        let strike_book = exp_book
+            .get_strike(strike)
+            .expect("strike exists in fixture");
+        strike_book
+            .get(OptionStyle::Call)
+            .add_limit_order(OrderId::new(), side, price, quantity)
+            .expect("resting order placed");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_submit_atomic_rollback_partial_fill_is_unrollbackable() {
+        // BLOCKER B1: a batch order that PARTIALLY fills on submit (remainder
+        // rests) must NOT be reported as a clean rollback. A resting sell of 5 is
+        // seeded; the batch buy for 10 crosses it, fills 5, and rests 5. A later
+        // order then fails and triggers the atomic rollback. The 5 filled units
+        // cannot be un-filled, so the order must be flagged un-rollbackable.
+        let state = create_test_state();
+        let underlying = "FILL";
+        let strike = 12000u64;
+        let exp = seed_book_with_strikes(&state, underlying, &[strike]);
+
+        // Resting opposite-side liquidity: SELL 5 @ 100.
+        place_resting_call(&state, underlying, &exp, strike, Side::Sell, 100, 5);
+
+        // Batch: a marketable BUY 10 @ 150 (crosses the ask, fills 5, rests 5),
+        // then an order on an unseeded strike that fails -> atomic rollback.
+        let crossing_buy = BulkOrderItem {
+            underlying: underlying.to_string(),
+            expiration: exp.clone(),
+            strike,
+            style: "call".to_string(),
+            side: "buy".to_string(),
+            price: 150,
+            quantity: 10,
+        };
+        let request = BulkOrderRequest {
+            orders: vec![crossing_buy, bulk_item(underlying, &exp, 99999)],
+            atomic: true,
+        };
+
+        let Json(response) = bulk_submit_orders(State(state.clone()), Json(request))
+            .await
+            .expect("atomic bulk submit returns a response");
+
+        // The partially-filled order is un-rollbackable: counted, not a clean
+        // rollback.
+        assert!(response.rolled_back);
+        assert_eq!(
+            response.success_count, 1,
+            "the partially-filled order remains and is counted"
+        );
+        assert_eq!(response.failure_count, 1);
+        assert_eq!(
+            response.rollback_warnings.len(),
+            1,
+            "the un-rollbackable fill must surface a warning"
+        );
+        assert!(
+            response.rollback_warnings[0].contains("already filled"),
+            "warning must explain the fill: {}",
+            response.rollback_warnings[0]
+        );
+
+        // The crossing order is reported accepted (NOT a clean "rolled back"),
+        // with its id and a warning.
+        let first = &response.results[0];
+        assert_eq!(first.status, BulkOrderStatus::Accepted);
+        let kept_id = first.order_id.clone().expect("kept order retains its id");
+        assert!(
+            first
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not be fully rolled back")),
+            "result error must flag the un-rollbackable fill: {:?}",
+            first.error
+        );
+        // The failing order is rejected.
+        assert_eq!(response.results[1].status, BulkOrderStatus::Rejected);
+
+        // Tracked state (C2) reflects reality: 5 filled, remainder cancelled.
+        let kept = state
+            .orders
+            .get(&kept_id)
+            .expect("partially-filled order is kept in tracking");
+        assert_eq!(kept.filled_quantity, 5);
+        assert_eq!(kept.remaining_quantity, 0);
+        assert_eq!(kept.status, OrderStatus::Canceled);
+        drop(kept);
+        assert_eq!(state.orders.len(), 1);
+
+        // The book: the resting sell was fully consumed and the buy remainder was
+        // cancelled by the rollback, so nothing rests.
+        assert_eq!(call_order_count(&state, underlying, &exp, strike), 0);
     }
 
     #[tokio::test]

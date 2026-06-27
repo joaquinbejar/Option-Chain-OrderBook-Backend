@@ -1073,12 +1073,32 @@ pub struct BulkOrderResultItem {
 /// Response for bulk order submission.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BulkOrderResponse {
-    /// Number of orders successfully submitted.
+    /// Number of orders accepted by the book (placed or filled).
+    ///
+    /// "Accepted" means the matching engine accepted the order — it is NOT
+    /// necessarily still resting, since a marketable order can fill immediately
+    /// on submit. For a non-atomic batch this is the count of accepted orders.
+    /// After an atomic rollback it counts only the orders that could NOT be
+    /// rolled back because they had already (partially) filled (a fill cannot be
+    /// un-filled) — normally `0`; see `rollback_warnings`.
     pub success_count: usize,
-    /// Number of orders that failed.
+    /// Number of orders not left in the live state after the request (rejected,
+    /// not attempted, or cleanly rolled back).
     pub failure_count: usize,
     /// Detailed results for each order.
     pub results: Vec<BulkOrderResultItem>,
+    /// True if an atomic rollback was performed because an order in the batch
+    /// failed. When true, every previously-accepted order was cancelled in the
+    /// real order book (best-effort — see `rollback_warnings`).
+    pub rolled_back: bool,
+    /// Best-effort rollback warnings.
+    ///
+    /// Populated during an atomic rollback when an accepted order could not be
+    /// cleanly cancelled — most importantly when it had already (partially)
+    /// filled, since a fill cannot be un-filled. Such orders remain live, are
+    /// counted in `success_count`, and are reported with status `accepted`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rollback_warnings: Vec<String>,
 }
 
 /// Request for bulk order cancellation.
