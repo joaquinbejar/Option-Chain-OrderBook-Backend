@@ -156,7 +156,14 @@ impl ApiKeyStore {
     fn hash_key(key: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(key.as_bytes());
-        format!("{:x}", hasher.finalize())
+        // sha2 0.11 no longer implements `LowerHex` on the finalize output, so
+        // format the digest bytes to lowercase hex explicitly (byte-identical
+        // to the previous `format!("{:x}", ...)`).
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// Create a new API key.

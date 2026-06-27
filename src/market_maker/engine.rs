@@ -325,10 +325,7 @@ impl MarketMakerEngine {
         let config = self.get_config();
 
         if let Ok(underlying_book) = self.manager.get(symbol) {
-            for exp_entry in underlying_book.expirations().iter() {
-                let expiration = exp_entry.key();
-                let exp_book = exp_entry.value();
-
+            for (expiration, exp_book) in underlying_book.expirations().iter() {
                 for strike in exp_book.strike_prices() {
                     if let Ok(_strike_book) = exp_book.get_strike(strike) {
                         for style in [OptionStyle::Call, OptionStyle::Put] {

@@ -32,11 +32,11 @@ use std::sync::Arc;
 /// Converts a Quote to QuoteResponse.
 fn quote_to_response(quote: &Quote) -> QuoteResponse {
     QuoteResponse {
-        bid_price: quote.bid_price(),
-        bid_size: quote.bid_size(),
-        ask_price: quote.ask_price(),
-        ask_size: quote.ask_size(),
-        timestamp_ms: quote.timestamp_ms(),
+        bid_price: quote.bid_price().map(|p| p.as_u128()),
+        bid_size: quote.bid_size().as_u64(),
+        ask_price: quote.ask_price().map(|p| p.as_u128()),
+        ask_size: quote.ask_size().as_u64(),
+        timestamp_ms: quote.timestamp_ms().as_u64(),
     }
 }
 
@@ -74,12 +74,11 @@ fn find_expiration_by_str(
     underlying_book: &std::sync::Arc<option_chain_orderbook::orderbook::UnderlyingOrderBook>,
     exp_str: &str,
 ) -> Option<ExpirationDate> {
-    for entry in underlying_book.expirations().iter() {
-        if format_expiration(entry.key()) == exp_str {
-            return Some(*entry.key());
-        }
-    }
-    None
+    underlying_book
+        .expirations()
+        .iter()
+        .map(|(exp, _)| exp)
+        .find(|&exp| format_expiration(&exp) == exp_str)
 }
 
 /// Parses expiration string to ExpirationDate.
@@ -286,7 +285,7 @@ pub async fn list_executions(
     }
 
     // Sort by timestamp descending (most recent first)
-    executions.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+    executions.sort_by_key(|e| std::cmp::Reverse(e.timestamp_ms));
 
     // Calculate summary before pagination
     let total_executions = executions.len() as u64;
@@ -371,8 +370,7 @@ pub async fn create_snapshot(State(state): State<Arc<AppState>>) -> Json<CreateS
     for underlying_symbol in state.manager.underlying_symbols() {
         if let Ok(underlying) = state.manager.get(&underlying_symbol) {
             // Iterate through all expirations
-            for exp_entry in underlying.expirations().iter() {
-                let exp: ExpirationDate = *exp_entry.key();
+            for (exp, _) in underlying.expirations().iter() {
                 if let Ok(exp_book) = underlying.get_expiration(&exp) {
                     let exp_str = format_expiration(&exp);
 
@@ -392,9 +390,13 @@ pub async fn create_snapshot(State(state): State<Arc<AppState>>) -> Json<CreateS
                                 let order_count = snapshot
                                     .bids
                                     .iter()
-                                    .map(|l| l.orders.len())
+                                    .map(|l| l.orders().len())
                                     .sum::<usize>()
-                                    + snapshot.asks.iter().map(|l| l.orders.len()).sum::<usize>();
+                                    + snapshot
+                                        .asks
+                                        .iter()
+                                        .map(|l| l.orders().len())
+                                        .sum::<usize>();
 
                                 if order_count > 0 {
                                     let data = serde_json::to_string(&snapshot).unwrap_or_default();
@@ -730,7 +732,7 @@ pub async fn list_expirations(
     let expirations: Vec<String> = book
         .expirations()
         .iter()
-        .map(|e| format_expiration(e.key()))
+        .map(|e| format_expiration(&e.0))
         .collect();
 
     Ok(Json(ExpirationsListResponse { expirations }))
@@ -965,10 +967,10 @@ fn build_option_quote_data(
     let last_trade = state.last_trades.get(&symbol).map(|entry| entry.price);
 
     OptionQuoteData {
-        bid: quote.bid_price(),
-        ask: quote.ask_price(),
-        bid_size: quote.bid_size(),
-        ask_size: quote.ask_size(),
+        bid: quote.bid_price().map(|p| p.as_u128()),
+        ask: quote.ask_price().map(|p| p.as_u128()),
+        bid_size: quote.bid_size().as_u64(),
+        ask_size: quote.ask_size().as_u64(),
         last_trade: last_trade.map(|p| p as u128),
         volume: 0,        // Not tracked yet
         open_interest: 0, // Not tracked yet
@@ -1027,7 +1029,7 @@ pub async fn get_volatility_surface(
     let now = chrono::Utc::now();
 
     for exp_entry in expirations_map.iter() {
-        let exp = exp_entry.key();
+        let exp = &exp_entry.0;
         let exp_str = match exp.get_date() {
             Ok(d) => d.format("%Y%m%d").to_string(),
             Err(_) => continue,
@@ -1111,9 +1113,9 @@ pub async fn get_volatility_surface(
 /// Calculate mid-price from a quote.
 fn calculate_mid_price(quote: &Quote) -> Option<u128> {
     match (quote.bid_price(), quote.ask_price()) {
-        (Some(bid), Some(ask)) => Some((bid + ask) / 2),
-        (Some(bid), None) => Some(bid),
-        (None, Some(ask)) => Some(ask),
+        (Some(bid), Some(ask)) => Some((bid.as_u128() + ask.as_u128()) / 2),
+        (Some(bid), None) => Some(bid.as_u128()),
+        (None, Some(ask)) => Some(ask.as_u128()),
         (None, None) => None,
     }
 }
@@ -1499,8 +1501,8 @@ pub async fn modify_order(
     let side = existing_order.side();
 
     // Determine new values
-    let new_price = body.price.unwrap_or(current_price);
-    let new_quantity = body.quantity.unwrap_or(current_quantity);
+    let new_price = body.price.unwrap_or(current_price.as_u128());
+    let new_quantity = body.quantity.unwrap_or(current_quantity.as_u64());
 
     // Cancel the existing order
     let canceled = option_book
@@ -1823,9 +1825,9 @@ pub async fn get_option_snapshot(
         .bids
         .iter()
         .map(|level| PriceLevelInfo {
-            price: level.price,
-            quantity: level.visible_quantity,
-            order_count: level.order_count,
+            price: level.price().as_u128(),
+            quantity: level.visible_quantity().as_u64(),
+            order_count: level.order_count(),
         })
         .collect();
 
@@ -1833,9 +1835,9 @@ pub async fn get_option_snapshot(
         .asks
         .iter()
         .map(|level| PriceLevelInfo {
-            price: level.price,
-            quantity: level.visible_quantity,
-            order_count: level.order_count,
+            price: level.price().as_u128(),
+            quantity: level.visible_quantity().as_u64(),
+            order_count: level.order_count(),
         })
         .collect();
 
@@ -1923,8 +1925,8 @@ pub async fn get_orderbook_metrics(
     );
 
     // Calculate spread metrics from bids/asks
-    let best_bid = enriched.bids.first().map(|l| l.price);
-    let best_ask = enriched.asks.first().map(|l| l.price);
+    let best_bid = enriched.bids.first().map(|l| l.price().as_u128());
+    let best_ask = enriched.asks.first().map(|l| l.price().as_u128());
     let current_spread = match (best_bid, best_ask) {
         (Some(bid), Some(ask)) if ask > bid => Some(ask - bid),
         _ => None,
@@ -2041,21 +2043,24 @@ pub async fn submit_market_order(
         .submit_market_order(order_id, body.quantity, side)
     {
         Ok(match_result) => {
-            let filled_quantity = match_result.executed_quantity();
-            let remaining_quantity = match_result.remaining_quantity;
-            let average_price = match_result.average_price();
+            let filled_quantity = match_result
+                .executed_quantity()
+                .map(|q| q.as_u64())
+                .unwrap_or(0);
+            let remaining_quantity = match_result.remaining_quantity().as_u64();
+            let average_price = match_result.average_price().ok().flatten();
 
             let fills: Vec<FillInfo> = match_result
-                .transactions
+                .trades()
                 .as_vec()
                 .iter()
                 .map(|t| FillInfo {
-                    price: t.price,
-                    quantity: t.quantity,
+                    price: t.price().as_u128(),
+                    quantity: t.quantity().as_u64(),
                 })
                 .collect();
 
-            let status = if match_result.is_complete {
+            let status = if match_result.is_complete() {
                 MarketOrderStatus::Filled
             } else if filled_quantity > 0 {
                 MarketOrderStatus::Partial
@@ -2298,7 +2303,7 @@ pub async fn list_orders(
         .collect();
 
     // Sort by creation time (newest first)
-    filtered_orders.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    filtered_orders.sort_by_key(|o| std::cmp::Reverse(o.created_at_ms));
 
     let total = filtered_orders.len();
 
@@ -2934,9 +2939,9 @@ fn get_current_price_for_symbol(state: &AppState, symbol: &str) -> Option<u128> 
 
     // Use mid price if available, otherwise best bid or ask
     match (quote.bid_price(), quote.ask_price()) {
-        (Some(bid), Some(ask)) => Some((bid + ask) / 2),
-        (Some(bid), None) => Some(bid),
-        (None, Some(ask)) => Some(ask),
+        (Some(bid), Some(ask)) => Some((bid.as_u128() + ask.as_u128()) / 2),
+        (Some(bid), None) => Some(bid.as_u128()),
+        (None, Some(ask)) => Some(ask.as_u128()),
         (None, None) => None,
     }
 }
@@ -5374,21 +5379,46 @@ mod tests {
     #[test]
     fn test_calculate_mid_price() {
         use option_chain_orderbook::orderbook::Quote;
+        use option_chain_orderbook::{Price, Quantity, TimestampMs};
 
-        // Both bid and ask (bid_price, bid_size, ask_price, ask_size, last_trade)
-        let quote1 = Quote::new(Some(100), 10, Some(110), 10, 0);
+        // Both bid and ask (bid_price, bid_size, ask_price, ask_size, timestamp_ms)
+        let quote1 = Quote::new(
+            Some(Price::new(100)),
+            Quantity::new(10),
+            Some(Price::new(110)),
+            Quantity::new(10),
+            TimestampMs::new(0),
+        );
         assert_eq!(calculate_mid_price(&quote1), Some(105));
 
         // Only bid
-        let quote2 = Quote::new(Some(100), 10, None, 0, 0);
+        let quote2 = Quote::new(
+            Some(Price::new(100)),
+            Quantity::new(10),
+            None,
+            Quantity::new(0),
+            TimestampMs::new(0),
+        );
         assert_eq!(calculate_mid_price(&quote2), Some(100));
 
         // Only ask
-        let quote3 = Quote::new(None, 0, Some(110), 10, 0);
+        let quote3 = Quote::new(
+            None,
+            Quantity::new(0),
+            Some(Price::new(110)),
+            Quantity::new(10),
+            TimestampMs::new(0),
+        );
         assert_eq!(calculate_mid_price(&quote3), Some(110));
 
         // Neither
-        let quote4 = Quote::new(None, 0, None, 0, 0);
+        let quote4 = Quote::new(
+            None,
+            Quantity::new(0),
+            None,
+            Quantity::new(0),
+            TimestampMs::new(0),
+        );
         assert_eq!(calculate_mid_price(&quote4), None);
     }
 

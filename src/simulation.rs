@@ -34,6 +34,7 @@ pub struct PriceUpdate {
 }
 
 /// Walker implementation for OptionStratLib simulation.
+#[derive(Clone)]
 struct Walker;
 
 impl Walker {

@@ -1,6 +1,6 @@
 [package]
 name = "option-chain-orderbook-backend"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "REST API backend for Option Chain OrderBook"
@@ -62,22 +62,22 @@ sha2 = { workspace = true }
 [workspace.dependencies]
 # Web framework
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Option Chain OrderBook library
-option-chain-orderbook = "0.3"
-optionstratlib = "0.14"
-orderbook-rs = { version = "0.5", features = ["special_orders"] }
+option-chain-orderbook = "0.5"
+optionstratlib = "0.17"
+orderbook-rs = { version = "0.9", features = ["special_orders"] }
 
 # Async runtime
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
 
 # Logging
 tracing = "0.1"
@@ -88,25 +88,25 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # OpenAPI documentation
-utoipa = { version = "5.4", features = ["axum_extras"] }
+utoipa = { version = "5.5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.20", features = ["v4", "serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 futures = "0.3"
 parking_lot = "0.12"
-toml = "0.9"
-rust_decimal = "1.40"
+toml = "1.1"
+rust_decimal = "1.42"
 rust_decimal_macros = "1.40"
-dashmap = "6.1"
+dashmap = "6.2"
 futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
-tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 url = "2.5"
 serde_urlencoded = "0.7"
 
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 
 [dev-dependencies]
 

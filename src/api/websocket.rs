@@ -1267,8 +1267,8 @@ async fn get_orderbook_snapshot(
         .bids
         .iter()
         .map(|level| PriceLevelData {
-            price: level.price,
-            quantity: level.visible_quantity,
+            price: level.price().as_u128(),
+            quantity: level.visible_quantity().as_u64(),
         })
         .collect();
 
@@ -1276,8 +1276,8 @@ async fn get_orderbook_snapshot(
         .asks
         .iter()
         .map(|level| PriceLevelData {
-            price: level.price,
-            quantity: level.visible_quantity,
+            price: level.price().as_u128(),
+            quantity: level.visible_quantity().as_u64(),
         })
         .collect();
 
@@ -1290,12 +1290,12 @@ fn find_expiration_by_str(
     exp_str: &str,
 ) -> Option<optionstratlib::ExpirationDate> {
     for entry in underlying_book.expirations().iter() {
-        let formatted = match entry.key().get_date() {
+        let formatted = match entry.0.get_date() {
             Ok(date) => date.format("%Y%m%d").to_string(),
-            Err(_) => entry.key().to_string(),
+            Err(_) => entry.0.to_string(),
         };
         if formatted == exp_str {
-            return Some(*entry.key());
+            return Some(entry.0);
         }
     }
     None
