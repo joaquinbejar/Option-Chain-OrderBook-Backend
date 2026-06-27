@@ -110,14 +110,25 @@ impl Quoter {
         let half_spread_cents =
             ((theo_cents as f64 * half_spread_bps as f64) / 10000.0).max(1.0) as u64;
 
-        // Apply directional skew
-        // Positive skew = bullish = tighter bid, wider ask for calls
-        // Negative skew = bearish = wider bid, tighter ask for calls
+        // Apply directional skew as a symmetric, same-signed PARALLEL shift of
+        // both bid and ask (not a spread-widening). For a call, a positive
+        // (bullish) skew raises both the bid and the ask by `skew_adjustment`:
+        // relative to the theo midpoint the bid moves toward theo (tighter bid)
+        // and the ask moves away from theo (wider ask); a negative (bearish)
+        // skew lowers both by the same amount. A put's value moves opposite to
+        // the underlying, so its sign is mirrored. Because the same adjustment
+        // is applied to both legs, the quoted spread width is preserved.
+        //
+        // `skew_adjustment` is signed cents derived from a clamped skew in
+        // [-1.0, 1.0]; its magnitude is at most `half_spread_cents * 0.5`. The
+        // final prices are computed in `i64` and then floored with the existing
+        // bid floor (`.max(1)`) and ask floor (`.max(bid + 1)`), so a negative
+        // adjustment can never underflow the `u128` price.
         let skew_adjustment = (half_spread_cents as f64 * input.directional_skew * 0.5) as i64;
 
         let (bid_adjustment, ask_adjustment) = match input.style {
-            OptionStyle::Call => (-skew_adjustment, skew_adjustment),
-            OptionStyle::Put => (skew_adjustment, -skew_adjustment),
+            OptionStyle::Call => (skew_adjustment, skew_adjustment),
+            OptionStyle::Put => (-skew_adjustment, -skew_adjustment),
         };
 
         let bid_price =
@@ -234,8 +245,127 @@ mod tests {
             .generate_quote(&bullish_input)
             .expect("bullish input must yield a quote");
 
-        // Bullish skew should have tighter bid (higher) for calls
+        // Bullish skew should have a tighter (>=) bid for calls. At this default
+        // ATM/spread the integer `skew_adjustment` truncates to 0, so the bid is
+        // unchanged here; `test_directional_skew_is_symmetric_parallel_shift`
+        // exercises the non-truncated case where the bid strictly moves.
         assert!(bullish.bid_price >= neutral.bid_price);
+    }
+
+    #[test]
+    fn test_directional_skew_is_symmetric_parallel_shift() {
+        // Regression for issue #50: directional skew must be a same-signed,
+        // symmetric (parallel) shift of bid AND ask, not an asymmetric
+        // spread-widening. Use a large theo and a wide spread multiplier so the
+        // integer `skew_adjustment` is comfortably >= 1 and is NOT truncated to
+        // 0 (the truncation that masked the original sign bug at ATM/default
+        // spread).
+        let quoter = Quoter::default();
+        let exp = ExpirationDate::Days(Positive::THIRTY);
+
+        let call_neutral = QuoteInput {
+            spot_cents: 1_000_000,   // $10,000 spot
+            strike_cents: 1_000_000, // $10,000 strike (ATM, large theo)
+            expiration: &exp,
+            style: OptionStyle::Call,
+            spread_multiplier: 10.0, // widen so half_spread_cents is large
+            size_scalar: 1.0,
+            directional_skew: 0.0,
+            iv: Some(0.50),
+        };
+        let call_bullish = QuoteInput {
+            directional_skew: 0.5,
+            ..call_neutral.clone()
+        };
+        let call_bearish = QuoteInput {
+            directional_skew: -0.5,
+            ..call_neutral.clone()
+        };
+
+        let neutral = quoter
+            .generate_quote(&call_neutral)
+            .expect("neutral call must yield a quote");
+        let bullish = quoter
+            .generate_quote(&call_bullish)
+            .expect("bullish call must yield a quote");
+        let bearish = quoter
+            .generate_quote(&call_bearish)
+            .expect("bearish call must yield a quote");
+
+        // Bullish call: BOTH bid and ask rise, by the SAME signed amount.
+        let bid_delta = bullish.bid_price as i128 - neutral.bid_price as i128;
+        let ask_delta = bullish.ask_price as i128 - neutral.ask_price as i128;
+        assert!(
+            bid_delta >= 1,
+            "bullish skew must strictly raise the call bid (tighter bid); \
+             skew_adjustment must be >= 1, got {bid_delta}"
+        );
+        assert!(
+            ask_delta >= 1,
+            "bullish skew must strictly raise the call ask (wider ask); got {ask_delta}"
+        );
+        assert_eq!(
+            bid_delta, ask_delta,
+            "bullish skew must shift bid and ask by the same signed amount"
+        );
+
+        // Bearish call: BOTH bid and ask fall, by the SAME signed amount, and
+        // exactly mirror the bullish move at the same magnitude.
+        let bear_bid_delta = bearish.bid_price as i128 - neutral.bid_price as i128;
+        let bear_ask_delta = bearish.ask_price as i128 - neutral.ask_price as i128;
+        assert!(
+            bear_bid_delta <= -1,
+            "bearish skew must strictly lower the call bid; got {bear_bid_delta}"
+        );
+        assert_eq!(
+            bear_bid_delta, bear_ask_delta,
+            "bearish skew must shift bid and ask by the same signed amount"
+        );
+        assert_eq!(
+            bid_delta, -bear_bid_delta,
+            "bullish and bearish skew of equal magnitude must be opposite shifts"
+        );
+
+        // The spread width is preserved under a parallel shift.
+        let neutral_spread = neutral.ask_price - neutral.bid_price;
+        assert_eq!(
+            bullish.ask_price - bullish.bid_price,
+            neutral_spread,
+            "skew must not change the quoted spread width"
+        );
+        assert_eq!(
+            bearish.ask_price - bearish.bid_price,
+            neutral_spread,
+            "skew must not change the quoted spread width"
+        );
+
+        // Mirror for a put: its value moves opposite to the underlying, so a
+        // bullish skew LOWERS both the put bid and ask by the same amount.
+        let put_neutral = QuoteInput {
+            style: OptionStyle::Put,
+            ..call_neutral.clone()
+        };
+        let put_bullish = QuoteInput {
+            directional_skew: 0.5,
+            ..put_neutral.clone()
+        };
+        let put_n = quoter
+            .generate_quote(&put_neutral)
+            .expect("neutral put must yield a quote");
+        let put_b = quoter
+            .generate_quote(&put_bullish)
+            .expect("bullish put must yield a quote");
+
+        let put_bid_delta = put_b.bid_price as i128 - put_n.bid_price as i128;
+        let put_ask_delta = put_b.ask_price as i128 - put_n.ask_price as i128;
+        assert!(
+            put_bid_delta <= -1,
+            "bullish skew must strictly lower the put bid; got {put_bid_delta}"
+        );
+        assert_eq!(
+            put_bid_delta, put_ask_delta,
+            "bullish skew on a put must shift bid and ask by the same signed amount"
+        );
     }
 
     #[test]
