@@ -68,9 +68,21 @@ impl Quoter {
     /// * `input` - Quote input parameters
     ///
     /// # Returns
-    /// Quote parameters with bid/ask prices and sizes.
+    /// `Some(QuoteParams)` with bid/ask prices (cents) and sizes, or `None` when
+    /// the theoretical value is non-finite and no safe quote can be produced.
+    ///
+    /// # Boundary guard
+    /// The Black-Scholes approximation works in `f64`. A degenerate input
+    /// (zero/expired time-to-expiry, zero strike, or an extreme/non-finite vol)
+    /// can make the theoretical value `NaN` or `±Inf`. Casting that straight to
+    /// integer cents silently yields `0` (from `NaN`) or `u64::MAX` (from `+Inf`,
+    /// which becomes `-1` as `i64`) and poisons every downstream bid/ask. To keep
+    /// the `f64 → cents` boundary honest, a non-finite theoretical value (or a
+    /// non-finite scaled-to-cents intermediate) returns `None` instead of a
+    /// quote; the caller skips placing orders for that instrument. The value is
+    /// never silently coerced to `0`.
     #[must_use]
-    pub fn generate_quote(&self, input: &QuoteInput<'_>) -> QuoteParams {
+    pub fn generate_quote(&self, input: &QuoteInput<'_>) -> Option<QuoteParams> {
         let spot = input.spot_cents as f64 / 100.0;
         let strike = input.strike_cents as f64 / 100.0;
 
@@ -78,7 +90,20 @@ impl Quoter {
         let theo =
             self.pricer
                 .theoretical_value(spot, strike, input.expiration, input.style, input.iv);
-        let theo_cents = (theo * 100.0).round() as u64;
+
+        // Guard the f64 -> cents boundary: refuse to quote on a non-finite theo
+        // (NaN / ±Inf) rather than casting it to a garbage cents value.
+        if !theo.is_finite() {
+            return None;
+        }
+
+        // Guard the scaled intermediate too: a finite-but-huge theo can overflow
+        // to ±Inf when multiplied by 100, which must not slip into the cents cast.
+        let theo_scaled = theo * 100.0;
+        if !theo_scaled.is_finite() {
+            return None;
+        }
+        let theo_cents = theo_scaled.round() as u64;
 
         // Calculate spread based on theo value and base spread
         let half_spread_bps = (self.base_spread_bps as f64 * input.spread_multiplier / 2.0) as u64;
@@ -115,12 +140,12 @@ impl Quoter {
             (base_size, base_size)
         };
 
-        QuoteParams {
+        Some(QuoteParams {
             bid_price,
             ask_price,
             bid_size: bid_size.max(1),
             ask_size: ask_size.max(1),
-        }
+        })
     }
 
     /// Calculates the edge for a fill.
@@ -171,9 +196,12 @@ mod tests {
             iv: Some(0.20),
         };
 
-        let quote = quoter.generate_quote(&input);
+        let quote = quoter
+            .generate_quote(&input)
+            .expect("a finite theo must yield a quote");
 
         assert!(quote.bid_price < quote.ask_price);
+        assert!(quote.bid_price >= 1);
         assert!(quote.bid_size > 0);
         assert!(quote.ask_size > 0);
     }
@@ -199,8 +227,12 @@ mod tests {
             ..neutral_input.clone()
         };
 
-        let neutral = quoter.generate_quote(&neutral_input);
-        let bullish = quoter.generate_quote(&bullish_input);
+        let neutral = quoter
+            .generate_quote(&neutral_input)
+            .expect("neutral input must yield a quote");
+        let bullish = quoter
+            .generate_quote(&bullish_input)
+            .expect("bullish input must yield a quote");
 
         // Bullish skew should have tighter bid (higher) for calls
         assert!(bullish.bid_price >= neutral.bid_price);
@@ -216,5 +248,95 @@ mod tests {
 
         // Buying at 110 when theo is 105 = -5 edge (adverse)
         assert_eq!(Quoter::calculate_edge(110, 105, true), -5);
+    }
+
+    #[test]
+    fn test_generate_quote_skips_non_finite_theo() {
+        let quoter = Quoter::default();
+        let exp = ExpirationDate::Days(Positive::THIRTY);
+        let pricer = OptionPricer::default();
+
+        // An infinite implied volatility drives the Black-Scholes approximation
+        // to a NaN theoretical value (Inf / Inf). Confirm the pricer really does
+        // produce a non-finite value, then assert the quoter refuses to quote.
+        for bad_iv in [f64::INFINITY, f64::NAN] {
+            let theo =
+                pricer.theoretical_value(100.0, 100.0, &exp, OptionStyle::Call, Some(bad_iv));
+            assert!(
+                !theo.is_finite(),
+                "expected a non-finite theo for iv={bad_iv}, got {theo}"
+            );
+
+            let input = QuoteInput {
+                spot_cents: 10000,
+                strike_cents: 10000,
+                expiration: &exp,
+                style: OptionStyle::Call,
+                spread_multiplier: 1.0,
+                size_scalar: 1.0,
+                directional_skew: 0.0,
+                iv: Some(bad_iv),
+            };
+
+            assert!(
+                quoter.generate_quote(&input).is_none(),
+                "a non-finite theo must skip quoting (iv={bad_iv})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_finite_theo_never_becomes_cents() {
+        // Guard test: a non-finite theoretical value must never be cast into a
+        // cents number. The quoter returns `None`, so no `QuoteParams` (and thus
+        // no bid/ask cents) is ever derived from the non-finite value. This
+        // protects against the silent `NaN -> 0` / `+Inf -> u64::MAX -> -1` casts.
+        let quoter = Quoter::default();
+        let exp = ExpirationDate::Days(Positive::THIRTY);
+
+        let input = QuoteInput {
+            spot_cents: 10000,
+            strike_cents: 10000,
+            expiration: &exp,
+            style: OptionStyle::Put,
+            spread_multiplier: 1.0,
+            size_scalar: 1.0,
+            directional_skew: 0.0,
+            iv: Some(f64::INFINITY),
+        };
+
+        match quoter.generate_quote(&input) {
+            None => {}
+            Some(params) => panic!(
+                "non-finite theo leaked into cents: bid={} ask={}",
+                params.bid_price, params.ask_price
+            ),
+        }
+    }
+
+    #[test]
+    fn test_generate_quote_finite_input_is_valid() {
+        // A normal, finite input still produces a valid two-sided quote.
+        let quoter = Quoter::default();
+        let exp = ExpirationDate::Days(Positive::THIRTY);
+
+        let input = QuoteInput {
+            spot_cents: 10000,
+            strike_cents: 10000,
+            expiration: &exp,
+            style: OptionStyle::Call,
+            spread_multiplier: 1.0,
+            size_scalar: 1.0,
+            directional_skew: 0.0,
+            iv: Some(0.20),
+        };
+
+        let quote = quoter
+            .generate_quote(&input)
+            .expect("a finite input must yield a quote");
+        assert!(quote.ask_price > quote.bid_price);
+        assert!(quote.bid_price >= 1);
+        assert!(quote.bid_size >= 1);
+        assert!(quote.ask_size >= 1);
     }
 }
