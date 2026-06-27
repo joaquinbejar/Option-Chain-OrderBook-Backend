@@ -126,6 +126,44 @@ fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
     )))
 }
 
+/// Resolves the GTD (Good-Til-Date) expiration timestamp, in milliseconds, for a
+/// limit order.
+///
+/// A GTD order requires a valid `expire_at` (RFC 3339 / ISO 8601) that lies
+/// strictly in the future relative to `now_ms`. Without this guard a missing or
+/// malformed `expire_at` would silently fall back to `Gtd(0)` — an epoch /
+/// already-expired timestamp — so the order would be born dead.
+///
+/// # Errors
+/// Returns [`ApiError::InvalidRequest`] when `expire_at` is missing, cannot be
+/// parsed as RFC 3339, falls outside the representable `u64` millisecond range
+/// (e.g. a pre-epoch date), or is not strictly after `now_ms` (it would expire
+/// immediately).
+fn parse_gtd_expire_at(expire_at: Option<&str>, now_ms: u64) -> Result<u64, ApiError> {
+    let expire_str = expire_at
+        .ok_or_else(|| ApiError::InvalidRequest("GTD order requires expire_at".to_string()))?;
+
+    let parsed = chrono::DateTime::parse_from_rfc3339(expire_str)
+        .map_err(|e| ApiError::InvalidRequest(format!("invalid expire_at '{expire_str}': {e}")))?;
+
+    // Timestamps are carried in milliseconds; reject anything that cannot be
+    // represented as a non-negative u64 (e.g. pre-epoch dates) so it never wraps
+    // into a degenerate Gtd value.
+    let expire_ms = u64::try_from(parsed.timestamp_millis()).map_err(|_| {
+        ApiError::InvalidRequest(format!(
+            "invalid expire_at '{expire_str}': out of representable range"
+        ))
+    })?;
+
+    if expire_ms <= now_ms {
+        return Err(ApiError::InvalidRequest(format!(
+            "expire_at '{expire_str}' is in the past or now; GTD order would expire immediately"
+        )));
+    }
+
+    Ok(expire_ms)
+}
+
 // ============================================================================
 // Health Check
 // ============================================================================
@@ -1321,14 +1359,10 @@ pub async fn add_order(
         ApiTimeInForce::Ioc => TimeInForce::Ioc,
         ApiTimeInForce::Fok => TimeInForce::Fok,
         ApiTimeInForce::Gtd => {
-            // Parse expire_at timestamp for GTD orders
-            let expire_ms = if let Some(expire_str) = &body.expire_at {
-                chrono::DateTime::parse_from_rfc3339(expire_str)
-                    .map(|dt| dt.timestamp_millis() as u64)
-                    .unwrap_or(0)
-            } else {
-                0 // Default to 0 if no expiration provided
-            };
+            // GTD orders require a valid future expire_at; reject missing/invalid
+            // timestamps instead of falling back to an already-expired Gtd(0).
+            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+            let expire_ms = parse_gtd_expire_at(body.expire_at.as_deref(), now_ms)?;
             TimeInForce::Gtd(expire_ms)
         }
     };
@@ -3032,6 +3066,201 @@ mod tests {
         // An 8-digit value is accepted without panicking. (It is consumed by the
         // numeric "days" branch first, since every 8-digit value fits in i32.)
         assert!(parse_expiration("20251231").is_ok());
+    }
+
+    #[test]
+    fn test_parse_gtd_expire_at_missing_is_rejected() {
+        // Issue #57: a GTD order with no expire_at must be rejected, not
+        // defaulted to an already-expired Gtd(0).
+        let err = parse_gtd_expire_at(None, 1_000).expect_err("missing expire_at must be rejected");
+        match err {
+            ApiError::InvalidRequest(msg) => assert!(msg.contains("GTD order requires expire_at")),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_gtd_expire_at_unparseable_is_rejected() {
+        let err = parse_gtd_expire_at(Some("not-a-timestamp"), 1_000)
+            .expect_err("unparseable expire_at must be rejected");
+        match err {
+            ApiError::InvalidRequest(msg) => assert!(msg.contains("not-a-timestamp")),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_gtd_expire_at_past_is_rejected() {
+        // 2020-01-01T00:00:00Z is in the past relative to `now_ms` here.
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let err = parse_gtd_expire_at(Some("2020-01-01T00:00:00Z"), now_ms)
+            .expect_err("past expire_at must be rejected");
+        match err {
+            ApiError::InvalidRequest(msg) => {
+                assert!(msg.contains("2020-01-01T00:00:00Z"));
+                assert!(msg.contains("expire immediately"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_gtd_expire_at_equal_to_now_is_rejected() {
+        // An expire_at exactly equal to now would expire immediately.
+        let expire_str = "2030-06-27T12:00:00Z";
+        let now_ms = chrono::DateTime::parse_from_rfc3339(expire_str)
+            .expect("fixture timestamp parses")
+            .timestamp_millis() as u64;
+        let err = parse_gtd_expire_at(Some(expire_str), now_ms)
+            .expect_err("expire_at == now must be rejected");
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn test_parse_gtd_expire_at_future_yields_expected_ms() {
+        let expire_str = "2099-01-01T00:00:00Z";
+        let expected_ms = chrono::DateTime::parse_from_rfc3339(expire_str)
+            .expect("fixture timestamp parses")
+            .timestamp_millis() as u64;
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let resolved =
+            parse_gtd_expire_at(Some(expire_str), now_ms).expect("future expire_at is valid");
+        assert_eq!(resolved, expected_ms);
+    }
+
+    #[tokio::test]
+    async fn test_add_order_gtd_without_expire_at_is_rejected() {
+        // Issue #57: GTD with no expire_at must be HTTP 400, not a dead Gtd(0).
+        let state = create_test_state();
+
+        let request = AddOrderRequest {
+            side: OrderSide::Buy,
+            price: 100,
+            quantity: 10,
+            time_in_force: Some(ApiTimeInForce::Gtd),
+            expire_at: None,
+        };
+
+        let err = add_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Json(request),
+        )
+        .await
+        .expect_err("GTD without expire_at must be rejected");
+
+        match err {
+            ApiError::InvalidRequest(msg) => assert!(msg.contains("GTD order requires expire_at")),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_order_gtd_with_past_expire_at_is_rejected() {
+        let state = create_test_state();
+
+        let request = AddOrderRequest {
+            side: OrderSide::Buy,
+            price: 100,
+            quantity: 10,
+            time_in_force: Some(ApiTimeInForce::Gtd),
+            expire_at: Some("2020-01-01T00:00:00Z".to_string()),
+        };
+
+        let err = add_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Json(request),
+        )
+        .await
+        .expect_err("GTD with past expire_at must be rejected");
+
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn test_add_order_gtd_with_valid_future_expire_at_is_accepted() {
+        let state = create_test_state();
+
+        let expire_str = "2099-01-01T00:00:00Z";
+        let expected_ms = chrono::DateTime::parse_from_rfc3339(expire_str)
+            .expect("fixture timestamp parses")
+            .timestamp_millis() as u64;
+
+        let request = AddOrderRequest {
+            side: OrderSide::Buy,
+            price: 100,
+            quantity: 10,
+            time_in_force: Some(ApiTimeInForce::Gtd),
+            expire_at: Some(expire_str.to_string()),
+        };
+
+        let response = add_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Json(request),
+        )
+        .await
+        .expect("GTD with a valid future expire_at must be accepted")
+        .0;
+
+        assert_eq!(response.status, LimitOrderStatus::Accepted);
+        assert_eq!(response.remaining_quantity, 10);
+        // The message embeds the upstream TimeInForce Display ("GTD-<ms>"),
+        // confirming the order was placed with the correct Gtd value.
+        assert!(
+            response.message.contains(&format!("GTD-{expected_ms}")),
+            "message did not contain the expected Gtd value: {}",
+            response.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_order_non_gtd_unaffected_by_expire_at() {
+        // A non-GTD order (GTC) is accepted regardless of expire_at; the GTD
+        // validation must not touch it.
+        let state = create_test_state();
+
+        let request = AddOrderRequest {
+            side: OrderSide::Buy,
+            price: 100,
+            quantity: 10,
+            time_in_force: Some(ApiTimeInForce::Gtc),
+            // Even an obviously-past expire_at is ignored for a GTC order.
+            expire_at: Some("2020-01-01T00:00:00Z".to_string()),
+        };
+
+        let response = add_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Json(request),
+        )
+        .await
+        .expect("GTC order must be accepted")
+        .0;
+
+        assert_eq!(response.status, LimitOrderStatus::Accepted);
+        assert!(response.message.contains("GTC"));
     }
 
     #[tokio::test]
