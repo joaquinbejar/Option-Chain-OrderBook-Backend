@@ -477,6 +477,47 @@ impl MarketMakerEngine {
         {
             let option_book = strike_book.get(style);
 
+            // Replace, don't accumulate: cancel this instrument's previously
+            // resting maker orders before placing the fresh quote. Without this
+            // every requote tick would add a new bid/ask pair while the prior
+            // pair kept resting, leaking stale quotes into the option book.
+            //
+            // Match the exact instrument (symbol, expiration, strike, style) so
+            // requoting a BTC 50000 Call never cancels its Put or another strike.
+            // Collect the stale ids under a short read lock, drop the lock, cancel
+            // each on the option book (never holding the lock across the cancel),
+            // then prune the tracking map under one short write lock.
+            let stale_ids: Vec<OrderId> = {
+                let orders = self.active_orders.read();
+                let mut ids = Vec::with_capacity(2);
+                for (id, (s, e, k, sty)) in orders.iter() {
+                    if s == symbol && e == exp_str && *k == strike && *sty == style {
+                        ids.push(*id);
+                    }
+                }
+                ids
+            };
+            if !stale_ids.is_empty() {
+                for &stale_id in &stale_ids {
+                    // Ok(true) = cancelled, Ok(false) = already filled/gone; both
+                    // mean the order should leave tracking. Delegate the actual
+                    // cancel to the upstream book.
+                    let _ = option_book.cancel_order(stale_id);
+                }
+                let mut orders = self.active_orders.write();
+                for stale_id in &stale_ids {
+                    orders.remove(stale_id);
+                }
+                debug!(
+                    symbol = %symbol,
+                    expiration = %exp_str,
+                    strike,
+                    style = ?style,
+                    cancelled = stale_ids.len(),
+                    "cancelled stale quote before requote"
+                );
+            }
+
             // Place bid order
             let bid_id = OrderId::new();
             if option_book
@@ -581,6 +622,18 @@ impl MarketMakerEngine {
             return Ok(ExpirationDate::DateTime(utc_datetime));
         }
 
+        // Try parsing the `ExpirationDate` `Display` form
+        // (`%Y-%m-%d %H:%M:%S UTC`). The requote loop keys instruments by
+        // `expiration.to_string()` and feeds that same string back here (and into
+        // `cancel_order`); without this branch a `DateTime` expiration could never
+        // round-trip, so `update_quote` would early-return and never place — or
+        // later cancel — any maker order. Parsing as a naive UTC datetime keeps
+        // the reparsed `ExpirationKey` identical to the originally stored one.
+        if let Ok(naive) = NaiveDateTime::parse_from_str(exp_str, "%Y-%m-%d %H:%M:%S UTC") {
+            let utc_datetime = Utc.from_utc_datetime(&naive);
+            return Ok(ExpirationDate::DateTime(utc_datetime));
+        }
+
         Err(())
     }
 }
@@ -591,6 +644,182 @@ mod tests {
 
     fn test_engine() -> MarketMakerEngine {
         MarketMakerEngine::new(Arc::new(UnderlyingOrderBookManager::new()), None)
+    }
+
+    /// A far-future absolute expiration whose `Display` form round-trips through
+    /// [`MarketMakerEngine::parse_expiration`] to the identical `ExpirationKey`,
+    /// so the requote loop can place (and later cancel) orders against it.
+    fn future_expiration() -> optionstratlib::ExpirationDate {
+        use chrono::{TimeZone, Utc};
+        let dt = Utc
+            .with_ymd_and_hms(2035, 12, 31, 16, 0, 0)
+            .single()
+            .expect("valid fixture datetime");
+        optionstratlib::ExpirationDate::DateTime(dt)
+    }
+
+    /// Collects the engine's tracked order ids for one exact instrument.
+    fn instrument_ids(
+        engine: &MarketMakerEngine,
+        symbol: &str,
+        strike: u64,
+        style: OptionStyle,
+    ) -> std::collections::HashSet<OrderId> {
+        engine
+            .active_orders
+            .read()
+            .iter()
+            .filter(|(_, (s, _, k, sty))| s == symbol && *k == strike && *sty == style)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_expiration_round_trips_datetime_display() {
+        // The requote loop keys instruments by `expiration.to_string()` and feeds
+        // that string back through `parse_expiration`. A `DateTime` expiration must
+        // round-trip, otherwise `update_quote` early-returns and never quotes.
+        let engine = test_engine();
+        let exp = future_expiration();
+        let reparsed = engine
+            .parse_expiration(&exp.to_string())
+            .expect("display form must round-trip");
+        // Same calendar instant => same expiration key the manager indexes on.
+        match (exp, reparsed) {
+            (
+                optionstratlib::ExpirationDate::DateTime(a),
+                optionstratlib::ExpirationDate::DateTime(b),
+            ) => assert_eq!(a, b),
+            other => panic!("expected two DateTime expirations, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_requote_does_not_accumulate_orders() {
+        // Acceptance criteria for issue #49: after N requotes for the same
+        // instrument the resting order count stays ~2 per instrument, not N*2.
+        let engine = test_engine();
+        let expiration = future_expiration();
+        let underlying = engine.manager.get_or_create("BTC");
+        let exp_book = underlying.get_or_create_expiration(expiration);
+        let strike_book = exp_book.get_or_create_strike(5_000_000); // $50,000 strike
+        let call_book = strike_book.get(OptionStyle::Call);
+        let put_book = strike_book.get(OptionStyle::Put);
+
+        // First tick places a bid+ask for the call and the put.
+        engine.update_price("BTC", 5_000_000);
+        assert_eq!(
+            call_book.active_order_count(),
+            2,
+            "first requote should place exactly bid+ask for the call"
+        );
+        assert_eq!(
+            put_book.active_order_count(),
+            2,
+            "first requote should place exactly bid+ask for the put"
+        );
+        assert_eq!(
+            engine.active_orders.read().len(),
+            4,
+            "two instruments * (bid+ask) = 4 tracked orders"
+        );
+
+        // Second tick must REPLACE the resting quote, not stack a new pair on top.
+        engine.update_price("BTC", 5_050_000);
+        assert_eq!(
+            call_book.active_order_count(),
+            2,
+            "requote must replace, not accumulate (call)"
+        );
+        assert_eq!(
+            put_book.active_order_count(),
+            2,
+            "requote must replace, not accumulate (put)"
+        );
+        assert_eq!(
+            engine.active_orders.read().len(),
+            4,
+            "tracking map must not grow per tick"
+        );
+
+        // Several more ticks: counts stay bounded, proving no per-tick leak.
+        for px in [4_900_000, 5_100_000, 5_025_000, 4_950_000] {
+            engine.update_price("BTC", px);
+        }
+        assert_eq!(call_book.active_order_count(), 2);
+        assert_eq!(put_book.active_order_count(), 2);
+        assert_eq!(engine.active_orders.read().len(), 4);
+    }
+
+    #[test]
+    fn test_requote_one_instrument_leaves_others_resting() {
+        // Per-instrument matching: requoting one contract must cancel only that
+        // contract's stale orders, never another strike's or the same strike's
+        // opposite style.
+        let engine = test_engine();
+        let expiration = future_expiration();
+        let exp_str = expiration.to_string();
+        let config = engine.get_config();
+
+        let underlying = engine.manager.get_or_create("ETH");
+        let exp_book = underlying.get_or_create_expiration(expiration);
+        let strike_a = exp_book.get_or_create_strike(300_000); // $3,000
+        let strike_b = exp_book.get_or_create_strike(400_000); // $4,000
+        let a_call = strike_a.get(OptionStyle::Call);
+        let a_put = strike_a.get(OptionStyle::Put);
+        let b_call = strike_b.get(OptionStyle::Call);
+
+        // Quote strike-A call, strike-A put, and strike-B call.
+        engine.update_quote(
+            "ETH",
+            &exp_str,
+            300_000,
+            OptionStyle::Call,
+            350_000,
+            &config,
+        );
+        engine.update_quote("ETH", &exp_str, 300_000, OptionStyle::Put, 350_000, &config);
+        engine.update_quote(
+            "ETH",
+            &exp_str,
+            400_000,
+            OptionStyle::Call,
+            350_000,
+            &config,
+        );
+        assert_eq!(a_call.active_order_count(), 2);
+        assert_eq!(a_put.active_order_count(), 2);
+        assert_eq!(b_call.active_order_count(), 2);
+
+        let a_put_before = instrument_ids(&engine, "ETH", 300_000, OptionStyle::Put);
+        let b_call_before = instrument_ids(&engine, "ETH", 400_000, OptionStyle::Call);
+        assert_eq!(a_put_before.len(), 2);
+        assert_eq!(b_call_before.len(), 2);
+
+        // Requote ONLY the strike-A call.
+        engine.update_quote(
+            "ETH",
+            &exp_str,
+            300_000,
+            OptionStyle::Call,
+            351_000,
+            &config,
+        );
+
+        // Strike-A call replaced (still 2); the others are untouched, same ids.
+        assert_eq!(a_call.active_order_count(), 2, "strike-A call replaced");
+        assert_eq!(a_put.active_order_count(), 2, "strike-A put untouched");
+        assert_eq!(b_call.active_order_count(), 2, "strike-B call untouched");
+        assert_eq!(
+            instrument_ids(&engine, "ETH", 300_000, OptionStyle::Put),
+            a_put_before,
+            "requoting the call must not disturb the same-strike put"
+        );
+        assert_eq!(
+            instrument_ids(&engine, "ETH", 400_000, OptionStyle::Call),
+            b_call_before,
+            "requoting strike A must not disturb strike B"
+        );
     }
 
     #[test]
