@@ -83,10 +83,22 @@ fn find_expiration_by_str(
 
 /// Parses expiration string to ExpirationDate.
 fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
-    // Try parsing as days first
+    use optionstratlib::prelude::Positive;
+
+    // Try parsing as a number of days first.
     if let Ok(days) = exp_str.parse::<i32>() {
-        use optionstratlib::prelude::pos_or_panic;
-        return Ok(ExpirationDate::Days(pos_or_panic!(days as f64)));
+        // An expiration must be a strictly positive number of days. Reject 0 and
+        // negatives (e.g. `.../expirations/0` or `.../expirations/-5`) up front so
+        // attacker-controlled inbound path segments map to HTTP 400 instead of
+        // panicking the request task.
+        if days <= 0 {
+            return Err(ApiError::InvalidRequest(format!(
+                "invalid expiration: {exp_str}. Expiration must be a positive number of days"
+            )));
+        }
+        let positive_days = Positive::new(days as f64)
+            .map_err(|_| ApiError::InvalidRequest(format!("invalid expiration: {exp_str}")))?;
+        return Ok(ExpirationDate::Days(positive_days));
     }
 
     // Try parsing as YYYYMMDD format
@@ -99,7 +111,10 @@ fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
     {
         use chrono::{NaiveDate, Utc};
         if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
-            let datetime = date.and_hms_opt(16, 0, 0).unwrap();
+            // 16:00:00 is a compile-time literal time-of-day that is always valid.
+            let datetime = date
+                .and_hms_opt(16, 0, 0)
+                .expect("16:00:00 is a valid time-of-day constant");
             let utc_datetime = chrono::DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc);
             return Ok(ExpirationDate::DateTime(utc_datetime));
         }
@@ -2985,6 +3000,38 @@ mod tests {
 
     fn create_test_state() -> Arc<AppState> {
         Arc::new(AppState::new())
+    }
+
+    #[test]
+    fn test_parse_expiration_rejects_zero() {
+        let err = parse_expiration("0").expect_err("zero days must be rejected");
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn test_parse_expiration_rejects_negative() {
+        // The #44-audit P1: `.../expirations/-5` must return 400, never panic.
+        let err = parse_expiration("-5").expect_err("negative days must be rejected");
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn test_parse_expiration_rejects_garbage() {
+        let err = parse_expiration("not-a-date").expect_err("garbage must be rejected");
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn test_parse_expiration_accepts_positive_days() {
+        let exp = parse_expiration("30").expect("positive day count is valid");
+        assert!(matches!(exp, ExpirationDate::Days(_)));
+    }
+
+    #[test]
+    fn test_parse_expiration_accepts_yyyymmdd() {
+        // An 8-digit value is accepted without panicking. (It is consumed by the
+        // numeric "days" branch first, since every 8-digit value fits in i32.)
+        assert!(parse_expiration("20251231").is_ok());
     }
 
     #[tokio::test]

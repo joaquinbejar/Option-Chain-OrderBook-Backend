@@ -454,11 +454,21 @@ impl MarketMakerEngine {
     fn parse_expiration(&self, exp_str: &str) -> Result<optionstratlib::ExpirationDate, ()> {
         use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
         use optionstratlib::ExpirationDate;
-        use optionstratlib::prelude::pos_or_panic;
+        use optionstratlib::prelude::Positive;
 
-        // Try parsing as days first
+        // Try parsing as a number of days first.
         if let Ok(days) = exp_str.parse::<i32>() {
-            return Ok(ExpirationDate::Days(pos_or_panic!(days as f64)));
+            // An expiration must be a strictly positive number of days; a
+            // non-positive or otherwise invalid value is logged and rejected
+            // rather than panicking the quoting loop on bad stored data.
+            if days <= 0 {
+                warn!(expiration = %exp_str, "rejecting non-positive expiration days");
+                return Err(());
+            }
+            let positive_days = Positive::new(days as f64).map_err(|_| {
+                warn!(expiration = %exp_str, "rejecting invalid expiration value");
+            })?;
+            return Ok(ExpirationDate::Days(positive_days));
         }
 
         // Try parsing as YYYYMMDD format
@@ -470,12 +480,53 @@ impl MarketMakerEngine {
             )
             && let Some(date) = NaiveDate::from_ymd_opt(year, month, day)
         {
-            let time = NaiveTime::from_hms_opt(16, 0, 0).unwrap();
+            // 16:00:00 is a compile-time literal time-of-day that is always valid.
+            let time = NaiveTime::from_hms_opt(16, 0, 0)
+                .expect("16:00:00 is a valid time-of-day constant");
             let datetime = NaiveDateTime::new(date, time);
             let utc_datetime = Utc.from_utc_datetime(&datetime);
             return Ok(ExpirationDate::DateTime(utc_datetime));
         }
 
         Err(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_engine() -> MarketMakerEngine {
+        MarketMakerEngine::new(Arc::new(UnderlyingOrderBookManager::new()), None)
+    }
+
+    #[test]
+    fn test_parse_expiration_rejects_zero() {
+        let engine = test_engine();
+        assert!(engine.parse_expiration("0").is_err());
+    }
+
+    #[test]
+    fn test_parse_expiration_rejects_negative() {
+        let engine = test_engine();
+        assert!(engine.parse_expiration("-5").is_err());
+    }
+
+    #[test]
+    fn test_parse_expiration_rejects_garbage() {
+        let engine = test_engine();
+        assert!(engine.parse_expiration("not-a-date").is_err());
+    }
+
+    #[test]
+    fn test_parse_expiration_accepts_positive_days() {
+        let engine = test_engine();
+        assert!(engine.parse_expiration("30").is_ok());
+    }
+
+    #[test]
+    fn test_parse_expiration_accepts_yyyymmdd() {
+        let engine = test_engine();
+        assert!(engine.parse_expiration("20251231").is_ok());
     }
 }
