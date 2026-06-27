@@ -101,8 +101,13 @@ fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
         return Ok(ExpirationDate::Days(positive_days));
     }
 
-    // Try parsing as YYYYMMDD format
+    // Try parsing as YYYYMMDD format. `len()` is a byte length, so the
+    // `is_ascii()` guard ensures every byte is a char boundary before slicing —
+    // an 8-byte multibyte path segment (e.g. `"12345é7"`) maps to the normal
+    // invalid-expiration error below instead of panicking the request task on a
+    // non-char-boundary slice.
     if exp_str.len() == 8
+        && exp_str.is_ascii()
         && let (Ok(year), Ok(month), Ok(day)) = (
             exp_str[0..4].parse::<i32>(),
             exp_str[4..6].parse::<u32>(),
@@ -3066,6 +3071,18 @@ mod tests {
         // An 8-digit value is accepted without panicking. (It is consumed by the
         // numeric "days" branch first, since every 8-digit value fits in i32.)
         assert!(parse_expiration("20251231").is_ok());
+    }
+
+    #[test]
+    fn test_parse_expiration_rejects_multibyte_eight_bytes() {
+        // `"12345é7"` is 8 bytes ('é' is 2 bytes) but does not parse as i32, so it
+        // reaches the YYYYMMDD branch where byte slicing at indices 4/6 would land
+        // mid-char and panic. This is request-reachable via an inbound path
+        // segment, so the char-safe guard must map it to a 400, never a panic.
+        let multibyte = "12345é7";
+        assert_eq!(multibyte.len(), 8, "fixture must be exactly 8 bytes");
+        let err = parse_expiration(multibyte).expect_err("multibyte 8-byte input must be rejected");
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
     }
 
     #[test]

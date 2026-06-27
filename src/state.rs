@@ -188,7 +188,10 @@ impl AppState {
 
     /// Parses an expiration string (YYYYMMDD) into ExpirationDate.
     fn parse_expiration(exp_str: &str) -> Option<ExpirationDate> {
-        if exp_str.len() != 8 {
+        // `len()` is a byte length, so the `is_ascii()` guard ensures every byte
+        // is a char boundary before slicing — an 8-byte multibyte string (e.g.
+        // `"12345é7"`) returns `None` instead of panicking on a non-boundary slice.
+        if exp_str.len() != 8 || !exp_str.is_ascii() {
             return None;
         }
 
@@ -265,6 +268,22 @@ impl Default for AppState {
 mod tests {
     use super::*;
     use crate::models::{OrderSide, OrderStatus, OrderTimeInForce};
+
+    #[test]
+    fn test_parse_expiration_accepts_yyyymmdd() {
+        let exp = AppState::parse_expiration("20251231").expect("valid YYYYMMDD must parse");
+        assert!(matches!(exp, ExpirationDate::DateTime(_)));
+    }
+
+    #[test]
+    fn test_parse_expiration_rejects_multibyte_eight_bytes() {
+        // `"12345é7"` is 8 bytes ('é' is 2 bytes) but not on char boundaries at
+        // indices 4/6. Byte slicing would panic; the char-safe guard must return
+        // `None` instead of panicking.
+        let multibyte = "12345é7";
+        assert_eq!(multibyte.len(), 8, "fixture must be exactly 8 bytes");
+        assert!(AppState::parse_expiration(multibyte).is_none());
+    }
 
     #[test]
     fn test_cleanup_old_orders() {

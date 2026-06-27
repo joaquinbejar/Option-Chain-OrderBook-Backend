@@ -560,8 +560,12 @@ impl MarketMakerEngine {
             return Ok(ExpirationDate::Days(positive_days));
         }
 
-        // Try parsing as YYYYMMDD format
+        // Try parsing as YYYYMMDD format. `len()` is a byte length, so the
+        // `is_ascii()` guard ensures every byte is a char boundary before
+        // slicing — an 8-byte multibyte string (e.g. `"12345é7"`) returns
+        // `Err(())` instead of panicking the requote loop on a non-boundary slice.
         if exp_str.len() == 8
+            && exp_str.is_ascii()
             && let (Ok(year), Ok(month), Ok(day)) = (
                 exp_str[0..4].parse::<i32>(),
                 exp_str[4..6].parse::<u32>(),
@@ -617,6 +621,18 @@ mod tests {
     fn test_parse_expiration_accepts_yyyymmdd() {
         let engine = test_engine();
         assert!(engine.parse_expiration("20251231").is_ok());
+    }
+
+    #[test]
+    fn test_parse_expiration_rejects_multibyte_eight_bytes() {
+        // `"12345é7"` is 8 bytes ('é' is 2 bytes) but does not parse as i32, so it
+        // reaches the YYYYMMDD branch where byte slicing at indices 4/6 would land
+        // mid-char and panic the requote loop. The char-safe guard must return
+        // `Err(())` instead.
+        let engine = test_engine();
+        let multibyte = "12345é7";
+        assert_eq!(multibyte.len(), 8, "fixture must be exactly 8 bytes");
+        assert!(engine.parse_expiration(multibyte).is_err());
     }
 
     // ------------------------------------------------------------------------
