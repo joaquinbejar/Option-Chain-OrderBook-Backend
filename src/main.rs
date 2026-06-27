@@ -2,6 +2,7 @@
 //!
 //! REST API server for interacting with the Option Chain OrderBook library.
 
+use anyhow::Context;
 use option_chain_orderbook_backend::api::{build_cors_layer, create_router};
 use option_chain_orderbook_backend::auth::JwtAuth;
 use option_chain_orderbook_backend::config::{
@@ -316,8 +317,8 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             std::env::var("PORT")
                 .unwrap_or_else(|_| "8080".to_string())
-                .parse()
-                .expect("PORT must be a valid number"),
+                .parse::<u16>()
+                .context("PORT must be a valid u16 (1-65535)")?,
         )
     };
 
