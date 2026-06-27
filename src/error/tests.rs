@@ -172,6 +172,32 @@ fn test_api_error_not_found_into_response() {
 }
 
 #[test]
+fn test_api_error_unauthorized_into_response() {
+    let error = ApiError::Unauthorized("missing token".to_string());
+    let response = error.into_response();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn test_api_error_forbidden_into_response() {
+    let error = ApiError::Forbidden("requires admin".to_string());
+    let response = error.into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn test_api_error_unauthorized_display() {
+    let error = ApiError::Unauthorized("missing token".to_string());
+    assert_eq!(format!("{}", error), "Unauthorized: missing token");
+}
+
+#[test]
+fn test_api_error_forbidden_display() {
+    let error = ApiError::Forbidden("requires admin".to_string());
+    assert_eq!(format!("{}", error), "Forbidden: requires admin");
+}
+
+#[test]
 fn test_api_error_rate_limit_exceeded_into_response() {
     let error = ApiError::RateLimitExceeded {
         limit: 100,

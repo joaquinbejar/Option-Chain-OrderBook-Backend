@@ -407,21 +407,41 @@ fn test_permission_deserialization() {
 }
 
 // ============================================================================
-// CreateApiKeyRequest Tests
+// Token Tests
 // ============================================================================
 
 #[test]
-fn test_create_api_key_request_serialization() {
-    let request = CreateApiKeyRequest {
-        name: "test-key".to_string(),
+fn test_token_request_serialization() {
+    let request = TokenRequest {
+        secret: "bootstrap".to_string(),
         permissions: vec![Permission::Read, Permission::Trade],
-        rate_limit: 500,
+        ttl_secs: Some(3600),
     };
 
     let json = serde_json::to_string(&request).unwrap();
-    assert!(json.contains("\"name\":\"test-key\""));
+    assert!(json.contains("\"secret\":\"bootstrap\""));
     assert!(json.contains("\"permissions\":[\"read\",\"trade\"]"));
-    assert!(json.contains("\"rate_limit\":500"));
+    assert!(json.contains("\"ttl_secs\":3600"));
+}
+
+#[test]
+fn test_token_request_skips_none_ttl() {
+    let request = TokenRequest {
+        secret: "bootstrap".to_string(),
+        permissions: vec![Permission::Admin],
+        ttl_secs: None,
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(!json.contains("ttl_secs"));
+}
+
+#[test]
+fn test_token_response_deserialization() {
+    let json = r#"{"token":"abc.def.ghi","expires_at":"2026-06-27T18:00:00+00:00"}"#;
+    let response: TokenResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(response.token, "abc.def.ghi");
+    assert_eq!(response.expires_at, "2026-06-27T18:00:00+00:00");
 }
 
 // ============================================================================

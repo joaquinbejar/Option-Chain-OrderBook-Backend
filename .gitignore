@@ -29,3 +29,10 @@ src/.DS_Store
 .secrets
 /Option-Chain-OrderBook.code-workspace
 /coverage/
+
+# Production auth key material (the DEV fixtures under tests/fixtures/ are
+# intentionally committed; real private keys / certs must NOT be).
+/keys/
+/secrets/
+*.key
+/Docker/prod-keys/

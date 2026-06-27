@@ -69,6 +69,14 @@ pub enum ApiError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// Authentication failed (missing, malformed, or expired token).
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
+    /// The authenticated caller lacks the required permission.
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     /// Rate limit exceeded.
     #[error("Rate limit exceeded")]
     RateLimitExceeded {
@@ -127,6 +135,8 @@ impl IntoResponse for ApiError {
                     ApiError::OrderBook(_) => (StatusCode::BAD_REQUEST, "ORDERBOOK_ERROR"),
                     ApiError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
                     ApiError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+                    ApiError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED"),
+                    ApiError::Forbidden(_) => (StatusCode::FORBIDDEN, "FORBIDDEN"),
                     ApiError::RateLimitExceeded { .. } => unreachable!(),
                 };
 

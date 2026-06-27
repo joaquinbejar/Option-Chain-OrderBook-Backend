@@ -14,7 +14,9 @@
 //!     let client = OrderbookClient::new(ClientConfig {
 //!         base_url: "http://localhost:8080".into(),
 //!         timeout: Duration::from_secs(30),
-//!     });
+//!         // A JWT bearer token; required for every endpoint except `/health`.
+//!         token: Some("eyJhbGciOi...".into()),
+//!     })?;
 //!
 //!     // Check health
 //!     let health = client.health_check().await?;
@@ -32,4 +34,4 @@ mod websocket;
 pub use client::{ClientConfig, OrderbookClient};
 pub use error::Error;
 pub use types::*;
-pub use websocket::{WsClient, WsMessage};
+pub use websocket::{ClientCommand, WsClient, WsMessage};

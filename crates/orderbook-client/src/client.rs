@@ -3,6 +3,7 @@
 use crate::error::Error;
 use crate::types::*;
 use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -15,6 +16,10 @@ pub struct ClientConfig {
     pub base_url: String,
     /// Request timeout.
     pub timeout: Duration,
+    /// Optional JWT bearer token. When set, it is sent as
+    /// `Authorization: Bearer <token>` on REST requests and appended as
+    /// `?token=<token>` on the WebSocket URL.
+    pub token: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -22,6 +27,7 @@ impl Default for ClientConfig {
         Self {
             base_url: "http://localhost:8080".to_string(),
             timeout: Duration::from_secs(30),
+            token: None,
         }
     }
 }
@@ -31,19 +37,33 @@ impl Default for ClientConfig {
 pub struct OrderbookClient {
     client: Client,
     base_url: String,
+    token: Option<String>,
 }
 
 impl OrderbookClient {
     /// Creates a new client with the given configuration.
     ///
+    /// When `config.token` is set, every REST request carries an
+    /// `Authorization: Bearer` header.
+    ///
     /// # Errors
-    /// Returns error if the HTTP client cannot be built.
+    /// Returns error if the HTTP client cannot be built (including an invalid
+    /// bearer token that cannot be encoded as a header value).
     pub fn new(config: ClientConfig) -> Result<Self, Error> {
-        let client = Client::builder().timeout(config.timeout).build()?;
+        let mut builder = Client::builder().timeout(config.timeout);
+        if let Some(token) = &config.token {
+            let mut headers = HeaderMap::new();
+            let value = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| Error::InvalidRequest("invalid bearer token".to_string()))?;
+            headers.insert(AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+        let client = builder.build()?;
 
         Ok(Self {
             client,
             base_url: config.base_url.trim_end_matches('/').to_string(),
+            token: config.token,
         })
     }
 
@@ -54,6 +74,18 @@ impl OrderbookClient {
     pub fn with_base_url(base_url: &str) -> Result<Self, Error> {
         Self::new(ClientConfig {
             base_url: base_url.to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// Creates a new client for `base_url` carrying the given JWT bearer token.
+    ///
+    /// # Errors
+    /// Returns error if the HTTP client cannot be built.
+    pub fn with_token(base_url: &str, token: &str) -> Result<Self, Error> {
+        Self::new(ClientConfig {
+            base_url: base_url.to_string(),
+            token: Some(token.to_string()),
             ..Default::default()
         })
     }
@@ -460,36 +492,16 @@ impl OrderbookClient {
     // Authentication
     // ========================================================================
 
-    /// Creates a new API key.
+    /// Issues a signed JWT via `POST /api/v1/auth/token`.
+    ///
+    /// Requires the operator bootstrap secret in `request.secret`. This call does
+    /// not require an existing token.
     ///
     /// # Errors
-    /// Returns error if the request fails.
-    pub async fn create_api_key(
-        &self,
-        request: &CreateApiKeyRequest,
-    ) -> Result<CreateApiKeyResponse, Error> {
-        let url = format!("{}/api/v1/auth/keys", self.base_url);
+    /// Returns error if the request fails or the server rejects the secret.
+    pub async fn issue_token(&self, request: &TokenRequest) -> Result<TokenResponse, Error> {
+        let url = format!("{}/api/v1/auth/token", self.base_url);
         let resp = self.client.post(&url).json(request).send().await?;
-        self.handle_response(resp).await
-    }
-
-    /// Lists all API keys.
-    ///
-    /// # Errors
-    /// Returns error if the request fails.
-    pub async fn list_api_keys(&self) -> Result<ApiKeyListResponse, Error> {
-        let url = format!("{}/api/v1/auth/keys", self.base_url);
-        let resp = self.client.get(&url).send().await?;
-        self.handle_response(resp).await
-    }
-
-    /// Deletes an API key.
-    ///
-    /// # Errors
-    /// Returns error if the request fails.
-    pub async fn delete_api_key(&self, key_id: &str) -> Result<DeleteApiKeyResponse, Error> {
-        let url = format!("{}/api/v1/auth/keys/{}", self.base_url, key_id);
-        let resp = self.client.delete(&url).send().await?;
         self.handle_response(resp).await
     }
 
@@ -835,13 +847,19 @@ impl OrderbookClient {
     // ========================================================================
 
     /// Returns the WebSocket URL for this client.
+    ///
+    /// When the client carries a JWT, it is appended as `?token=<jwt>` so the
+    /// browser-style upgrade authenticates.
     #[must_use]
     pub fn ws_url(&self) -> String {
         let ws_base = self
             .base_url
             .replace("http://", "ws://")
             .replace("https://", "wss://");
-        format!("{}/ws", ws_base)
+        match &self.token {
+            Some(token) => format!("{ws_base}/ws?token={token}"),
+            None => format!("{ws_base}/ws"),
+        }
     }
 
     // ========================================================================

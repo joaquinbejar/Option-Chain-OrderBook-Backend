@@ -5,6 +5,16 @@
 host = "0.0.0.0"
 port = 8080
 
+# Authentication (JWT signed with an x509 key pair).
+# The AUTH_* environment variables override these values. For local dev the
+# built-in fixtures under tests/fixtures/ are used. In production set the paths
+# to your real (gitignored) key/cert and provide AUTH_BOOTSTRAP_SECRET via env.
+[auth]
+private_key_path = "tests/fixtures/dev-private-key.pem"
+cert_path = "tests/fixtures/dev-cert.pem"
+issuer = "option-chain-orderbook-backend"
+default_ttl_secs = 3600
+
 # Price simulation settings
 [simulation]
 # Enable price simulation (generates random price movements)

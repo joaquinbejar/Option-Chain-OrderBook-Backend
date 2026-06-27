@@ -2,11 +2,10 @@
 
 use crate::error::ApiError;
 use crate::models::{
-    ATMTermStructurePoint, AddOrderRequest, AddOrderResponse, ApiKeyListResponse, ApiTimeInForce,
-    BulkCancelRequest, BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest,
-    BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus, CancelAllQuery, CancelAllResponse,
-    CancelOrderResponse, ChainQuery, ChainStrikeRow, CreateApiKeyRequest, CreateApiKeyResponse,
-    CreateSnapshotResponse, DeleteApiKeyResponse, DepthMetrics, EnrichedSnapshotResponse,
+    ATMTermStructurePoint, AddOrderRequest, AddOrderResponse, ApiTimeInForce, BulkCancelRequest,
+    BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
+    BulkOrderResultItem, BulkOrderStatus, CancelAllQuery, CancelAllResponse, CancelOrderResponse,
+    ChainQuery, ChainStrikeRow, CreateSnapshotResponse, DepthMetrics, EnrichedSnapshotResponse,
     ExecutionInfo, ExecutionSummary, ExecutionsListResponse, ExecutionsQuery, ExpirationSummary,
     ExpirationsListResponse, FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse,
     HealthResponse, ImpactMetrics, LastTradeResponse, LimitOrderStatus, MarketImpactMetrics,
@@ -18,7 +17,8 @@ use crate::models::{
     PositionSummary, PositionsListResponse, PriceLevelInfo, PriceMetrics, QuoteResponse,
     RestoreSnapshotResponse, SnapshotDepth, SnapshotQuery, SnapshotStats, SnapshotSummary,
     SnapshotsListResponse, SpreadMetrics, StrikeIV, StrikeSummary, StrikesListResponse,
-    UnderlyingSummary, UnderlyingsListResponse, VolatilitySurfaceResponse,
+    TokenRequest, TokenResponse, UnderlyingSummary, UnderlyingsListResponse,
+    VolatilitySurfaceResponse,
 };
 use crate::state::AppState;
 use axum::Json;
@@ -132,82 +132,80 @@ pub async fn health_check() -> Json<HealthResponse> {
 }
 
 // ============================================================================
-// Authentication and API Key Management
+// Authentication (JWT issuance)
 // ============================================================================
 
-/// Create a new API key.
+/// Issue a signed JWT.
 ///
-/// Creates a new API key with the specified name, permissions, and rate limit.
-/// The raw API key is only returned once and should be stored securely.
+/// Mints a JWT carrying the requested permissions, gated by the operator
+/// bootstrap secret (`AUTH_BOOTSTRAP_SECRET`). This is the only unauthenticated
+/// mutating route besides `/health`; it is rate-limited per client IP. When no
+/// bootstrap secret is configured, issuance is disabled and tokens must be minted
+/// out-of-band via the `mint-token` CLI subcommand.
+///
+/// # Errors
+/// Returns [`ApiError::Forbidden`] when issuance is disabled,
+/// [`ApiError::Unauthorized`] when the bootstrap secret is wrong,
+/// [`ApiError::InvalidRequest`] when no permissions are requested, or
+/// [`ApiError::Internal`] when signing fails. The bootstrap secret and the
+/// minted token are never logged.
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/keys",
-    request_body = CreateApiKeyRequest,
+    path = "/api/v1/auth/token",
+    request_body = TokenRequest,
     responses(
-        (status = 200, description = "API key created", body = CreateApiKeyResponse)
+        (status = 200, description = "Token issued", body = TokenResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Invalid bootstrap secret"),
+        (status = 403, description = "Token issuance disabled"),
+        (status = 429, description = "Rate limit exceeded")
     ),
     tag = "Authentication"
 )]
-pub async fn create_api_key(
+pub async fn issue_token(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<CreateApiKeyRequest>,
-) -> Json<CreateApiKeyResponse> {
-    let (key_id, raw_key) = state.api_key_store.create_key(
-        request.name.clone(),
-        request.permissions.clone(),
-        request.rate_limit,
+    Json(request): Json<TokenRequest>,
+) -> Result<Json<TokenResponse>, ApiError> {
+    // Issuance is enabled only when an operator bootstrap secret is configured.
+    let Some(expected) = state.bootstrap_secret.as_deref() else {
+        return Err(ApiError::Forbidden(
+            "token issuance is disabled".to_string(),
+        ));
+    };
+
+    // Constant-time comparison of the supplied secret against the configured one
+    // (server secret first, so timing depends only on its fixed length).
+    if !crate::auth::constant_time_eq(expected.as_bytes(), request.secret.as_bytes()) {
+        tracing::warn!("token issuance attempt with an invalid bootstrap secret");
+        return Err(ApiError::Unauthorized(
+            "invalid bootstrap secret".to_string(),
+        ));
+    }
+
+    if request.permissions.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "permissions must not be empty".to_string(),
+        ));
+    }
+
+    let ttl_secs = request
+        .ttl_secs
+        .unwrap_or_else(|| state.auth.default_ttl_secs());
+    let (token, exp_secs) = state
+        .auth
+        .mint_token(request.permissions.clone(), ttl_secs)?;
+
+    let expires_at = chrono::DateTime::<chrono::Utc>::from_timestamp(exp_secs as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .ok_or_else(|| ApiError::Internal("failed to format token expiry".to_string()))?;
+
+    tracing::info!(
+        permissions = ?request.permissions,
+        ttl_secs,
+        "issued JWT"
     );
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    Json(CreateApiKeyResponse {
-        key_id,
-        api_key: raw_key,
-        name: request.name,
-        permissions: request.permissions,
-        created_at: now,
-    })
-}
-
-/// List all API keys.
-///
-/// Returns a list of all API keys without the raw key values.
-#[utoipa::path(
-    get,
-    path = "/api/v1/auth/keys",
-    responses(
-        (status = 200, description = "List of API keys", body = ApiKeyListResponse)
-    ),
-    tag = "Authentication"
-)]
-pub async fn list_api_keys(State(state): State<Arc<AppState>>) -> Json<ApiKeyListResponse> {
-    let keys = state.api_key_store.list_keys();
-    Json(ApiKeyListResponse { keys })
-}
-
-/// Delete an API key.
-///
-/// Deletes an API key by its ID. Returns success status.
-#[utoipa::path(
-    delete,
-    path = "/api/v1/auth/keys/{key_id}",
-    params(
-        ("key_id" = String, Path, description = "API key ID to delete")
-    ),
-    responses(
-        (status = 200, description = "API key deleted", body = DeleteApiKeyResponse)
-    ),
-    tag = "Authentication"
-)]
-pub async fn delete_api_key(
-    State(state): State<Arc<AppState>>,
-    Path(key_id): Path<String>,
-) -> Json<DeleteApiKeyResponse> {
-    let success = state.api_key_store.delete_key(&key_id);
-    Json(DeleteApiKeyResponse { success })
+    Ok(Json(TokenResponse { token, expires_at }))
 }
 
 // ============================================================================
@@ -5452,133 +5450,95 @@ mod tests {
         assert_eq!(admin, Permission::Admin);
     }
 
-    #[test]
-    fn test_create_api_key_request_deserialization() {
-        use crate::models::{CreateApiKeyRequest, Permission};
+    #[tokio::test]
+    async fn test_issue_token_disabled_when_no_bootstrap_secret() {
+        use crate::models::{Permission, TokenRequest};
 
-        let json = r#"{"name": "Test Key", "permissions": ["read", "trade"], "rate_limit": 500}"#;
-        let request: CreateApiKeyRequest = serde_json::from_str(json).unwrap();
+        let state = create_test_state();
+        // No bootstrap secret configured by default.
+        let result = issue_token(
+            State(state.clone()),
+            Json(TokenRequest {
+                secret: "anything".to_string(),
+                permissions: vec![Permission::Read],
+                ttl_secs: None,
+            }),
+        )
+        .await;
 
-        assert_eq!(request.name, "Test Key");
-        assert_eq!(request.permissions.len(), 2);
-        assert!(request.permissions.contains(&Permission::Read));
-        assert!(request.permissions.contains(&Permission::Trade));
-        assert_eq!(request.rate_limit, 500);
-    }
-
-    #[test]
-    fn test_create_api_key_request_default_rate_limit() {
-        use crate::models::CreateApiKeyRequest;
-
-        let json = r#"{"name": "Test Key", "permissions": ["read"]}"#;
-        let request: CreateApiKeyRequest = serde_json::from_str(json).unwrap();
-
-        assert_eq!(request.rate_limit, 1000); // Default value
-    }
-
-    #[test]
-    fn test_api_key_info_serialization() {
-        use crate::models::{ApiKeyInfo, Permission};
-
-        let info = ApiKeyInfo {
-            key_id: "test-id".to_string(),
-            name: "Test Key".to_string(),
-            permissions: vec![Permission::Read],
-            rate_limit: 1000,
-            created_at: 1709123456789,
-            last_used_at: Some(1709123456800),
-        };
-
-        let json = serde_json::to_string(&info).unwrap();
-        assert!(json.contains("\"key_id\":\"test-id\""));
-        assert!(json.contains("\"name\":\"Test Key\""));
-        assert!(json.contains("\"permissions\":[\"read\"]"));
-        assert!(json.contains("\"rate_limit\":1000"));
-        assert!(json.contains("\"last_used_at\":1709123456800"));
-    }
-
-    #[test]
-    fn test_api_key_info_skip_none_last_used() {
-        use crate::models::{ApiKeyInfo, Permission};
-
-        let info = ApiKeyInfo {
-            key_id: "test-id".to_string(),
-            name: "Test Key".to_string(),
-            permissions: vec![Permission::Read],
-            rate_limit: 1000,
-            created_at: 1709123456789,
-            last_used_at: None,
-        };
-
-        let json = serde_json::to_string(&info).unwrap();
-        assert!(!json.contains("last_used_at"));
+        assert!(matches!(result, Err(ApiError::Forbidden(_))));
     }
 
     #[tokio::test]
-    async fn test_create_api_key_handler() {
-        use crate::models::{CreateApiKeyRequest, Permission};
+    async fn test_issue_token_rejects_wrong_secret() {
+        use crate::models::{Permission, TokenRequest};
 
-        let state = create_test_state();
+        let mut state = (*create_test_state()).clone();
+        state.bootstrap_secret = Some("correct-secret".to_string());
+        let state = Arc::new(state);
 
-        let request = CreateApiKeyRequest {
-            name: "Test Trading Bot".to_string(),
-            permissions: vec![Permission::Read, Permission::Trade],
-            rate_limit: 500,
-        };
+        let result = issue_token(
+            State(state),
+            Json(TokenRequest {
+                secret: "wrong-secret".to_string(),
+                permissions: vec![Permission::Read],
+                ttl_secs: None,
+            }),
+        )
+        .await;
 
-        let response = create_api_key(State(state.clone()), Json(request)).await;
-
-        assert!(!response.key_id.is_empty());
-        assert!(response.api_key.starts_with("sk_live_"));
-        assert_eq!(response.name, "Test Trading Bot");
-        assert_eq!(response.permissions.len(), 2);
+        assert!(matches!(result, Err(ApiError::Unauthorized(_))));
     }
 
     #[tokio::test]
-    async fn test_list_api_keys_handler() {
-        use crate::models::Permission;
+    async fn test_issue_token_success() {
+        use crate::models::{Permission, TokenRequest};
 
-        let state = create_test_state();
+        let mut state = (*create_test_state()).clone();
+        state.bootstrap_secret = Some("correct-secret".to_string());
+        let auth = Arc::clone(&state.auth);
+        let state = Arc::new(state);
 
-        // Create some keys
-        state
-            .api_key_store
-            .create_key("Key 1".to_string(), vec![Permission::Read], 1000);
-        state
-            .api_key_store
-            .create_key("Key 2".to_string(), vec![Permission::Trade], 500);
+        let response = issue_token(
+            State(state),
+            Json(TokenRequest {
+                secret: "correct-secret".to_string(),
+                permissions: vec![Permission::Read, Permission::Trade],
+                ttl_secs: Some(120),
+            }),
+        )
+        .await
+        .expect("token issued");
 
-        let response = list_api_keys(State(state.clone())).await;
+        assert!(!response.token.is_empty());
+        assert!(!response.expires_at.is_empty());
 
-        assert_eq!(response.keys.len(), 2);
+        // The minted token must verify and carry the requested permissions.
+        let claims = auth.verify_token(&response.token).expect("verify");
+        assert!(claims.has_permission(Permission::Read));
+        assert!(claims.has_permission(Permission::Trade));
+        assert!(!claims.has_permission(Permission::Admin));
     }
 
     #[tokio::test]
-    async fn test_delete_api_key_handler() {
-        use crate::models::Permission;
+    async fn test_issue_token_rejects_empty_permissions() {
+        use crate::models::TokenRequest;
 
-        let state = create_test_state();
+        let mut state = (*create_test_state()).clone();
+        state.bootstrap_secret = Some("correct-secret".to_string());
+        let state = Arc::new(state);
 
-        let (key_id, _) =
-            state
-                .api_key_store
-                .create_key("To Delete".to_string(), vec![Permission::Read], 1000);
+        let result = issue_token(
+            State(state),
+            Json(TokenRequest {
+                secret: "correct-secret".to_string(),
+                permissions: vec![],
+                ttl_secs: None,
+            }),
+        )
+        .await;
 
-        // Delete the key
-        let response = delete_api_key(State(state.clone()), Path(key_id.clone())).await;
-        assert!(response.success);
-
-        // Try to delete again - should fail
-        let response2 = delete_api_key(State(state.clone()), Path(key_id)).await;
-        assert!(!response2.success);
-    }
-
-    #[tokio::test]
-    async fn test_delete_api_key_not_found() {
-        let state = create_test_state();
-
-        let response = delete_api_key(State(state.clone()), Path("nonexistent".to_string())).await;
-        assert!(!response.success);
+        assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
     }
 
     // ========================================================================
