@@ -122,26 +122,68 @@ impl IntoResponse for ApiError {
                     .into_response()
             }
             _ => {
-                let (status, code) = match &self {
-                    ApiError::UnderlyingNotFound(_) => {
-                        (StatusCode::NOT_FOUND, "UNDERLYING_NOT_FOUND")
+                // For 5xx variants (`Internal`, `Database`) the inner string is
+                // built from lower-level / sqlx errors that can carry host,
+                // database, table, column, or constraint names. We log the full
+                // detail server-side at ERROR and return a FIXED, generic body so
+                // no internal detail ever reaches the client. The 4xx variants
+                // carry safe, useful domain values and keep their detailed body.
+                let (status, code, error) = match &self {
+                    ApiError::UnderlyingNotFound(_) => (
+                        StatusCode::NOT_FOUND,
+                        "UNDERLYING_NOT_FOUND",
+                        self.to_string(),
+                    ),
+                    ApiError::ExpirationNotFound(_) => (
+                        StatusCode::NOT_FOUND,
+                        "EXPIRATION_NOT_FOUND",
+                        self.to_string(),
+                    ),
+                    ApiError::StrikeNotFound(_) => {
+                        (StatusCode::NOT_FOUND, "STRIKE_NOT_FOUND", self.to_string())
                     }
-                    ApiError::ExpirationNotFound(_) => {
-                        (StatusCode::NOT_FOUND, "EXPIRATION_NOT_FOUND")
+                    ApiError::InvalidRequest(_) => {
+                        (StatusCode::BAD_REQUEST, "INVALID_REQUEST", self.to_string())
                     }
-                    ApiError::StrikeNotFound(_) => (StatusCode::NOT_FOUND, "STRIKE_NOT_FOUND"),
-                    ApiError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "INVALID_REQUEST"),
-                    ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
-                    ApiError::OrderBook(_) => (StatusCode::BAD_REQUEST, "ORDERBOOK_ERROR"),
-                    ApiError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
-                    ApiError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
-                    ApiError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED"),
-                    ApiError::Forbidden(_) => (StatusCode::FORBIDDEN, "FORBIDDEN"),
+                    ApiError::OrderBook(_) => {
+                        (StatusCode::BAD_REQUEST, "ORDERBOOK_ERROR", self.to_string())
+                    }
+                    ApiError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND", self.to_string()),
+                    ApiError::Unauthorized(_) => {
+                        (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", self.to_string())
+                    }
+                    ApiError::Forbidden(_) => {
+                        (StatusCode::FORBIDDEN, "FORBIDDEN", self.to_string())
+                    }
+                    ApiError::Internal(_) => {
+                        tracing::error!(
+                            code = "INTERNAL_ERROR",
+                            detail = %self,
+                            "internal server error"
+                        );
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "INTERNAL_ERROR",
+                            "internal server error".to_string(),
+                        )
+                    }
+                    ApiError::Database(_) => {
+                        tracing::error!(
+                            code = "DATABASE_ERROR",
+                            detail = %self,
+                            "database error"
+                        );
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "DATABASE_ERROR",
+                            "database error".to_string(),
+                        )
+                    }
                     ApiError::RateLimitExceeded { .. } => unreachable!(),
                 };
 
                 let body = Json(ErrorResponse {
-                    error: self.to_string(),
+                    error,
                     code: code.to_string(),
                 });
 

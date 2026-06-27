@@ -143,11 +143,30 @@ fn test_api_error_invalid_request_into_response() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-#[test]
-fn test_api_error_internal_into_response() {
-    let error = ApiError::Internal("Server error".to_string());
+/// Reads the full response body into a UTF-8 string for assertions.
+async fn body_to_string(response: Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should be readable");
+    String::from_utf8(bytes.to_vec()).expect("response body should be valid UTF-8")
+}
+
+#[tokio::test]
+async fn test_api_error_internal_into_response() {
+    // The inner detail must NOT leak into the client body; the response is a
+    // fixed, generic message and a 500 status.
+    let detail = "connection to host db.internal failed";
+    let error = ApiError::Internal(detail.to_string());
     let response = error.into_response();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body = body_to_string(response).await;
+    assert!(body.contains("\"error\":\"internal server error\""));
+    assert!(body.contains("\"code\":\"INTERNAL_ERROR\""));
+    assert!(
+        !body.contains(detail),
+        "5xx body must not echo the inner detail: {body}"
+    );
 }
 
 #[test]
@@ -157,11 +176,68 @@ fn test_api_error_orderbook_into_response() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-#[test]
-fn test_api_error_database_into_response() {
-    let error = ApiError::Database("DB error".to_string());
+#[tokio::test]
+async fn test_api_error_database_into_response() {
+    // The inner sqlx detail must NOT leak into the client body; the response is
+    // a fixed, generic message and a 500 status.
+    let detail = "error returned from database: column accounts.secret does not exist";
+    let error = ApiError::Database(detail.to_string());
     let response = error.into_response();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body = body_to_string(response).await;
+    assert!(body.contains("\"error\":\"database error\""));
+    assert!(body.contains("\"code\":\"DATABASE_ERROR\""));
+    assert!(
+        !body.contains(detail),
+        "5xx body must not echo the inner detail: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_database_error_does_not_leak_sensitive_detail() {
+    // A realistic sqlx error string carrying a table/column name and host detail
+    // must never appear in the response body sent to the client.
+    let sensitive =
+        "error returned from database: relation \"users_api_keys\" host=10.0.0.5 dbname=prod";
+    let error = ApiError::Database(sensitive.to_string());
+    let response = error.into_response();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body = body_to_string(response).await;
+    assert!(
+        !body.contains("users_api_keys"),
+        "table name leaked into body: {body}"
+    );
+    assert!(!body.contains("10.0.0.5"), "host leaked into body: {body}");
+    assert!(
+        !body.contains("dbname=prod"),
+        "dbname leaked into body: {body}"
+    );
+    assert_eq!(
+        body,
+        "{\"error\":\"database error\",\"code\":\"DATABASE_ERROR\"}"
+    );
+}
+
+#[tokio::test]
+async fn test_internal_error_does_not_leak_sensitive_detail() {
+    // The inner Internal detail (which may wrap arbitrary lower-level errors)
+    // must never reach the client body.
+    let sensitive = "panic at src/db/pool.rs: DATABASE_URL=postgres://user:pass@host/db";
+    let error = ApiError::Internal(sensitive.to_string());
+    let response = error.into_response();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body = body_to_string(response).await;
+    assert!(
+        !body.contains("postgres://"),
+        "connection string leaked into body: {body}"
+    );
+    assert_eq!(
+        body,
+        "{\"error\":\"internal server error\",\"code\":\"INTERNAL_ERROR\"}"
+    );
 }
 
 #[test]
