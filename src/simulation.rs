@@ -3,9 +3,9 @@
 use crate::config::{AssetConfig, SimulationConfig, WalkTypeConfig};
 use crate::market_maker::MarketMakerEngine;
 use optionstratlib::prelude::ExpirationDate;
+use optionstratlib::prelude::Positive;
 use optionstratlib::prelude::TimeFrame;
 use optionstratlib::prelude::convert_time_frame;
-use optionstratlib::prelude::{Positive, pos_or_panic};
 use optionstratlib::prelude::{Step, Xstep, Ystep};
 use optionstratlib::prelude::{WalkParams, WalkType, WalkTypeAble};
 use parking_lot::RwLock;
@@ -18,7 +18,21 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::interval;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Error returned when a price path cannot be generated from invalid inputs.
+///
+/// Each variant carries the offending value so a caller can log a `WARN` and skip
+/// the misconfigured asset instead of panicking the whole simulation.
+#[derive(Debug, thiserror::Error)]
+pub enum SimulationError {
+    /// The initial price was not a valid, finite, positive value.
+    #[error("invalid initial price: {0}")]
+    InvalidInitialPrice(f64),
+    /// The volatility was not a valid, finite, positive value.
+    #[error("invalid volatility: {0}")]
+    InvalidVolatility(f64),
+}
 
 /// Price update event broadcast to subscribers.
 #[derive(Debug, Clone)]
@@ -58,9 +72,11 @@ fn generate_price_path(
     drift: f64,
     walk_type_config: &WalkTypeConfig,
     n_steps: usize,
-) -> Vec<f64> {
-    let initial = pos_or_panic!(initial_price);
-    let vol = pos_or_panic!(volatility);
+) -> Result<Vec<f64>, SimulationError> {
+    let initial = Positive::new(initial_price)
+        .map_err(|_| SimulationError::InvalidInitialPrice(initial_price))?;
+    let vol =
+        Positive::new(volatility).map_err(|_| SimulationError::InvalidVolatility(volatility))?;
     let drift_dec = Decimal::try_from(drift).unwrap_or(dec!(0.0));
     let days = Positive::THIRTY;
 
@@ -73,16 +89,19 @@ fn generate_price_path(
         WalkTypeConfig::MeanReverting => WalkType::MeanReverting {
             dt: convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day),
             volatility: vol,
-            speed: pos_or_panic!(0.5),
+            // 0.5 is a compile-time literal that is always a valid Positive.
+            speed: Positive::new(0.5).expect("0.5 is a valid positive constant"),
             mean: initial,
         },
         WalkTypeConfig::JumpDiffusion => WalkType::JumpDiffusion {
             dt: convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day),
             drift: drift_dec,
             volatility: vol,
-            intensity: pos_or_panic!(0.1),
+            // 0.1 is a compile-time literal that is always a valid Positive.
+            intensity: Positive::new(0.1).expect("0.1 is a valid positive constant"),
             jump_mean: dec!(0.0),
-            jump_volatility: pos_or_panic!(0.05),
+            // 0.05 is a compile-time literal that is always a valid Positive.
+            jump_volatility: Positive::new(0.05).expect("0.05 is a valid positive constant"),
         },
     };
 
@@ -127,7 +146,7 @@ fn generate_price_path(
     };
 
     // Convert Positive values to f64
-    y_steps.into_iter().map(|p: Positive| p.to_f64()).collect()
+    Ok(y_steps.into_iter().map(|p: Positive| p.to_f64()).collect())
 }
 
 /// State for each asset's random walk simulation (thread-safe).
@@ -169,22 +188,33 @@ impl PriceSimulator {
             let price_cents = (asset.initial_price * 100.0) as u64;
             initial_prices.insert(asset.symbol.clone(), price_cents);
 
-            // Generate price path for this asset
-            let prices = generate_price_path(
+            // Generate price path for this asset. A misconfigured asset (e.g. a
+            // non-positive or out-of-range initial price/volatility) is logged and
+            // skipped rather than panicking the whole simulation at startup.
+            match generate_price_path(
                 asset.initial_price,
                 asset.volatility,
                 asset.drift,
                 &config.walk_type,
                 n_steps,
-            );
-
-            simulations.insert(
-                asset.symbol.clone(),
-                AssetSimulation {
-                    current_index: 0,
-                    prices,
-                },
-            );
+            ) {
+                Ok(prices) => {
+                    simulations.insert(
+                        asset.symbol.clone(),
+                        AssetSimulation {
+                            current_index: 0,
+                            prices,
+                        },
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        symbol = %asset.symbol,
+                        error = %e,
+                        "skipping price simulation for misconfigured asset"
+                    );
+                }
+            }
         }
 
         let (price_tx, _) = broadcast::channel(1024);
@@ -296,15 +326,29 @@ impl PriceSimulator {
                 .unwrap_or((asset.initial_price * 100.0) as u64);
             let price_dollars = current_price as f64 / 100.0;
 
-            // Regenerate price path starting from current price
-            sim.prices = generate_price_path(
+            // Regenerate price path starting from current price. If regeneration
+            // fails (e.g. a degenerate current price), log and reuse the current
+            // price rather than panicking the simulation loop.
+            match generate_price_path(
                 price_dollars,
                 asset.volatility,
                 asset.drift,
                 &self.config.walk_type,
                 n_steps,
-            );
-            sim.current_index = 1; // Start from step 1 (step 0 is initial)
+            ) {
+                Ok(prices) => {
+                    sim.prices = prices;
+                    sim.current_index = 1; // Start from step 1 (step 0 is initial)
+                }
+                Err(e) => {
+                    warn!(
+                        symbol = %symbol,
+                        error = %e,
+                        "failed to regenerate price path; reusing current price"
+                    );
+                    return current_price;
+                }
+            }
         }
 
         // Get price from current step
@@ -361,13 +405,44 @@ mod tests {
     #[test]
     fn test_generate_price_path() {
         let prices =
-            generate_price_path(100.0, 0.2, 0.05, &WalkTypeConfig::GeometricBrownian, 1000);
+            generate_price_path(100.0, 0.2, 0.05, &WalkTypeConfig::GeometricBrownian, 1000)
+                .expect("valid inputs produce a price path");
 
         assert!(!prices.is_empty());
         // First price should be close to initial
         assert!((prices[0] - 100.0).abs() < 1.0);
         // All prices should be positive
         assert!(prices.iter().all(|&p| p > 0.0));
+    }
+
+    #[test]
+    fn test_generate_price_path_invalid_initial_price() {
+        // A non-positive initial price must yield an error, not a panic.
+        let result = generate_price_path(-1.0, 0.2, 0.05, &WalkTypeConfig::GeometricBrownian, 100);
+        assert!(matches!(
+            result,
+            Err(SimulationError::InvalidInitialPrice(_))
+        ));
+    }
+
+    #[test]
+    fn test_generate_price_path_invalid_volatility() {
+        // A non-positive volatility must yield an error, not a panic.
+        let result =
+            generate_price_path(100.0, -0.2, 0.05, &WalkTypeConfig::GeometricBrownian, 100);
+        assert!(matches!(result, Err(SimulationError::InvalidVolatility(_))));
+    }
+
+    #[test]
+    fn test_new_skips_misconfigured_asset_without_panic() {
+        // A misconfigured asset must be skipped at startup, not crash the server.
+        let mut bad = test_asset();
+        bad.initial_price = -5.0;
+        let simulator = PriceSimulator::new(vec![bad], SimulationConfig::default());
+        // No simulation path was registered, but the call did not panic and the
+        // next-price lookup falls back gracefully.
+        let price = simulator.get_next_price("TEST", &test_asset());
+        let _ = price;
     }
 
     #[test]
