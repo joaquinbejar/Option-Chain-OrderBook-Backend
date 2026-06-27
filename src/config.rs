@@ -33,6 +33,14 @@ pub const ENV_DEFAULT_TTL_SECS: &str = "AUTH_DEFAULT_TTL_SECS";
 /// `POST /api/v1/auth/token` endpoint is disabled.
 pub const ENV_BOOTSTRAP_SECRET: &str = "AUTH_BOOTSTRAP_SECRET";
 
+/// Environment variable enabling reverse-proxy trust for client-IP resolution.
+///
+/// OFF by default: the unauthenticated token endpoint is rate-limited by the
+/// trusted socket peer address only. Set to `1`/`true` ONLY when a trusted
+/// reverse proxy terminates the connection, in which case `X-Forwarded-For` /
+/// `X-Real-IP` is honored for the rate-limit identity (issue #48).
+pub const ENV_TRUST_PROXY: &str = "AUTH_TRUST_PROXY";
+
 /// Configuration error types.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -146,6 +154,23 @@ impl AuthConfig {
         match std::env::var(ENV_BOOTSTRAP_SECRET) {
             Ok(s) if !s.is_empty() => Some(s),
             _ => None,
+        }
+    }
+
+    /// Reads the reverse-proxy trust flag from `AUTH_TRUST_PROXY`.
+    ///
+    /// Returns `false` (the secure default) unless the variable is set to a
+    /// truthy value (`1`, `true`, `yes`, `on`, case-insensitive). When `false`,
+    /// the token endpoint rate-limits by the socket peer address and never trusts
+    /// a client-supplied forwarding header.
+    #[must_use]
+    pub fn trust_proxy() -> bool {
+        match std::env::var(ENV_TRUST_PROXY) {
+            Ok(s) => matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+            Err(_) => false,
         }
     }
 }

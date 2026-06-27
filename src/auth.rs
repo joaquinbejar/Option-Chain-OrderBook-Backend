@@ -28,6 +28,13 @@ const CLOCK_SKEW_LEEWAY_SECS: u64 = 60;
 /// Sliding rate-limit window length in milliseconds (60s, per issue #48).
 const RATE_LIMIT_WINDOW_MS: u64 = 60_000;
 
+/// Hard upper bound on the number of distinct keys the [`RateLimiter`] tracks at
+/// once (issue #48: bound the window map against memory-exhaustion DoS from many
+/// distinct subjects / peer IPs). When the map is full, a sweep of fully-expired
+/// entries is attempted before a brand-new key is admitted; if it is still full,
+/// the new key is rejected (fail-closed) rather than growing the map unbounded.
+const MAX_TRACKED_KEYS: usize = 100_000;
+
 /// Built-in, clearly-labeled DEV/TEST private key (RSA, PKCS#8 PEM).
 ///
 /// Used only by [`JwtAuth::dev`] for local `cargo run`, unit tests, and the
@@ -126,14 +133,46 @@ impl RateLimiter {
 
     /// Records a request for `key` and returns true if it is within `limit`
     /// requests over the sliding 60-second window.
+    ///
+    /// Existing keys take a lock-free fast path. A brand-new key is admitted only
+    /// while the map is under [`MAX_TRACKED_KEYS`]; at the cap a sweep of
+    /// fully-expired entries is attempted first, and if the map is still full the
+    /// request is rejected so the map can never grow without bound.
     pub fn check_and_record(&self, key: &str, limit: u32) -> bool {
         let now = now_millis();
         let window_start = now.saturating_sub(RATE_LIMIT_WINDOW_MS);
 
-        let mut entry = self.windows.entry(key.to_string()).or_default();
-        let window = entry.value_mut();
+        // Fast path: the key already has a bucket. `get_mut` holds the shard lock
+        // only for the duration of this block (no `.await` inside).
+        if let Some(mut entry) = self.windows.get_mut(key) {
+            return Self::prune_and_record(entry.value_mut(), now, window_start, limit);
+        }
 
-        // Drop entries outside the window.
+        // New key: enforce the cap before allocating a bucket.
+        if self.windows.len() >= MAX_TRACKED_KEYS {
+            let evicted = self.sweep_expired();
+            if self.windows.len() >= MAX_TRACKED_KEYS {
+                tracing::warn!(
+                    tracked = self.windows.len(),
+                    evicted,
+                    "rate-limit window map at capacity; rejecting request for a new key"
+                );
+                return false;
+            }
+        }
+
+        let mut entry = self.windows.entry(key.to_string()).or_default();
+        Self::prune_and_record(entry.value_mut(), now, window_start, limit)
+    }
+
+    /// Drops timestamps older than `window_start` from `window`, then records
+    /// `now` if doing so keeps the count within `limit`.
+    fn prune_and_record(
+        window: &mut VecDeque<u64>,
+        now: u64,
+        window_start: u64,
+        limit: u32,
+    ) -> bool {
         while let Some(&front) = window.front() {
             if front < window_start {
                 window.pop_front();
@@ -148,6 +187,38 @@ impl RateLimiter {
         } else {
             false
         }
+    }
+
+    /// Reaps entries whose entire window has expired, returning the number of
+    /// keys removed.
+    ///
+    /// Lazy pruning alone never removes a key (a recorded request always leaves
+    /// the bucket non-empty), so the map would otherwise retain one entry per
+    /// distinct key seen. This sweep — driven periodically by a background task
+    /// and on-demand when the cap is hit — reaps idle buckets back toward
+    /// baseline. It is lock-free across shards (`DashMap::retain`) and does not
+    /// hold any guard across an `.await`.
+    pub fn sweep_expired(&self) -> usize {
+        let now = now_millis();
+        let window_start = now.saturating_sub(RATE_LIMIT_WINDOW_MS);
+        let before = self.windows.len();
+        self.windows.retain(|_key, window| {
+            while let Some(&front) = window.front() {
+                if front < window_start {
+                    window.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !window.is_empty()
+        });
+        before.saturating_sub(self.windows.len())
+    }
+
+    /// Returns the number of keys currently tracked (for tests / observability).
+    #[must_use]
+    pub fn tracked_keys(&self) -> usize {
+        self.windows.len()
     }
 
     /// Clears rate-limit data for `key`.
@@ -346,6 +417,14 @@ impl JwtAuth {
     pub fn check_rate_limit(&self, key: &str, limit: u32) -> bool {
         self.rate_limiter.check_and_record(key, limit)
     }
+
+    /// Reaps fully-expired rate-limit buckets, returning the number removed.
+    ///
+    /// Intended to be called periodically by a background sweep task so idle
+    /// buckets do not accumulate (issue #48).
+    pub fn sweep_rate_limit_windows(&self) -> usize {
+        self.rate_limiter.sweep_expired()
+    }
 }
 
 #[cfg(test)]
@@ -469,5 +548,96 @@ mod tests {
         assert!(!limiter.check_and_record("sub-1", 10));
         // A different subject has its own window.
         assert!(limiter.check_and_record("sub-2", 10));
+    }
+
+    #[test]
+    fn test_rate_limiter_boundary_nth_allowed_n_plus_one_rejected() {
+        let limiter = RateLimiter::new();
+        // Exactly `limit` requests are admitted within the window.
+        for i in 0..5 {
+            assert!(
+                limiter.check_and_record("boundary", 5),
+                "request {i} within the limit must be admitted"
+            );
+        }
+        // The (limit + 1)-th request in the same window is rejected.
+        assert!(!limiter.check_and_record("boundary", 5));
+    }
+
+    #[test]
+    fn test_sweep_evicts_fully_expired_entries() {
+        let limiter = RateLimiter::new();
+
+        // Seed a key with a timestamp older than the full window so it counts as
+        // fully expired (simulate an idle bucket from a past burst).
+        let stale = now_millis().saturating_sub(RATE_LIMIT_WINDOW_MS + 1);
+        {
+            let mut entry = limiter.windows.entry("stale".to_string()).or_default();
+            entry.value_mut().push_back(stale);
+        }
+        // And a key that is still fresh.
+        assert!(limiter.check_and_record("fresh", 10));
+        assert_eq!(limiter.tracked_keys(), 2);
+
+        let removed = limiter.sweep_expired();
+        assert_eq!(removed, 1, "only the fully-expired key is reaped");
+        assert_eq!(limiter.tracked_keys(), 1);
+        // The fresh key survives.
+        assert!(limiter.check_and_record("fresh", 10));
+    }
+
+    #[test]
+    fn test_sweep_reaps_burst_from_many_keys_back_to_baseline() {
+        let limiter = RateLimiter::new();
+
+        // Simulate a burst from many distinct keys (e.g. many peer IPs), all with
+        // timestamps already outside the window.
+        let stale = now_millis().saturating_sub(RATE_LIMIT_WINDOW_MS + 1);
+        for i in 0..1_000 {
+            let mut entry = limiter.windows.entry(format!("ip-{i}")).or_default();
+            entry.value_mut().push_back(stale);
+        }
+        assert_eq!(limiter.tracked_keys(), 1_000);
+
+        // After the idle window, a sweep reaps the map back to baseline (empty).
+        let removed = limiter.sweep_expired();
+        assert_eq!(removed, 1_000);
+        assert_eq!(limiter.tracked_keys(), 0);
+    }
+
+    #[test]
+    fn test_map_does_not_grow_unbounded_across_expired_keys() {
+        let limiter = RateLimiter::new();
+
+        // Repeatedly record one-shot keys whose timestamps are immediately stale,
+        // sweeping between rounds. The map must not accumulate across rounds.
+        let stale = now_millis().saturating_sub(RATE_LIMIT_WINDOW_MS + 1);
+        for round in 0..5 {
+            for i in 0..200 {
+                let mut entry = limiter.windows.entry(format!("r{round}-k{i}")).or_default();
+                entry.value_mut().push_back(stale);
+            }
+            limiter.sweep_expired();
+            assert_eq!(
+                limiter.tracked_keys(),
+                0,
+                "expired keys from round {round} must be reaped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_per_key_isolation_within_window() {
+        let limiter = RateLimiter::new();
+        // Exhaust key A.
+        for _ in 0..3 {
+            assert!(limiter.check_and_record("A", 3));
+        }
+        assert!(!limiter.check_and_record("A", 3));
+        // Key B is unaffected and still has its full allowance.
+        for _ in 0..3 {
+            assert!(limiter.check_and_record("B", 3));
+        }
+        assert!(!limiter.check_and_record("B", 3));
     }
 }

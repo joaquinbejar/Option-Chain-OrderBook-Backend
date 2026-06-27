@@ -11,8 +11,10 @@ use option_chain_orderbook_backend::db::DatabasePool;
 use option_chain_orderbook_backend::models::Permission;
 use option_chain_orderbook_backend::state::AppState;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -32,6 +34,11 @@ use option_chain_orderbook_backend::models::{
     QuoteResponse, StrikeSummary, StrikesListResponse, TokenRequest, TokenResponse,
     UnderlyingSummary, UnderlyingsListResponse,
 };
+
+/// Interval between background sweeps of expired rate-limit window buckets
+/// (issue #48: reap idle buckets so the window map does not accumulate one entry
+/// per distinct subject / peer IP forever).
+const RATE_LIMIT_SWEEP_INTERVAL_SECS: u64 = 120;
 
 /// Builds tracing spans for HTTP requests recording the path but NEVER the query
 /// string, so secrets such as the `?token=<jwt>` WebSocket upgrade parameter can
@@ -234,6 +241,14 @@ async fn main() -> anyhow::Result<()> {
     };
     app_state.auth = auth;
     app_state.bootstrap_secret = bootstrap_secret;
+    // Reverse-proxy trust is OFF by default; the token endpoint then rate-limits
+    // by the socket peer address and ignores spoofable forwarding headers.
+    app_state.trust_proxy = AuthConfig::trust_proxy();
+    if app_state.trust_proxy {
+        info!(
+            "AUTH_TRUST_PROXY enabled: honoring X-Forwarded-For / X-Real-IP for token-endpoint rate limiting"
+        );
+    }
     let state = Arc::new(app_state);
 
     // Start price simulation if enabled
@@ -271,6 +286,29 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Start the rate-limit window sweep task. It periodically reaps fully-expired
+    // buckets so the window map cannot accumulate one entry per distinct subject
+    // or peer IP forever (issue #48). The `JoinHandle` is aborted after the
+    // server stops, giving the task a clear shutdown path.
+    let sweep_auth = Arc::clone(&state.auth);
+    let sweep_handle = tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(RATE_LIMIT_SWEEP_INTERVAL_SECS));
+        // Skip the first immediate tick.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let removed = sweep_auth.sweep_rate_limit_windows();
+            if removed > 0 {
+                tracing::debug!(removed, "swept expired rate-limit windows");
+            }
+        }
+    });
+    info!(
+        "Rate-limit window sweep task started (interval: {}s)",
+        RATE_LIMIT_SWEEP_INTERVAL_SECS
+    );
+
     // Get host and port for server binding
     let (host, port) = if let Some(ref cfg) = state.config {
         (cfg.server.host.clone(), cfg.server.port)
@@ -305,12 +343,24 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .layer(TraceLayer::new_for_http().make_span_with(RedactingMakeSpan));
 
-    // Start the server
+    // Start the server. `into_make_service_with_connect_info::<SocketAddr>()`
+    // injects the trusted socket peer address into request extensions so the
+    // token endpoint can rate-limit by the real peer rather than a spoofable
+    // client header (issue #48).
     let addr = format!("{}:{}", host, port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Listening on {}", addr);
 
-    axum::serve(listener, app).await?;
+    let serve_result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await;
+
+    // Server has stopped: tear down the background sweep task.
+    sweep_handle.abort();
+
+    serve_result?;
 
     Ok(())
 }

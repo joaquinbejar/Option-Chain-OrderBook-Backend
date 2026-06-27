@@ -42,6 +42,11 @@ pub struct AppState {
     /// Operator bootstrap secret for the token-issuance endpoint. `None` disables
     /// `POST /api/v1/auth/token` (tokens must then be minted out-of-band).
     pub bootstrap_secret: Option<String>,
+    /// Whether a trusted reverse proxy sits in front of the server. When `false`
+    /// (the secure default), the unauthenticated token endpoint rate-limits by
+    /// the socket peer address and ignores client-supplied forwarding headers;
+    /// when `true`, `X-Forwarded-For` / `X-Real-IP` is honored (issue #48).
+    pub trust_proxy: bool,
     /// Storage for execution reports by execution ID.
     pub executions: Arc<DashMap<String, ExecutionInfo>>,
     /// Storage for orderbook snapshots by snapshot ID.
@@ -68,6 +73,7 @@ impl AppState {
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
             auth: Arc::new(JwtAuth::dev()),
             bootstrap_secret: None,
+            trust_proxy: false,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
         }
@@ -95,6 +101,7 @@ impl AppState {
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
             auth: Arc::new(JwtAuth::dev()),
             bootstrap_secret: None,
+            trust_proxy: false,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
         }
@@ -137,6 +144,7 @@ impl AppState {
             ohlc_aggregator: Arc::new(OhlcAggregator::new()),
             auth: Arc::new(JwtAuth::dev()),
             bootstrap_secret: None,
+            trust_proxy: false,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
         }
