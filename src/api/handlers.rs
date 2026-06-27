@@ -286,7 +286,7 @@ pub async fn list_executions(
     }
 
     // Sort by timestamp descending (most recent first)
-    executions.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+    executions.sort_by_key(|e| std::cmp::Reverse(e.timestamp_ms));
 
     // Calculate summary before pagination
     let total_executions = executions.len() as u64;
@@ -2298,7 +2298,7 @@ pub async fn list_orders(
         .collect();
 
     // Sort by creation time (newest first)
-    filtered_orders.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    filtered_orders.sort_by_key(|o| std::cmp::Reverse(o.created_at_ms));
 
     let total = filtered_orders.len();
 
