@@ -1,7 +1,10 @@
 //! WebSocket handler for real-time updates.
 
 use crate::auth::Claims;
-use crate::market_maker::MarketMakerEvent;
+use crate::market_maker::{
+    DIRECTIONAL_SKEW_MAX, DIRECTIONAL_SKEW_MIN, MarketMakerEvent, SIZE_SCALAR_MAX, SIZE_SCALAR_MIN,
+    SPREAD_MULTIPLIER_MAX, SPREAD_MULTIPLIER_MIN, validate_control_value,
+};
 use crate::models::Permission;
 use crate::state::AppState;
 use axum::Extension;
@@ -671,6 +674,17 @@ struct ClientCommand {
 /// Sender type alias for WebSocket.
 type WsSender = Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, Message>>>;
 
+/// Serializes and sends a [`WsMessage::Error`] to the client.
+///
+/// Send failures are ignored: a closed socket is detected and cleaned up by the
+/// read loop, so there is nothing useful to do here on failure.
+async fn send_ws_error(sender: &WsSender, message: String) {
+    let error_msg = WsMessage::Error { message };
+    if let Ok(json) = serde_json::to_string(&error_msg) {
+        let _ = sender.lock().await.send(Message::Text(json.into())).await;
+    }
+}
+
 /// Handle incoming client messages.
 ///
 /// `permissions` are the authenticated caller's permissions; the market-maker
@@ -725,28 +739,50 @@ async fn handle_client_message(
             action @ ("set_spread" | "set_size" | "set_skew" | "kill" | "enable") => {
                 // Market-maker control commands require Admin (Admin implies all).
                 if !permissions.contains(&Permission::Admin) {
-                    let error_msg = WsMessage::Error {
-                        message: "forbidden: admin permission required".to_string(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&error_msg) {
-                        let _ = sender.lock().await.send(Message::Text(json.into())).await;
-                    }
+                    send_ws_error(sender, "forbidden: admin permission required".to_string()).await;
                     return;
                 }
                 match action {
                     "set_spread" => {
                         if let Some(value) = cmd.value {
-                            state.market_maker.set_spread_multiplier(value);
+                            match validate_control_value(
+                                "spread_multiplier",
+                                value,
+                                SPREAD_MULTIPLIER_MIN,
+                                SPREAD_MULTIPLIER_MAX,
+                            ) {
+                                Ok(v) => state.market_maker.set_spread_multiplier(v),
+                                Err(message) => send_ws_error(sender, message).await,
+                            }
                         }
                     }
                     "set_size" => {
                         if let Some(value) = cmd.value {
-                            state.market_maker.set_size_scalar(value / 100.0);
+                            // Wire contract carries size as a percentage; convert
+                            // to the engine scalar before validating against
+                            // [SIZE_SCALAR_MIN, SIZE_SCALAR_MAX].
+                            match validate_control_value(
+                                "size_scalar",
+                                value / 100.0,
+                                SIZE_SCALAR_MIN,
+                                SIZE_SCALAR_MAX,
+                            ) {
+                                Ok(v) => state.market_maker.set_size_scalar(v),
+                                Err(message) => send_ws_error(sender, message).await,
+                            }
                         }
                     }
                     "set_skew" => {
                         if let Some(value) = cmd.value {
-                            state.market_maker.set_directional_skew(value);
+                            match validate_control_value(
+                                "directional_skew",
+                                value,
+                                DIRECTIONAL_SKEW_MIN,
+                                DIRECTIONAL_SKEW_MAX,
+                            ) {
+                                Ok(v) => state.market_maker.set_directional_skew(v),
+                                Err(message) => send_ws_error(sender, message).await,
+                            }
                         }
                     }
                     "kill" => {

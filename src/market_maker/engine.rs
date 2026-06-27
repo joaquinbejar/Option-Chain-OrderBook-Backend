@@ -11,6 +11,52 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+/// Minimum accepted spread multiplier (dimensionless). Matches the engine clamp.
+pub const SPREAD_MULTIPLIER_MIN: f64 = 0.1;
+/// Maximum accepted spread multiplier (dimensionless). Matches the engine clamp.
+pub const SPREAD_MULTIPLIER_MAX: f64 = 10.0;
+/// Minimum accepted size scalar (fraction of full size). Matches the engine clamp.
+pub const SIZE_SCALAR_MIN: f64 = 0.0;
+/// Maximum accepted size scalar (fraction of full size). Matches the engine clamp.
+pub const SIZE_SCALAR_MAX: f64 = 1.0;
+/// Minimum accepted directional skew. Matches the engine clamp.
+pub const DIRECTIONAL_SKEW_MIN: f64 = -1.0;
+/// Maximum accepted directional skew. Matches the engine clamp.
+pub const DIRECTIONAL_SKEW_MAX: f64 = 1.0;
+
+/// Validates a market-maker control value is finite and within `[min, max]`.
+///
+/// The market-maker control parameters (`spread_multiplier`, `size_scalar`,
+/// `directional_skew`) are `f64`. `f64::clamp` returns `NaN` when its input is
+/// `NaN`, so a non-finite value would slip through the engine clamp and poison
+/// quoting math. This helper is the single validation gate used by both the REST
+/// (`POST /controls/parameters`) and WebSocket
+/// (`set_spread` / `set_size` / `set_skew`) boundaries before a value ever reaches
+/// the engine setters.
+///
+/// `RangeInclusive::contains` already rejects `NaN` (every comparison with `NaN`
+/// is false) and both infinities (they fall outside any finite range), so a
+/// single containment check covers finiteness and range together.
+///
+/// Returns the value unchanged when it is finite and within `[min, max]`,
+/// otherwise an error message naming the `field`, the accepted range, and the
+/// offending value (it contains no secrets).
+///
+/// # Errors
+/// Returns a human-readable message when `value` is non-finite (`NaN` / infinite)
+/// or outside the inclusive range `[min, max]`.
+#[inline]
+#[must_use = "the validation result must be handled"]
+pub fn validate_control_value(field: &str, value: f64, min: f64, max: f64) -> Result<f64, String> {
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "{field} must be finite and within [{min}, {max}], got {value}"
+        ))
+    }
+}
+
 /// Market maker configuration.
 #[derive(Debug, Clone)]
 pub struct MarketMakerConfig {
@@ -231,30 +277,58 @@ impl MarketMakerEngine {
     }
 
     /// Updates the spread multiplier.
+    ///
+    /// A finite value is clamped into `[SPREAD_MULTIPLIER_MIN,
+    /// SPREAD_MULTIPLIER_MAX]`. A non-finite (`NaN` / infinite) input is a no-op
+    /// with a `WARN`: `f64::clamp` returns `NaN` for a `NaN` input, so clamping
+    /// must never be the only guard. Callers should validate at the API boundary
+    /// via [`validate_control_value`]; this is defense in depth.
     pub fn set_spread_multiplier(&self, multiplier: f64) {
+        if !multiplier.is_finite() {
+            warn!(value = multiplier, "ignoring non-finite spread multiplier");
+            return;
+        }
         {
             let mut config = self.config.write();
-            config.spread_multiplier = multiplier.clamp(0.1, 10.0);
+            config.spread_multiplier =
+                multiplier.clamp(SPREAD_MULTIPLIER_MIN, SPREAD_MULTIPLIER_MAX);
         }
         self.broadcast_config_change();
         self.requote_all();
     }
 
     /// Updates the size scalar.
+    ///
+    /// A finite value is clamped into `[SIZE_SCALAR_MIN, SIZE_SCALAR_MAX]`. A
+    /// non-finite (`NaN` / infinite) input is a no-op with a `WARN` so a `NaN`
+    /// can never be stored (clamping a `NaN` yields `NaN`).
     pub fn set_size_scalar(&self, scalar: f64) {
+        if !scalar.is_finite() {
+            warn!(value = scalar, "ignoring non-finite size scalar");
+            return;
+        }
         {
             let mut config = self.config.write();
-            config.size_scalar = scalar.clamp(0.0, 1.0);
+            config.size_scalar = scalar.clamp(SIZE_SCALAR_MIN, SIZE_SCALAR_MAX);
         }
         self.broadcast_config_change();
         self.requote_all();
     }
 
     /// Updates the directional skew.
+    ///
+    /// A finite value is clamped into `[DIRECTIONAL_SKEW_MIN,
+    /// DIRECTIONAL_SKEW_MAX]`. A non-finite (`NaN` / infinite) input is a no-op
+    /// with a `WARN` so a `NaN` can never be stored (clamping a `NaN` yields
+    /// `NaN`).
     pub fn set_directional_skew(&self, skew: f64) {
+        if !skew.is_finite() {
+            warn!(value = skew, "ignoring non-finite directional skew");
+            return;
+        }
         {
             let mut config = self.config.write();
-            config.directional_skew = skew.clamp(-1.0, 1.0);
+            config.directional_skew = skew.clamp(DIRECTIONAL_SKEW_MIN, DIRECTIONAL_SKEW_MAX);
         }
         self.broadcast_config_change();
         self.requote_all();
@@ -528,5 +602,91 @@ mod tests {
     fn test_parse_expiration_accepts_yyyymmdd() {
         let engine = test_engine();
         assert!(engine.parse_expiration("20251231").is_ok());
+    }
+
+    // ------------------------------------------------------------------------
+    // validate_control_value
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_control_value_accepts_in_range() {
+        assert_eq!(
+            validate_control_value("spread_multiplier", 2.0, 0.1, 10.0),
+            Ok(2.0)
+        );
+        // Inclusive bounds.
+        assert_eq!(
+            validate_control_value("size_scalar", 0.0, 0.0, 1.0),
+            Ok(0.0)
+        );
+        assert_eq!(
+            validate_control_value("size_scalar", 1.0, 0.0, 1.0),
+            Ok(1.0)
+        );
+        assert_eq!(
+            validate_control_value("directional_skew", -1.0, -1.0, 1.0),
+            Ok(-1.0)
+        );
+    }
+
+    #[test]
+    fn test_validate_control_value_rejects_non_finite() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = validate_control_value("spread_multiplier", bad, 0.1, 10.0)
+                .expect_err("non-finite must be rejected");
+            assert!(err.contains("spread_multiplier"));
+            assert!(err.contains("must be finite and within"));
+        }
+    }
+
+    #[test]
+    fn test_validate_control_value_rejects_out_of_range() {
+        assert!(validate_control_value("spread_multiplier", 0.05, 0.1, 10.0).is_err());
+        assert!(validate_control_value("spread_multiplier", 10.5, 0.1, 10.0).is_err());
+        assert!(validate_control_value("directional_skew", -1.5, -1.0, 1.0).is_err());
+        assert!(validate_control_value("directional_skew", 1.5, -1.0, 1.0).is_err());
+    }
+
+    // ------------------------------------------------------------------------
+    // Engine setters: non-finite is a no-op (defense in depth)
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_set_spread_multiplier_nan_is_noop() {
+        let engine = test_engine();
+        let before = engine.get_config().spread_multiplier;
+        engine.set_spread_multiplier(f64::NAN);
+        let after = engine.get_config().spread_multiplier;
+        assert_eq!(before, after);
+        assert!(after.is_finite());
+    }
+
+    #[test]
+    fn test_set_size_scalar_inf_is_noop() {
+        let engine = test_engine();
+        let before = engine.get_config().size_scalar;
+        engine.set_size_scalar(f64::INFINITY);
+        let after = engine.get_config().size_scalar;
+        assert_eq!(before, after);
+        assert!(after.is_finite());
+    }
+
+    #[test]
+    fn test_set_directional_skew_neg_inf_is_noop() {
+        let engine = test_engine();
+        let before = engine.get_config().directional_skew;
+        engine.set_directional_skew(f64::NEG_INFINITY);
+        let after = engine.get_config().directional_skew;
+        assert_eq!(before, after);
+        assert!(after.is_finite());
+    }
+
+    #[test]
+    fn test_set_spread_multiplier_finite_is_clamped() {
+        let engine = test_engine();
+        engine.set_spread_multiplier(100.0);
+        assert_eq!(engine.get_config().spread_multiplier, SPREAD_MULTIPLIER_MAX);
+        engine.set_spread_multiplier(0.0);
+        assert_eq!(engine.get_config().spread_multiplier, SPREAD_MULTIPLIER_MIN);
     }
 }
