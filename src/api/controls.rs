@@ -2,6 +2,10 @@
 
 use crate::db::{InsertPriceRequest, UpdateParametersRequest};
 use crate::error::ApiError;
+use crate::market_maker::{
+    DIRECTIONAL_SKEW_MAX, DIRECTIONAL_SKEW_MIN, SIZE_SCALAR_MAX, SIZE_SCALAR_MIN,
+    SPREAD_MULTIPLIER_MAX, SPREAD_MULTIPLIER_MIN, validate_control_value,
+};
 use crate::state::AppState;
 use axum::Json;
 use axum::extract::{Path, State};
@@ -184,39 +188,88 @@ pub async fn enable_quoting(State(state): State<Arc<AppState>>) -> Json<KillSwit
 }
 
 /// Update global parameters.
+///
+/// Every provided field is validated (finite and within its documented range)
+/// BEFORE any value is applied, so a single bad field leaves the configuration
+/// entirely unchanged. The control values are `f64` and `f64::clamp` returns
+/// `NaN` for a `NaN` input, so a non-finite value must be rejected here rather
+/// than slipping into the engine and poisoning quoting math.
+///
+/// # Errors
+/// Returns [`ApiError::InvalidRequest`] (HTTP 400) when any provided field is
+/// non-finite (`NaN` / infinite) or outside its documented range:
+/// `spread_multiplier` ∈ [0.1, 10.0], `size_scalar` (the engine scalar, after
+/// the percentage conversion) ∈ [0.0, 1.0], `directional_skew` ∈ [-1.0, 1.0].
 #[utoipa::path(
     post,
     path = "/api/v1/controls/parameters",
     request_body = UpdateParametersRequest,
     responses(
-        (status = 200, description = "Parameters updated", body = UpdateParametersResponse)
+        (status = 200, description = "Parameters updated", body = UpdateParametersResponse),
+        (status = 400, description = "Invalid parameter value")
     ),
     tag = "Controls"
 )]
 pub async fn update_parameters(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateParametersRequest>,
-) -> Json<UpdateParametersResponse> {
-    if let Some(spread) = body.spread_multiplier {
+) -> Result<Json<UpdateParametersResponse>, ApiError> {
+    // Validate EVERY provided field up front, before mutating any engine state,
+    // so an invalid field leaves the configuration entirely unchanged.
+    let spread = body
+        .spread_multiplier
+        .map(|v| {
+            validate_control_value(
+                "spread_multiplier",
+                v,
+                SPREAD_MULTIPLIER_MIN,
+                SPREAD_MULTIPLIER_MAX,
+            )
+        })
+        .transpose()
+        .map_err(ApiError::InvalidRequest)?;
+
+    // The REST/WS wire contract carries `size_scalar` as a percentage; convert to
+    // the engine scalar before validating against the documented [0.0, 1.0] range.
+    let size = body
+        .size_scalar
+        .map(|v| validate_control_value("size_scalar", v / 100.0, SIZE_SCALAR_MIN, SIZE_SCALAR_MAX))
+        .transpose()
+        .map_err(ApiError::InvalidRequest)?;
+
+    let skew = body
+        .directional_skew
+        .map(|v| {
+            validate_control_value(
+                "directional_skew",
+                v,
+                DIRECTIONAL_SKEW_MIN,
+                DIRECTIONAL_SKEW_MAX,
+            )
+        })
+        .transpose()
+        .map_err(ApiError::InvalidRequest)?;
+
+    // All provided values are valid: apply them (the engine still clamps finite
+    // values to the documented range as the in-range coercion contract).
+    if let Some(spread) = spread {
         state.market_maker.set_spread_multiplier(spread);
     }
-
-    if let Some(size) = body.size_scalar {
-        state.market_maker.set_size_scalar(size / 100.0); // Convert from percentage
+    if let Some(size) = size {
+        state.market_maker.set_size_scalar(size);
     }
-
-    if let Some(skew) = body.directional_skew {
+    if let Some(skew) = skew {
         state.market_maker.set_directional_skew(skew);
     }
 
     let config = state.market_maker.get_config();
 
-    Json(UpdateParametersResponse {
+    Ok(Json(UpdateParametersResponse {
         success: true,
         spread_multiplier: config.spread_multiplier,
         size_scalar: config.size_scalar * 100.0, // Convert back to percentage
         directional_skew: config.directional_skew,
-    })
+    }))
 }
 
 /// Toggle quoting for a specific instrument.
