@@ -273,4 +273,20 @@ mod tests {
         let put_delta = pricer.delta(100.0, 100.0, &exp, OptionStyle::Put, Some(0.20));
         assert!(put_delta > -0.6 && put_delta < -0.4); // ATM put delta ~-0.5
     }
+
+    #[test]
+    fn test_theoretical_value_non_finite_on_degenerate_iv() {
+        // The Black-Scholes approximation can return a non-finite value for a
+        // degenerate input: an infinite volatility makes d1 = Inf / Inf = NaN.
+        // The quoter is responsible for guarding this at the f64 -> cents
+        // boundary; this test documents the degenerate source.
+        let pricer = OptionPricer::default();
+        let exp = ExpirationDate::Days(Positive::THIRTY);
+        let theo =
+            pricer.theoretical_value(100.0, 100.0, &exp, OptionStyle::Call, Some(f64::INFINITY));
+        assert!(
+            !theo.is_finite(),
+            "expected a non-finite theo for an infinite iv, got {theo}"
+        );
+    }
 }

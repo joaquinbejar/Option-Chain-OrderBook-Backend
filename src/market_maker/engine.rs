@@ -453,7 +453,22 @@ impl MarketMakerEngine {
             iv: None,
         };
 
-        let quote_params = self.quoter.generate_quote(&input);
+        // Skip the instrument when the theoretical value is non-finite: the
+        // quoter returns `None` rather than producing a poisoned bid/ask. The
+        // requote loop continues with the next strike/style.
+        let quote_params = match self.quoter.generate_quote(&input) {
+            Some(params) => params,
+            None => {
+                warn!(
+                    symbol = %symbol,
+                    expiration = %exp_str,
+                    strike,
+                    style = ?style,
+                    "skipping quote: non-finite theoretical value"
+                );
+                return;
+            }
+        };
 
         // Cancel existing orders and place new ones
         if let Ok(underlying_book) = self.manager.get(symbol)
