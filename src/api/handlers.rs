@@ -286,14 +286,15 @@ pub async fn issue_token(
         ("offset" = Option<u64>, Query, description = "Offset for pagination")
     ),
     responses(
-        (status = 200, description = "List of executions", body = ExecutionsListResponse)
+        (status = 200, description = "List of executions", body = ExecutionsListResponse),
+        (status = 500, description = "Aggregation overflow")
     ),
     tag = "Executions"
 )]
 pub async fn list_executions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ExecutionsQuery>,
-) -> Json<ExecutionsListResponse> {
+) -> Result<Json<ExecutionsListResponse>, ApiError> {
     let mut executions: Vec<ExecutionInfo> = state
         .executions
         .iter()
@@ -343,10 +344,28 @@ pub async fn list_executions(
     // Sort by timestamp descending (most recent first)
     executions.sort_by_key(|e| std::cmp::Reverse(e.timestamp_ms));
 
-    // Calculate summary before pagination
+    // Calculate summary before pagination. Volume (counter) and edge (cents)
+    // accumulate in wide u128/i128 accumulators with checked arithmetic and
+    // narrow to the wire types only at the end; overflow is an opaque internal
+    // error rather than a silent wrap (issue #61).
     let total_executions = executions.len() as u64;
-    let total_volume: u64 = executions.iter().map(|e| e.quantity).sum();
-    let total_edge: i64 = executions.iter().filter_map(|e| e.edge).sum();
+    let total_volume_wide: u128 = executions.iter().try_fold(0u128, |acc, e| {
+        acc.checked_add(u128::from(e.quantity))
+            .ok_or_else(|| ApiError::Internal("total_volume accumulation overflow".to_string()))
+    })?;
+    let total_volume = u64::try_from(total_volume_wide)
+        .map_err(|_| ApiError::Internal("total_volume exceeds u64 range".to_string()))?;
+    let total_edge_wide: i128 =
+        executions
+            .iter()
+            .filter_map(|e| e.edge)
+            .try_fold(0i128, |acc, edge| {
+                acc.checked_add(i128::from(edge)).ok_or_else(|| {
+                    ApiError::Internal("total_edge accumulation overflow".to_string())
+                })
+            })?;
+    let total_edge = i64::try_from(total_edge_wide)
+        .map_err(|_| ApiError::Internal("total_edge exceeds i64 range".to_string()))?;
     let maker_count = executions.iter().filter(|e| e.is_maker).count() as f64;
     let maker_ratio = if total_executions > 0 {
         maker_count / total_executions as f64
@@ -366,10 +385,10 @@ pub async fn list_executions(
         maker_ratio,
     };
 
-    Json(ExecutionsListResponse {
+    Ok(Json(ExecutionsListResponse {
         executions,
         summary,
-    })
+    }))
 }
 
 /// Get a single execution by ID.
@@ -3427,11 +3446,18 @@ pub async fn get_position(
             // always reported.
             let mark = get_current_price_for_symbol(&state, &symbol);
             let (current_price, unrealized_pnl, notional_value) = match mark {
-                Some(price) => (
-                    Some(price),
-                    Some(position.unrealized_pnl(price)),
-                    Some(position.notional_value(price)),
-                ),
+                Some(price) => {
+                    // Overflow in the PnL/notional math is distinct from "unpriced":
+                    // surface it as an opaque internal error (detail logged), never
+                    // collapse it into the omitted-field unpriced representation.
+                    let pnl = position.unrealized_pnl(price).ok_or_else(|| {
+                        ApiError::Internal(format!("unrealized_pnl overflow for symbol {symbol}"))
+                    })?;
+                    let notional = position.notional_value(price).ok_or_else(|| {
+                        ApiError::Internal(format!("notional_value overflow for symbol {symbol}"))
+                    })?;
+                    (Some(price), Some(pnl), Some(notional))
+                }
                 None => (None, None, None),
             };
 
@@ -3475,81 +3501,107 @@ pub async fn list_positions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PositionQuery>,
 ) -> Result<Json<PositionsListResponse>, ApiError> {
-    let mut total_unrealized_pnl = 0i64;
+    // Monetary totals accumulate in a wide i128 accumulator with checked
+    // arithmetic and narrow to i64 only at the end (issue #61). `net_delta` is
+    // f64 and left as-is.
+    let mut total_unrealized_pnl: i128 = 0;
+    let mut total_realized_pnl: i128 = 0;
     let mut net_delta = 0.0f64;
     // Open positions with no current quote: excluded from the partial
     // `total_unrealized_pnl` / `net_delta` totals (issue #59) and surfaced so the
     // partial total is honest.
     let mut unpriced_count = 0usize;
 
-    // Realized PnL is booked permanently when a position is (partially) closed,
-    // so the summary total must include FLAT (`quantity == 0`) symbols too:
-    // closing a symbol to flat must not silently drop its realized PnL from the
-    // total while `get_position` (which has no quantity filter) still reports it
-    // (issue #55). Sum realized PnL across the full underlying-filtered set,
-    // independent of the non-flat filter the list view applies below.
-    let total_realized_pnl: i64 = state
-        .positions
-        .iter()
-        .filter(|entry| match query.underlying {
-            Some(ref underlying) => &entry.value().underlying == underlying,
-            None => true,
-        })
-        .map(|entry| entry.value().realized_pnl)
-        .sum();
+    let mut positions: Vec<PositionResponse> = Vec::new();
 
-    let positions: Vec<PositionResponse> = state
-        .positions
-        .iter()
-        .filter(|entry| {
-            if let Some(ref underlying) = query.underlying {
-                &entry.value().underlying == underlying
-            } else {
-                true
-            }
-        })
-        .filter(|entry| entry.value().quantity != 0) // Only include open positions
-        .map(|entry| {
-            let position = entry.value();
+    for entry in state.positions.iter() {
+        let position = entry.value();
 
-            // TODO: Calculate delta from option pricer when available
-            let delta_exposure = 0.0;
+        // The underlying filter applies to BOTH the realized-PnL total and the
+        // list view.
+        if let Some(ref underlying) = query.underlying
+            && &position.underlying != underlying
+        {
+            continue;
+        }
 
-            // Mark only when a quote exists; an unpriced position is left None
-            // (not fabricated at 0) and excluded from the partial totals so they
-            // reflect only what could actually be marked (issue #59).
-            let (current_price, unrealized_pnl, notional_value) =
-                match get_current_price_for_symbol(&state, &position.symbol) {
-                    Some(price) => {
-                        total_unrealized_pnl += position.unrealized_pnl(price);
-                        net_delta += delta_exposure;
-                        (
-                            Some(price),
-                            Some(position.unrealized_pnl(price)),
-                            Some(position.notional_value(price)),
-                        )
-                    }
-                    None => {
-                        unpriced_count += 1;
-                        (None, None, None)
-                    }
-                };
+        // Realized PnL is booked permanently when a position is (partially)
+        // closed, so the summary total must include FLAT (`quantity == 0`)
+        // symbols too: closing a symbol to flat must not silently drop its
+        // realized PnL while `get_position` (which has no quantity filter) still
+        // reports it (issue #55). Accumulate it across the full
+        // underlying-filtered set, before the non-flat filter below.
+        total_realized_pnl = total_realized_pnl
+            .checked_add(i128::from(position.realized_pnl))
+            .ok_or_else(|| {
+                ApiError::Internal("total_realized_pnl accumulation overflow".to_string())
+            })?;
 
-            PositionResponse {
-                symbol: position.symbol.clone(),
-                underlying: position.underlying.clone(),
-                quantity: position.quantity,
-                average_price: position.average_price,
-                current_price,
-                unrealized_pnl,
-                realized_pnl: position.realized_pnl,
-                delta_exposure,
-                notional_value,
-            }
-        })
-        .collect();
+        // Only OPEN positions appear in the list view and contribute marks.
+        if position.quantity == 0 {
+            continue;
+        }
+
+        // TODO: Calculate delta from option pricer when available
+        let delta_exposure = 0.0;
+
+        // Mark only when a quote exists; an unpriced position is left None (not
+        // fabricated at 0) and excluded from the partial totals so they reflect
+        // only what could actually be marked (issue #59). Overflow in the priced
+        // math is a distinct, opaque internal error — never collapsed into the
+        // omitted-field unpriced representation (issue #61).
+        let (current_price, unrealized_pnl, notional_value) =
+            match get_current_price_for_symbol(&state, &position.symbol) {
+                Some(price) => {
+                    let pnl = position.unrealized_pnl(price).ok_or_else(|| {
+                        ApiError::Internal(format!(
+                            "unrealized_pnl overflow for symbol {}",
+                            position.symbol
+                        ))
+                    })?;
+                    let notional = position.notional_value(price).ok_or_else(|| {
+                        ApiError::Internal(format!(
+                            "notional_value overflow for symbol {}",
+                            position.symbol
+                        ))
+                    })?;
+                    total_unrealized_pnl = total_unrealized_pnl
+                        .checked_add(i128::from(pnl))
+                        .ok_or_else(|| {
+                            ApiError::Internal(
+                                "total_unrealized_pnl accumulation overflow".to_string(),
+                            )
+                        })?;
+                    net_delta += delta_exposure;
+                    (Some(price), Some(pnl), Some(notional))
+                }
+                None => {
+                    unpriced_count += 1;
+                    (None, None, None)
+                }
+            };
+
+        positions.push(PositionResponse {
+            symbol: position.symbol.clone(),
+            underlying: position.underlying.clone(),
+            quantity: position.quantity,
+            average_price: position.average_price,
+            current_price,
+            unrealized_pnl,
+            realized_pnl: position.realized_pnl,
+            delta_exposure,
+            notional_value,
+        });
+    }
 
     let position_count = positions.len();
+
+    // Narrow the wide accumulators to the i64 wire type; a total that cannot be
+    // represented is an opaque internal error rather than a silent wrap.
+    let total_unrealized_pnl = i64::try_from(total_unrealized_pnl)
+        .map_err(|_| ApiError::Internal("total_unrealized_pnl exceeds i64 range".to_string()))?;
+    let total_realized_pnl = i64::try_from(total_realized_pnl)
+        .map_err(|_| ApiError::Internal("total_realized_pnl exceeds i64 range".to_string()))?;
 
     Ok(Json(PositionsListResponse {
         positions,
@@ -4762,6 +4814,7 @@ mod tests {
             }),
         )
         .await
+        .expect("list executions")
         .0;
         assert_eq!(executions.executions.len(), 1);
         let exec = &executions.executions[0];
@@ -4876,6 +4929,7 @@ mod tests {
             }),
         )
         .await
+        .expect("list executions")
         .0;
         assert_eq!(executions.executions.len(), 1);
         assert_eq!(executions.executions[0].price, 150);
@@ -5223,6 +5277,7 @@ mod tests {
             }),
         )
         .await
+        .expect("list executions")
         .0;
         assert_eq!(executions.executions.len(), 1);
         assert_eq!(executions.executions[0].price, 100);
@@ -5964,11 +6019,11 @@ mod tests {
 
         // Current price is 600, so unrealized P&L = (600 - 500) * 100 = 10000
         let unrealized = position.unrealized_pnl(600);
-        assert_eq!(unrealized, 10000);
+        assert_eq!(unrealized, Some(10000));
 
         // Notional value = 600 * 100 = 60000
         let notional = position.notional_value(600);
-        assert_eq!(notional, 60000);
+        assert_eq!(notional, Some(60000));
     }
 
     #[tokio::test]
@@ -5983,11 +6038,203 @@ mod tests {
 
         // Current price is 400, so unrealized P&L = (400 - 500) * -100 = 10000 (profit)
         let unrealized = position.unrealized_pnl(400);
-        assert_eq!(unrealized, 10000);
+        assert_eq!(unrealized, Some(10000));
 
         // Current price is 600, so unrealized P&L = (600 - 500) * -100 = -10000 (loss)
         let unrealized_loss = position.unrealized_pnl(600);
-        assert_eq!(unrealized_loss, -10000);
+        assert_eq!(unrealized_loss, Some(-10000));
+    }
+
+    #[test]
+    fn test_unrealized_pnl_overflow_returns_none() {
+        // Issue #61: overflow in the PnL math returns None — this is OVERFLOW,
+        // distinct from an unpriced position (which never calls this helper).
+        let position = PositionInfo::new(
+            "OVF-20251231-1-C".to_string(),
+            "OVF".to_string(),
+            i64::MAX,
+            0,
+            0,
+        );
+        // (1_000_000 - 0) * i64::MAX overflows i64.
+        assert_eq!(position.unrealized_pnl(1_000_000), None);
+
+        // Normal values still compute.
+        let normal = PositionInfo::new("OK-20251231-1-C".to_string(), "OK".to_string(), 10, 100, 0);
+        assert_eq!(normal.unrealized_pnl(150), Some(500));
+    }
+
+    #[test]
+    fn test_notional_value_overflow_returns_none() {
+        // Issue #61: a u128 product overflow returns None.
+        let position =
+            PositionInfo::new("OVF-20251231-1-C".to_string(), "OVF".to_string(), 2, 0, 0);
+        assert_eq!(position.notional_value(u128::MAX), None);
+        assert_eq!(position.notional_value(100), Some(200));
+    }
+
+    #[test]
+    fn test_position_update_realized_saturates_on_overflow() {
+        // Issue #61: the fill already executed, so a realized-PnL overflow
+        // SATURATES at i64::MAX rather than panicking or wrapping.
+        let mut pos = PositionInfo::new(
+            "SAT-20251231-1-C".to_string(),
+            "SAT".to_string(),
+            i64::MAX,
+            0,
+            0,
+        );
+        // Close the whole long by selling i64::MAX contracts at a high price:
+        // realized = 1e12 * i64::MAX overflows i64.
+        let realized = pos.update(-i64::MAX, 1_000_000_000_000, 1);
+        assert_eq!(realized, i64::MAX, "realized P&L saturates at i64::MAX");
+        assert_eq!(pos.realized_pnl, i64::MAX, "cumulative realized saturates");
+        assert_eq!(pos.quantity, 0, "position fully closed");
+    }
+
+    #[test]
+    fn test_position_update_realized_saturates_to_min_on_loss_overflow() {
+        // Issue #61: the opposite sign — a close whose realized P&L UNDERflows
+        // i64 must saturate toward i64::MIN (correct direction under saturation),
+        // never wrap or panic.
+        let mut pos = PositionInfo::new(
+            "SAT-20251231-1-C".to_string(),
+            "SAT".to_string(),
+            i64::MAX,
+            1_000_000_000_000,
+            0,
+        );
+        // Close the whole long by selling i64::MAX contracts at price 0:
+        // realized = (0 - 1e12) * i64::MAX underflows i64.
+        let realized = pos.update(-i64::MAX, 0, 1);
+        assert_eq!(realized, i64::MIN, "realized P&L saturates at i64::MIN");
+        assert_eq!(pos.realized_pnl, i64::MIN, "cumulative realized saturates");
+        assert_eq!(pos.quantity, 0, "position fully closed");
+    }
+
+    #[test]
+    fn test_position_update_average_price_saturates_on_overflow() {
+        // Issue #61: a weighted-average computation that overflows u128 saturates
+        // at u128::MAX (no panic / wrap).
+        let mut pos = PositionInfo::new(
+            "SAT-20251231-1-C".to_string(),
+            "SAT".to_string(),
+            2,
+            u128::MAX,
+            0,
+        );
+        // Add to the long; old_value = u128::MAX * 2 overflows u128.
+        pos.update(2, u128::MAX, 1);
+        assert_eq!(
+            pos.average_price,
+            u128::MAX,
+            "average_price saturates at u128::MAX"
+        );
+        assert_eq!(pos.quantity, 4);
+    }
+
+    #[tokio::test]
+    async fn test_list_positions_realized_total_overflow_is_internal_error() {
+        // Issue #61: the realized-PnL total accumulates in i128 and narrows to
+        // i64; a total that exceeds i64 is an opaque internal error, not a wrap.
+        let state = create_test_state();
+        for i in 0..2 {
+            let symbol = format!("OVF{i}-20251231-100-C");
+            let mut pos = PositionInfo::new(symbol.clone(), "OVF".to_string(), 0, 100, 0);
+            pos.realized_pnl = i64::MAX;
+            state.positions.insert(symbol, pos);
+        }
+
+        let err = list_positions(
+            State(state.clone()),
+            Query(PositionQuery { underlying: None }),
+        )
+        .await
+        .expect_err("realized total overflow must surface as an error");
+        assert!(matches!(err, ApiError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn test_list_executions_volume_overflow_is_internal_error() {
+        // Issue #61: total_volume accumulates in u128 and narrows to u64; an
+        // overflow is an opaque internal error.
+        let state = create_test_state();
+        for i in 0..2 {
+            let id = format!("vol-{i}");
+            state.executions.insert(
+                id.clone(),
+                ExecutionInfo {
+                    execution_id: id,
+                    order_id: "o".to_string(),
+                    symbol: "AAPL-20240329-150-C".to_string(),
+                    side: OrderSide::Buy,
+                    price: 100,
+                    quantity: u64::MAX,
+                    timestamp_ms: 1,
+                    counterparty_order_id: None,
+                    is_maker: true,
+                    fee: 0,
+                    edge: None,
+                },
+            );
+        }
+
+        let err = list_executions(
+            State(state.clone()),
+            Query(ExecutionsQuery {
+                from: None,
+                to: None,
+                underlying: None,
+                symbol: None,
+                side: None,
+                limit: 1000,
+                offset: 0,
+            }),
+        )
+        .await
+        .expect_err("total_volume overflow must surface as an error");
+        assert!(matches!(err, ApiError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn test_list_executions_edge_overflow_is_internal_error() {
+        // Issue #61: total_edge accumulates in i128 and narrows to i64.
+        let state = create_test_state();
+        for i in 0..2 {
+            let id = format!("edge-{i}");
+            state.executions.insert(
+                id.clone(),
+                ExecutionInfo {
+                    execution_id: id,
+                    order_id: "o".to_string(),
+                    symbol: "AAPL-20240329-150-C".to_string(),
+                    side: OrderSide::Buy,
+                    price: 100,
+                    quantity: 1,
+                    timestamp_ms: 1,
+                    counterparty_order_id: None,
+                    is_maker: true,
+                    fee: 0,
+                    edge: Some(i64::MAX),
+                },
+            );
+        }
+
+        let err = list_executions(
+            State(state.clone()),
+            Query(ExecutionsQuery {
+                from: None,
+                to: None,
+                underlying: None,
+                symbol: None,
+                side: None,
+                limit: 1000,
+                offset: 0,
+            }),
+        )
+        .await
+        .expect_err("total_edge overflow must surface as an error");
+        assert!(matches!(err, ApiError::Internal(_)));
     }
 
     #[test]
@@ -8185,7 +8432,9 @@ mod tests {
                 offset: 0,
             }),
         )
-        .await;
+        .await
+        .expect("list executions")
+        .0;
 
         assert_eq!(result.executions.len(), 0);
         assert_eq!(result.summary.total_executions, 0);
@@ -8244,7 +8493,9 @@ mod tests {
                 offset: 0,
             }),
         )
-        .await;
+        .await
+        .expect("list executions")
+        .0;
 
         assert_eq!(result.executions.len(), 2);
         assert_eq!(result.summary.total_executions, 2);
@@ -8304,7 +8555,9 @@ mod tests {
                 offset: 0,
             }),
         )
-        .await;
+        .await
+        .expect("list executions")
+        .0;
 
         assert_eq!(result.executions.len(), 1);
         assert_eq!(result.executions[0].side, OrderSide::Buy);

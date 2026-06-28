@@ -598,14 +598,14 @@ impl From<OrderInfo> for OrderStatusResponse {
             filled_quantity: info.filled_quantity,
             status: info.status,
             time_in_force: info.time_in_force,
-            created_at: Utc
-                .timestamp_millis_opt(info.created_at_ms as i64)
-                .single()
+            created_at: i64::try_from(info.created_at_ms)
+                .ok()
+                .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_default(),
-            updated_at: Utc
-                .timestamp_millis_opt(info.updated_at_ms as i64)
-                .single()
+            updated_at: i64::try_from(info.updated_at_ms)
+                .ok()
+                .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_default(),
             fills: info.fills,
@@ -696,7 +696,18 @@ impl PositionInfo {
 
     /// Updates the position with a new fill.
     ///
-    /// Returns the realized P&L from this fill (if closing a position).
+    /// Returns the realized P&L (cents) from this fill (zero when the fill only
+    /// opens or adds to the position).
+    ///
+    /// # Saturation
+    /// The order book has already matched this fill, so an overflow here cannot be
+    /// rejected. Every monetary computation (average entry price, realized P&L,
+    /// cumulative realized P&L) uses checked arithmetic in a wide accumulator and,
+    /// on overflow, SATURATES (`u128::MAX` / `i64::MAX` / `i64::MIN`) while
+    /// emitting a single `tracing::warn!` that names the saturated field. Values
+    /// are never silently wrapped and the function never panics. `quantity` is
+    /// updated with `saturating_add` (an overflow there is structurally
+    /// implausible for contract counts).
     pub fn update(&mut self, fill_quantity: i64, fill_price: u128, timestamp_ms: u64) -> i64 {
         let mut realized = 0i64;
 
@@ -705,31 +716,82 @@ impl PositionInfo {
             (self.quantity > 0 && fill_quantity > 0) || (self.quantity < 0 && fill_quantity < 0);
 
         if same_direction || self.quantity == 0 {
-            // Opening or adding to position - update average price
-            let old_value = self.average_price as i128 * self.quantity.abs() as i128;
-            let new_value = fill_price as i128 * fill_quantity.abs() as i128;
-            let total_quantity = self.quantity.abs() + fill_quantity.abs();
+            // Opening or adding to position - recompute the size-weighted average
+            // entry price in u128. `total_quantity` is the post-fill open size and
+            // is strictly positive whenever a divide is performed, so the division
+            // cannot divide by zero.
+            let old_qty = u128::from(self.quantity.unsigned_abs());
+            let add_qty = u128::from(fill_quantity.unsigned_abs());
+            let total_quantity = old_qty.saturating_add(add_qty);
 
             if total_quantity > 0 {
-                self.average_price = ((old_value + new_value) / total_quantity as i128) as u128;
+                let weighted = self
+                    .average_price
+                    .checked_mul(old_qty)
+                    .zip(fill_price.checked_mul(add_qty))
+                    .and_then(|(old_value, new_value)| old_value.checked_add(new_value))
+                    .map(|sum| sum / total_quantity);
+
+                self.average_price = match weighted {
+                    Some(avg) => avg,
+                    None => {
+                        tracing::warn!(
+                            symbol = %self.symbol,
+                            "average_price computation overflowed u128; saturating to u128::MAX"
+                        );
+                        u128::MAX
+                    }
+                };
             }
-            self.quantity += fill_quantity;
+            self.quantity = self.quantity.saturating_add(fill_quantity);
         } else {
             // Closing position (opposite direction)
-            let close_quantity = fill_quantity.abs().min(self.quantity.abs());
+            let close_quantity = i128::from(
+                fill_quantity
+                    .unsigned_abs()
+                    .min(self.quantity.unsigned_abs()),
+            );
 
-            // Calculate realized P&L
-            let price_diff = fill_price as i128 - self.average_price as i128;
-            if self.quantity > 0 {
-                // Long position being closed by sell
-                realized = (price_diff * close_quantity as i128) as i64;
-            } else {
-                // Short position being closed by buy
-                realized = (-price_diff * close_quantity as i128) as i64;
+            // Realized P&L in i128: (fill_price - average_price) * close_quantity,
+            // negated for a short. The sign is captured up front so a full i128
+            // overflow still saturates in the correct direction.
+            let diff = i128::try_from(fill_price)
+                .ok()
+                .zip(i128::try_from(self.average_price).ok())
+                .and_then(|(fp, ap)| fp.checked_sub(ap));
+            let signed_diff = match diff {
+                Some(d) if self.quantity > 0 => Some(d),
+                Some(d) => d.checked_neg(),
+                None => None,
+            };
+            let realized_i128 = signed_diff.and_then(|d| d.checked_mul(close_quantity));
+
+            realized = match realized_i128.and_then(|v| i64::try_from(v).ok()) {
+                Some(v) => v,
+                None => {
+                    // Saturate toward the sign of the (overflowing) realized P&L:
+                    // profit -> i64::MAX, loss -> i64::MIN.
+                    let positive = matches!(
+                        (self.quantity > 0, fill_price.cmp(&self.average_price)),
+                        (true, std::cmp::Ordering::Greater) | (false, std::cmp::Ordering::Less)
+                    );
+                    let clamped = if positive { i64::MAX } else { i64::MIN };
+                    tracing::warn!(
+                        symbol = %self.symbol,
+                        "realized P&L computation overflowed i64; saturating to {clamped}"
+                    );
+                    clamped
+                }
+            };
+
+            if self.realized_pnl.checked_add(realized).is_none() {
+                tracing::warn!(
+                    symbol = %self.symbol,
+                    "cumulative realized_pnl overflowed i64; saturating"
+                );
             }
-
-            self.realized_pnl += realized;
-            self.quantity += fill_quantity;
+            self.realized_pnl = self.realized_pnl.saturating_add(realized);
+            self.quantity = self.quantity.saturating_add(fill_quantity);
 
             // If position flipped, reset average price to fill price
             if (self.quantity > 0 && fill_quantity > 0) || (self.quantity < 0 && fill_quantity < 0)
@@ -742,17 +804,35 @@ impl PositionInfo {
         realized
     }
 
-    /// Calculates unrealized P&L given current market price.
+    /// Calculates unrealized P&L (cents) given the current market price (cents).
+    ///
+    /// Computes `(current_price - average_price) * quantity` in `i128` with
+    /// checked arithmetic, then narrows to `i64`.
+    ///
+    /// Returns `None` on arithmetic overflow — i.e. when the difference, the
+    /// product, or the final narrowing to `i64` cannot be represented. `None`
+    /// here means OVERFLOW, NOT an unpriced position: an unpriced position has no
+    /// mark and so never calls this (the caller maps overflow to a typed internal
+    /// error, distinct from the omitted-field unpriced representation).
     #[must_use]
-    pub fn unrealized_pnl(&self, current_price: u128) -> i64 {
-        let price_diff = current_price as i128 - self.average_price as i128;
-        (price_diff * self.quantity as i128) as i64
+    pub fn unrealized_pnl(&self, current_price: u128) -> Option<i64> {
+        let current = i128::try_from(current_price).ok()?;
+        let average = i128::try_from(self.average_price).ok()?;
+        let price_diff = current.checked_sub(average)?;
+        let pnl = price_diff.checked_mul(i128::from(self.quantity))?;
+        i64::try_from(pnl).ok()
     }
 
-    /// Calculates notional value given current market price.
+    /// Calculates notional value (cents) given the current market price (cents).
+    ///
+    /// Computes `current_price * abs(quantity)` in `u128` with checked
+    /// multiplication.
+    ///
+    /// Returns `None` on arithmetic overflow (the product exceeds `u128`). `None`
+    /// here means OVERFLOW, NOT an unpriced position (see [`Self::unrealized_pnl`]).
     #[must_use]
-    pub fn notional_value(&self, current_price: u128) -> u128 {
-        current_price * self.quantity.unsigned_abs() as u128
+    pub fn notional_value(&self, current_price: u128) -> Option<u128> {
+        current_price.checked_mul(u128::from(self.quantity.unsigned_abs()))
     }
 }
 
@@ -944,12 +1024,32 @@ impl OhlcBar {
     }
 
     /// Updates the bar with a new trade.
+    ///
+    /// # Saturation
+    /// Bars are aggregated from trades that have already executed, so an overflow
+    /// of the running `volume` or `trade_count` cannot be rejected: both use
+    /// `saturating_add` and emit a single `tracing::warn!` if they saturate at
+    /// `u64::MAX` rather than wrapping or panicking.
     pub fn update(&mut self, price: u128, quantity: u64) {
         self.high = self.high.max(price);
         self.low = self.low.min(price);
         self.close = price;
-        self.volume += quantity;
-        self.trade_count += 1;
+
+        if self.volume.checked_add(quantity).is_none() {
+            tracing::warn!(
+                timestamp = self.timestamp,
+                "OHLC bar volume overflowed u64; saturating to u64::MAX"
+            );
+        }
+        self.volume = self.volume.saturating_add(quantity);
+
+        if self.trade_count.checked_add(1).is_none() {
+            tracing::warn!(
+                timestamp = self.timestamp,
+                "OHLC bar trade_count overflowed u64; saturating to u64::MAX"
+            );
+        }
+        self.trade_count = self.trade_count.saturating_add(1);
     }
 }
 
