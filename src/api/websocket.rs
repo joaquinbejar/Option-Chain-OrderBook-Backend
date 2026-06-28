@@ -487,6 +487,19 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
     let subscribed_symbols_clone = Arc::clone(&subscribed_symbols);
     let subscribed_trades_clone = Arc::clone(&subscribed_trades);
     let send_task = tokio::spawn(async move {
+        // Construct the heartbeat ticker ONCE, outside the loop, so its cadence is
+        // wall-clock fixed and independent of outbound event traffic. (Issue #65:
+        // a `sleep` rebuilt inside the loop is dropped and restarted whenever
+        // another select! branch wins, so a busy connection starves the
+        // heartbeat.)
+        let mut heartbeat = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        // A burst of catch-up ticks after a busy period must not pile up; delay
+        // the schedule instead of firing back-to-back heartbeats.
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `interval`'s first tick resolves immediately; consume it here so the
+        // first heartbeat fires ~30s after connect rather than instantly (the
+        // initial `Connected` message already signals liveness at t=0).
+        heartbeat.tick().await;
         loop {
             tokio::select! {
                 // Handle market maker events
@@ -563,12 +576,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                         }
                     }
                 }
-                // Send periodic heartbeat
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
-                    let heartbeat = WsMessage::Heartbeat {
+                // Send periodic heartbeat on a fixed wall-clock cadence
+                _ = heartbeat.tick() => {
+                    let heartbeat_msg = WsMessage::Heartbeat {
                         timestamp: chrono::Utc::now().timestamp_millis() as u64,
                     };
-                    if let Ok(json) = serde_json::to_string(&heartbeat)
+                    if let Ok(json) = serde_json::to_string(&heartbeat_msg)
                         && sender_clone.lock().await.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
@@ -1837,5 +1850,72 @@ mod tests {
         assert_eq!(SubscriptionChannel::Quotes.to_string(), "quotes");
         assert_eq!(SubscriptionChannel::Prices.to_string(), "prices");
         assert_eq!(SubscriptionChannel::Fills.to_string(), "fills");
+    }
+
+    /// Characterizes the "interval created outside the loop" cadence pattern that
+    /// issue #65 relies on: a busy competitor cannot starve a fixed-cadence
+    /// `interval.tick()`, unlike a per-iteration `sleep`.
+    ///
+    /// This mirrors `send_task`'s structure: a 30s heartbeat `interval` racing a
+    /// hot 1s competitor. With the interval created ONCE outside the loop, the
+    /// heartbeat fires every 30s regardless of competing traffic, so reaching 3
+    /// heartbeats takes ~90s of (virtual) time while the competitor keeps firing.
+    /// The same shape under a `tokio::time::sleep(30s)` rebuilt INSIDE the loop
+    /// would never reach 30s (the future is dropped/restarted each time the
+    /// competitor wins) and would fire 0 times.
+    ///
+    /// Note: this mirrors `send_task`'s structure rather than driving it
+    /// directly, so it does not by itself catch a revert of the production fix; a
+    /// full guard would need a WebSocket harness around `send_task`.
+    #[tokio::test(start_paused = true)]
+    async fn test_heartbeat_fires_on_fixed_cadence_despite_busy_traffic() {
+        use tokio::time::{Duration, Instant, MissedTickBehavior, interval};
+
+        let start = Instant::now();
+
+        // Heartbeat ticker wired exactly as in `send_task`.
+        let mut heartbeat = interval(Duration::from_secs(30));
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.tick().await; // consume the immediate first tick
+
+        // A hot competitor that is ready every second (sub-30s spacing), standing
+        // in for a busy connection's outbound event branches.
+        let mut competitor = interval(Duration::from_secs(1));
+        competitor.tick().await; // consume its immediate first tick too
+
+        let mut heartbeat_ticks = 0u32;
+        let mut competitor_ticks = 0u32;
+
+        // Stop after the 3rd heartbeat; cap iterations so a regression can't hang.
+        let mut iterations = 0u32;
+        while heartbeat_ticks < 3 && iterations < 10_000 {
+            iterations += 1;
+            tokio::select! {
+                // Poll the heartbeat first so the test is deterministic at the
+                // 30s/60s/90s instants where both branches are ready.
+                biased;
+                _ = heartbeat.tick() => { heartbeat_ticks += 1; }
+                _ = competitor.tick() => { competitor_ticks += 1; }
+            }
+        }
+
+        // The heartbeat fired on cadence despite the busy competitor.
+        assert_eq!(heartbeat_ticks, 3, "heartbeat must fire on a fixed cadence");
+        // The competitor was firing ~1/s the whole time, proving the heartbeat
+        // was not starved by a busy connection.
+        assert!(
+            competitor_ticks >= 85,
+            "competitor should fire ~1/s for ~90s, got {competitor_ticks}"
+        );
+        // Three 30s heartbeats means ~90s of virtual time elapsed (cadence held).
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(90),
+            "expected ~90s elapsed, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(95),
+            "heartbeat cadence drifted, elapsed {elapsed:?}"
+        );
     }
 }
