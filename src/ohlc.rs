@@ -85,9 +85,20 @@ impl OhlcAggregator {
     /// * `to` - Optional end timestamp in seconds (inclusive)
     /// * `limit` - Maximum number of bars to return
     ///
+    /// # Limit semantics
+    ///
+    /// When more than `limit` bars match the `[from, to]` range:
+    /// - **Open-ended** (`to` is `None`): the caller wants "the latest N", so the
+    ///   NEWEST `limit` bars are returned (issue #73). Without this a charting
+    ///   client polling recent data would receive the OLDEST `limit` bars once the
+    ///   history grew past `limit` — backwards from candlestick semantics.
+    /// - **Explicit `to`**: the result is anchored at `from` (the window start),
+    ///   so the OLDEST `limit` bars within `[from, to]` are returned (unchanged
+    ///   behavior).
+    ///
     /// # Returns
     ///
-    /// A vector of OHLC bars sorted by timestamp (oldest first).
+    /// A vector of OHLC bars sorted by timestamp (oldest first) in both cases.
     #[must_use]
     pub fn get_bars(
         &self,
@@ -105,12 +116,18 @@ impl OhlcAggregator {
 
         let from_ts = from.unwrap_or(0);
         let to_ts = to.unwrap_or(u64::MAX);
+        let range = bars_map.range(from_ts..=to_ts);
 
-        bars_map
-            .range(from_ts..=to_ts)
-            .map(|(_, bar)| *bar)
-            .take(limit)
-            .collect()
+        if to.is_none() {
+            // Open-ended: take the newest `limit` bars from the end of the range,
+            // then restore ascending (oldest-first) order for the returned Vec.
+            let mut bars: Vec<OhlcBar> = range.rev().take(limit).map(|(_, bar)| *bar).collect();
+            bars.reverse();
+            bars
+        } else {
+            // Explicit end: the window ends at `to`; keep the oldest `limit` bars.
+            range.take(limit).map(|(_, bar)| *bar).collect()
+        }
     }
 
     /// Gets the most recent bar for a symbol and interval.
@@ -258,6 +275,108 @@ mod tests {
         // Limit to 5 bars
         let bars = aggregator.get_bars(symbol, OhlcInterval::OneMinute, None, None, 5);
         assert_eq!(bars.len(), 5);
+    }
+
+    #[test]
+    fn test_get_bars_open_ended_returns_newest_n() {
+        // Issue #73: with a limit and no explicit `to`, return the NEWEST `limit`
+        // bars (still ascending) — NOT the oldest. Fails under the old
+        // oldest-first `.take(limit)`.
+        let aggregator = OhlcAggregator::new();
+        let symbol = "AAPL_20251231_150_C";
+        let base_ts_ms: u64 = 1704067200000; // minute boundary
+        let total: u64 = 600;
+        let limit: usize = 500;
+
+        for i in 0..total {
+            aggregator.record_trade(symbol, base_ts_ms + i * 60_000, 500 + i as u128, 100);
+        }
+
+        let bars = aggregator.get_bars(symbol, OhlcInterval::OneMinute, None, None, limit);
+        assert_eq!(bars.len(), limit, "returns exactly `limit` bars");
+
+        let base_secs = base_ts_ms / 1000;
+        // The newest 500 of 600 bars are indices 100..=599.
+        let expected_first = base_secs + 100 * 60;
+        let expected_last = base_secs + (total - 1) * 60;
+        assert_eq!(
+            bars[0].timestamp, expected_first,
+            "first bar is the newest window start, not the oldest"
+        );
+        assert_eq!(
+            bars[bars.len() - 1].timestamp,
+            expected_last,
+            "last bar is the most recent"
+        );
+        // Explicitly NOT the oldest bar.
+        assert_ne!(
+            bars[0].timestamp, base_secs,
+            "must not return the oldest bars"
+        );
+        // Ordering preserved: strictly ascending by timestamp.
+        assert!(
+            bars.windows(2).all(|w| w[0].timestamp < w[1].timestamp),
+            "ascending (oldest-first) order preserved"
+        );
+    }
+
+    #[test]
+    fn test_get_bars_with_explicit_to_returns_oldest_limit_within_window() {
+        // Issue #73: when `to` is given the window is anchored at `to`, so the
+        // OLDEST `limit` within [from, to] are returned (unchanged semantics).
+        let aggregator = OhlcAggregator::new();
+        let symbol = "AAPL_20251231_150_C";
+        let base_ts_ms: u64 = 1704067200000;
+
+        for i in 0..10u64 {
+            aggregator.record_trade(symbol, base_ts_ms + i * 60_000, 500, 100);
+        }
+
+        let base_secs = base_ts_ms / 1000;
+        // Window [bar2 .. bar7] inclusive = 6 bars; limit 3 -> oldest 3 of window.
+        let from_ts = base_secs + 2 * 60;
+        let to_ts = base_secs + 7 * 60;
+        let bars = aggregator.get_bars(
+            symbol,
+            OhlcInterval::OneMinute,
+            Some(from_ts),
+            Some(to_ts),
+            3,
+        );
+
+        assert_eq!(bars.len(), 3);
+        assert_eq!(bars[0].timestamp, from_ts, "window starts at `from`");
+        assert_eq!(
+            bars[2].timestamp,
+            base_secs + 4 * 60,
+            "oldest 3 bars within the explicit window"
+        );
+        assert!(bars.windows(2).all(|w| w[0].timestamp < w[1].timestamp));
+    }
+
+    #[test]
+    fn test_get_bars_limit_exceeds_available_returns_all_ascending() {
+        // Issue #73: a limit larger than the number of bars returns them all,
+        // ascending.
+        let aggregator = OhlcAggregator::new();
+        let symbol = "AAPL_20251231_150_C";
+        let base_ts_ms: u64 = 1704067200000;
+
+        for i in 0..5u64 {
+            aggregator.record_trade(symbol, base_ts_ms + i * 60_000, 500, 100);
+        }
+
+        let base_secs = base_ts_ms / 1000;
+        let bars = aggregator.get_bars(symbol, OhlcInterval::OneMinute, None, None, 500);
+
+        assert_eq!(
+            bars.len(),
+            5,
+            "returns all available when limit exceeds count"
+        );
+        assert_eq!(bars[0].timestamp, base_secs, "oldest first");
+        assert_eq!(bars[4].timestamp, base_secs + 4 * 60, "newest last");
+        assert!(bars.windows(2).all(|w| w[0].timestamp < w[1].timestamp));
     }
 
     #[test]
