@@ -350,4 +350,27 @@ mod tests {
         // 1d interval
         assert_eq!(OhlcInterval::OneDay.floor_timestamp(1704100000), 1704067200);
     }
+
+    #[test]
+    fn test_ohlc_bar_update_saturates_on_overflow() {
+        // Issue #61: bars are aggregated from already-executed trades, so an
+        // overflow of the running volume / trade_count must saturate (no panic,
+        // no wrap) rather than be rejected.
+        let mut bar = OhlcBar::new(0, 100, u64::MAX);
+        bar.update(120, 10);
+
+        assert_eq!(bar.volume, u64::MAX, "volume saturates at u64::MAX");
+        assert_eq!(bar.trade_count, 2, "trade_count still advances");
+        assert_eq!(bar.close, 120);
+        assert_eq!(bar.high, 120);
+
+        // trade_count saturation: drive it to u64::MAX, then one more trade.
+        bar.trade_count = u64::MAX;
+        bar.update(130, 0);
+        assert_eq!(
+            bar.trade_count,
+            u64::MAX,
+            "trade_count saturates at u64::MAX"
+        );
+    }
 }
