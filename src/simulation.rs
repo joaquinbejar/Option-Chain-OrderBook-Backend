@@ -184,9 +184,19 @@ impl PriceSimulator {
         let n_steps = 43_200; // 30 days in minutes
 
         for asset in &assets {
-            // Store prices in cents
-            let price_cents = (asset.initial_price * 100.0) as u64;
-            initial_prices.insert(asset.symbol.clone(), price_cents);
+            // Store prices in cents through the single canonical rounding helper.
+            // A non-finite or out-of-range initial price is logged and the seed
+            // is skipped rather than truncated to a corrupt value.
+            match crate::config::dollars_to_cents(asset.initial_price) {
+                Some(price_cents) => {
+                    initial_prices.insert(asset.symbol.clone(), price_cents);
+                }
+                None => warn!(
+                    symbol = %asset.symbol,
+                    initial_price = asset.initial_price,
+                    "skipping initial price seed for misconfigured asset"
+                ),
+            }
 
             // Generate price path for this asset. A misconfigured asset (e.g. a
             // non-positive or out-of-range initial price/volatility) is logged and
@@ -312,7 +322,24 @@ impl PriceSimulator {
 
         let sim = match simulations.get_mut(symbol) {
             Some(s) => s,
-            None => return (asset.initial_price * 100.0) as u64,
+            None => {
+                // No simulation path was registered (the asset was skipped at
+                // construction). Fall back to the last stored price, then to the
+                // canonical rounding of the configured initial price; both round
+                // consistently. A non-finite/out-of-range price is logged and we
+                // return 0 only as an unreachable last resort, never silently.
+                return self
+                    .get_price(symbol)
+                    .or_else(|| crate::config::dollars_to_cents(asset.initial_price))
+                    .unwrap_or_else(|| {
+                        warn!(
+                            symbol = %symbol,
+                            initial_price = asset.initial_price,
+                            "no simulation registered and initial price invalid; returning 0"
+                        );
+                        0
+                    });
+            }
         };
 
         // Advance to next step
@@ -320,10 +347,19 @@ impl PriceSimulator {
 
         // If we've exhausted the walk, regenerate
         if sim.current_index >= sim.prices.len() {
-            // Get current price as new starting point
+            // Get current price as new starting point, rounding the configured
+            // initial price through the canonical helper when no price is stored.
             let current_price = self
                 .get_price(symbol)
-                .unwrap_or((asset.initial_price * 100.0) as u64);
+                .or_else(|| crate::config::dollars_to_cents(asset.initial_price))
+                .unwrap_or_else(|| {
+                    warn!(
+                        symbol = %symbol,
+                        initial_price = asset.initial_price,
+                        "no stored price and initial price invalid; restarting walk from 0"
+                    );
+                    0
+                });
             let price_dollars = current_price as f64 / 100.0;
 
             // Regenerate price path starting from current price. If regeneration
@@ -357,7 +393,20 @@ impl PriceSimulator {
             .get(sim.current_index)
             .copied()
             .unwrap_or(asset.initial_price);
-        let price_cents = (price_dollars.max(0.01) * 100.0) as u64;
+        // Round dollars→cents through the canonical helper (floored at one cent).
+        // A non-finite/out-of-range walk value is logged and the last known price
+        // is reused rather than truncated to a corrupt value.
+        let price_cents =
+            crate::config::dollars_to_cents(price_dollars.max(0.01)).unwrap_or_else(|| {
+                let fallback = self.get_price(symbol).unwrap_or(0);
+                warn!(
+                    symbol = %symbol,
+                    price_dollars,
+                    fallback_cents = fallback,
+                    "simulated price is non-finite or out of range; reusing last known price"
+                );
+                fallback
+            });
 
         // Update stored price
         self.set_price(symbol, price_cents);

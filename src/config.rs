@@ -5,15 +5,50 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
-/// Maximum accepted asset `initial_price` in dollars.
+/// Maximum accepted dollar price anywhere a dollar amount is converted to cents.
 ///
-/// Bounds the downstream cents conversion (`initial_price * 100.0`) and strike
-/// generation so they cannot overflow `u64`/`u128` or produce absurd books. A
-/// trillion dollars is far beyond any real underlying yet leaves huge headroom.
+/// This is the ONE canonical upper bound for the server's dollar→cents
+/// conversions (see [`dollars_to_cents`]): asset `initial_price` validation,
+/// startup price seeding, strike generation, the price simulation, and the live
+/// `POST /api/v1/prices` insert all share it. Bounding the input keeps the cents
+/// result (`<= MAX_INITIAL_PRICE * 100`) well within `u64`/`u128`/`i64` range, so
+/// a conversion can never overflow or wrap. A trillion dollars is far beyond any
+/// real underlying yet leaves huge headroom.
 pub const MAX_INITIAL_PRICE: f64 = 1e12;
 
 /// Maximum accepted asset `volatility` (annualized, as a fraction).
 pub const MAX_VOLATILITY: f64 = 5.0;
+
+/// Converts a dollar amount to integer cents using the single, canonical
+/// rounding policy for the whole server.
+///
+/// Rounds to the nearest cent (`f64::round`, i.e. half away from zero), so
+/// `0.07` becomes `7` cents and `100.999` becomes `10100` — never the truncated
+/// `6` / `10099` produced by a bare `(value * 100.0) as u64` cast, which biases
+/// every price downward.
+///
+/// Returns `None` for any value that is not a usable price — non-finite
+/// (`NaN` / `±∞`), negative, or greater than [`MAX_INITIAL_PRICE`] — so a bad
+/// `f64` can never wrap, saturate, or overflow. A `Some` result is only ever
+/// produced from a verified, in-range value and lies in
+/// `[0, MAX_INITIAL_PRICE * 100]`, far below `u64::MAX`.
+///
+/// Every dollar **input**→cents conversion (config seed, simulation, strike
+/// generation, and the live `POST /api/v1/prices` insert) routes through this
+/// helper so the rounding policy is single-sourced; the transport layer
+/// (`api::controls::dollars_to_cents`) wraps it to attach granular, per-reason
+/// error messages. The market-maker quoter's theoretical-value→cents conversion
+/// is separate.
+#[must_use]
+pub(crate) fn dollars_to_cents(value: f64) -> Option<u64> {
+    if !value.is_finite() || !(0.0..=MAX_INITIAL_PRICE).contains(&value) {
+        return None;
+    }
+    // Safe: `value` is finite and in `[0, MAX_INITIAL_PRICE]`, so the rounded
+    // cents value lies in `[0, MAX_INITIAL_PRICE * 100]`, far below `u64::MAX`.
+    // The cast cannot overflow or wrap.
+    Some((value * 100.0).round() as u64)
+}
 
 /// Default token issuer (`iss` claim) when none is configured.
 pub const DEFAULT_ISSUER: &str = "option-chain-orderbook-backend";
@@ -399,8 +434,18 @@ impl AssetConfig {
         for i in 0..self.num_strikes {
             let offset = (i as f64 - half_count as f64) * self.strike_spacing;
             let strike = (center + offset).max(self.strike_spacing);
-            // Convert to cents
-            strikes.push((strike * 100.0) as u64);
+            // Convert to cents through the single canonical rounding helper. A
+            // strike that is non-finite or out of range is logged and skipped
+            // rather than truncated into a corrupt value (inputs are already
+            // validated by `Config::validate`, so this is a defensive guard).
+            match dollars_to_cents(strike) {
+                Some(cents) => strikes.push(cents),
+                None => tracing::warn!(
+                    symbol = %self.symbol,
+                    strike,
+                    "skipping strike: dollar value is non-finite or out of range"
+                ),
+            }
         }
 
         strikes
@@ -614,6 +659,59 @@ strike_spacing = 1000.0
         assert_eq!(strikes.len(), 5);
         // Strikes should be centered around 100: 80, 90, 100, 110, 120
         assert_eq!(strikes, vec![8000, 9000, 10000, 11000, 12000]);
+    }
+
+    #[test]
+    fn test_generate_strikes_rounds_not_truncates() {
+        // A strike at a `.999` dollar boundary must ROUND to the nearest cent
+        // (10100), not truncate downward (10099) as the old `as u64` cast did.
+        let asset = AssetConfig {
+            symbol: "RND".to_string(),
+            name: "Rounding".to_string(),
+            initial_price: 100.999,
+            volatility: 0.2,
+            drift: 0.0,
+            expirations: vec!["20251231".to_string()],
+            num_strikes: 1,
+            strike_spacing: 1.0,
+        };
+
+        let strikes = asset.generate_strikes();
+        assert_eq!(strikes, vec![10100]);
+    }
+
+    #[test]
+    fn test_dollars_to_cents_rounds_half_up() {
+        // The exact issue acceptance cases: these FAIL under truncation (6 and
+        // 10099) but pass under the single canonical `.round()` policy.
+        assert_eq!(dollars_to_cents(0.07), Some(7));
+        assert_eq!(dollars_to_cents(100.999), Some(10100));
+    }
+
+    #[test]
+    fn test_dollars_to_cents_zero_and_basics() {
+        assert_eq!(dollars_to_cents(0.0), Some(0));
+        assert_eq!(dollars_to_cents(1.0), Some(100));
+        assert_eq!(dollars_to_cents(150.50), Some(15050));
+        // Half a cent rounds up; just under rounds down.
+        assert_eq!(dollars_to_cents(0.005), Some(1));
+        assert_eq!(dollars_to_cents(0.004), Some(0));
+    }
+
+    #[test]
+    fn test_dollars_to_cents_rejects_invalid() {
+        assert_eq!(dollars_to_cents(f64::NAN), None);
+        assert_eq!(dollars_to_cents(f64::INFINITY), None);
+        assert_eq!(dollars_to_cents(f64::NEG_INFINITY), None);
+        assert_eq!(dollars_to_cents(-0.01), None);
+        assert_eq!(dollars_to_cents(MAX_INITIAL_PRICE * 2.0), None);
+    }
+
+    #[test]
+    fn test_dollars_to_cents_accepts_at_cap() {
+        // The canonical cap itself is accepted and its cents fit in i64.
+        let cents = dollars_to_cents(MAX_INITIAL_PRICE).expect("cap is in range");
+        assert!(i64::try_from(cents).is_ok());
     }
 
     #[test]

@@ -262,6 +262,18 @@ fn test_dollars_to_cents_valid_conversion() {
 }
 
 #[test]
+fn test_dollars_to_cents_shares_canonical_rounding_policy() {
+    // The transport wrapper must round identically to the single canonical
+    // `config::dollars_to_cents` helper it delegates to: these acceptance cases
+    // FAIL under the old truncating cast (6 and 10099).
+    assert_eq!(dollars_to_cents("price", 0.07).unwrap(), 7);
+    assert_eq!(dollars_to_cents("price", 100.999).unwrap(), 10100);
+    // Same inputs through the shared core yield the same cents.
+    assert_eq!(crate::config::dollars_to_cents(0.07), Some(7));
+    assert_eq!(crate::config::dollars_to_cents(100.999), Some(10100));
+}
+
+#[test]
 fn test_dollars_to_cents_rejects_negative() {
     let err = dollars_to_cents("price", -0.01).unwrap_err();
     assert!(matches!(err, ApiError::InvalidRequest(_)));

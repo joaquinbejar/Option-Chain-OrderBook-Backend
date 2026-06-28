@@ -336,19 +336,23 @@ pub async fn list_instruments(State(state): State<Arc<AppState>>) -> Json<Instru
 
 /// Maximum accepted monetary value, in dollars, for any inbound price field.
 ///
-/// Inbound dollar amounts are multiplied by 100 to obtain integer cents. Capping
-/// the input at one quadrillion dollars guarantees the resulting cents value
-/// (`<= 1e17`) stays well within both `u64` and `i64` range, so the conversion
-/// can never overflow or wrap. No real instrument price approaches this bound.
-const MAX_PRICE_DOLLARS: f64 = 1e15;
+/// Aliases the crate-wide canonical bound [`crate::config::MAX_INITIAL_PRICE`] so
+/// the inbound-price ceiling is single-sourced with the shared
+/// [`crate::config::dollars_to_cents`] rounding helper — there is exactly ONE
+/// max-price constant and ONE rounding policy across startup, simulation, strike
+/// generation, and this live insert. Capping the input keeps the resulting cents
+/// value well within both `u64` and `i64` range, so the conversion can never
+/// overflow or wrap. No real instrument price approaches this bound.
+const MAX_PRICE_DOLLARS: f64 = crate::config::MAX_INITIAL_PRICE;
 
 /// Converts a dollar amount to integer cents with full validation.
 ///
-/// Rejects non-finite (`NaN` / infinite), negative, and out-of-range values
-/// (above [`MAX_PRICE_DOLLARS`]) so a bad `f64` can never wrap or saturate into a
-/// corrupt cents value. The rounded result is only produced from a verified,
-/// in-range value. The `field` name and the offending `value` are included in the
-/// error message (no secrets).
+/// Runs granular, per-reason checks first so the caller gets a precise 400
+/// message (non-finite vs. negative vs. out-of-range), then delegates the actual
+/// dollars→cents round to the single canonical [`crate::config::dollars_to_cents`]
+/// helper so the rounding policy (`.round()`, half away from zero) is
+/// single-sourced across the server. The `field` name and the offending `value`
+/// are included in the error message (no secrets).
 ///
 /// # Errors
 /// Returns [`ApiError::InvalidRequest`] when `value` is `NaN`, infinite,
@@ -371,10 +375,12 @@ fn dollars_to_cents(field: &str, value: f64) -> Result<u64, ApiError> {
             "{field} exceeds maximum allowed value of {MAX_PRICE_DOLLARS}, got {value}"
         )));
     }
-    // Safe: `value` is finite and in `[0, MAX_PRICE_DOLLARS]`, so the rounded
-    // cents value lies in `[0, 1e17]`, well below `u64::MAX`. The cast cannot
-    // overflow or wrap.
-    Ok((value * 100.0).round() as u64)
+    // Route the actual round+bound through the ONE canonical helper so the
+    // rounding policy is single-sourced. The granular checks above already
+    // guarantee a `Some` here; the `ok_or_else` is an unreachable safety net.
+    crate::config::dollars_to_cents(value).ok_or_else(|| {
+        ApiError::InvalidRequest(format!("{field} is not a valid price, got {value}"))
+    })
 }
 
 /// Converts a validated cents value to the signed representation used by the
