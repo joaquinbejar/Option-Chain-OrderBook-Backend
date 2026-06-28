@@ -114,6 +114,10 @@ serde_urlencoded = "0.7"
 jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "rust_crypto"] }
 
 [dev-dependencies]
+# `test-util` enables paused/virtual time (`tokio::time::pause`,
+# `#[tokio::test(start_paused = true)]`) for deterministic timer/cadence tests.
+# Dev-only: the production binary keeps the workspace `full` feature set.
+tokio = { workspace = true, features = ["test-util"] }
 
 
 [[bin]]
