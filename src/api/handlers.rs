@@ -1358,8 +1358,10 @@ pub async fn add_order(
     let option_style = parse_option_style(&style)?;
     let side = order_side_to_side(body.side);
 
-    // Convert API TimeInForce to orderbook-rs TimeInForce
-    let tif = match body.time_in_force.unwrap_or_default() {
+    // Convert API TimeInForce to orderbook-rs TimeInForce. `api_tif` is `Copy`,
+    // so it is reused below to record the tracked order's time-in-force.
+    let api_tif = body.time_in_force.unwrap_or_default();
+    let tif = match api_tif {
         ApiTimeInForce::Gtc => TimeInForce::Gtc,
         ApiTimeInForce::Ioc => TimeInForce::Ioc,
         ApiTimeInForce::Fok => TimeInForce::Fok,
@@ -1379,34 +1381,134 @@ pub async fn add_order(
 
     let order_id = OrderId::new();
 
-    // Use add_limit_order_with_tif for TIF support
-    match option_book.add_limit_order_with_tif(order_id, side, body.price, body.quantity, tif) {
-        Ok(()) => {
-            // For GTC orders, the order is accepted and placed in the book
-            Ok(Json(AddOrderResponse {
-                order_id: order_id.to_string(),
-                status: LimitOrderStatus::Accepted,
-                filled_quantity: 0,
-                remaining_quantity: body.quantity,
-                message: format!("Order added successfully with TIF={}", tif),
-            }))
-        }
+    // Use the fill-capturing TIF variant so the tracked `OrderInfo` reflects the
+    // real fill/remaining state (mirroring the bulk submit path in
+    // `submit_single_order`). A marketable limit order can (partially) fill on
+    // submit and rest only its remainder.
+    let trade_result = match option_book.add_limit_order_with_tif_full(
+        order_id,
+        side,
+        body.price,
+        body.quantity,
+        tif,
+    ) {
+        Ok(tr) => tr,
         Err(e) => {
             let error_str = e.to_string();
-            // Check if it's an IOC/FOK rejection due to insufficient liquidity
+            // An IOC/FOK rejected for insufficient liquidity is a normal,
+            // non-error outcome reported as `Rejected`; nothing is placed, so
+            // nothing is tracked.
             if error_str.contains("InsufficientLiquidity") || error_str.contains("insufficient") {
-                Ok(Json(AddOrderResponse {
+                return Ok(Json(AddOrderResponse {
                     order_id: order_id.to_string(),
                     status: LimitOrderStatus::Rejected,
                     filled_quantity: 0,
                     remaining_quantity: body.quantity,
                     message: format!("Order rejected: {}", error_str),
-                }))
-            } else {
-                Err(ApiError::OrderBook(error_str))
+                }));
             }
+            return Err(ApiError::OrderBook(error_str));
         }
-    }
+    };
+
+    // Derive the real fill/remaining state from the match result.
+    let match_result = &trade_result.match_result;
+    let filled_quantity = match_result
+        .executed_quantity()
+        .map(|q| q.as_u64())
+        .unwrap_or(0);
+    let remaining_quantity = match_result.remaining_quantity().as_u64();
+    let is_complete = match_result.is_complete();
+    let order_status = if is_complete {
+        OrderStatus::Filled
+    } else if filled_quantity > 0 {
+        OrderStatus::Partial
+    } else {
+        OrderStatus::Active
+    };
+    let fills: Vec<OrderFillInfo> = match_result
+        .trades()
+        .as_vec()
+        .iter()
+        .map(|t| OrderFillInfo {
+            price: t.price().as_u128(),
+            quantity: t.quantity().as_u64(),
+            timestamp_ms: t.timestamp().as_u64(),
+        })
+        .collect();
+
+    // Track the order in AppState so the single-order path is uniformly visible
+    // to GET /orders, GET /orders/{id}, cancel-all, and bulk-cancel — identical
+    // to the bulk submit path.
+    let style_char = match option_style {
+        OptionStyle::Call => "C",
+        OptionStyle::Put => "P",
+    };
+    // Store the canonical lowercase style and the YYYYMMDD-formatted expiration
+    // so the cancel-all / bulk-cancel book lookups (which match on these fields)
+    // resolve the order regardless of the inbound path's casing or date format.
+    let canonical_style = match option_style {
+        OptionStyle::Call => "call",
+        OptionStyle::Put => "put",
+    };
+    let exp_formatted = format_expiration(&expiration);
+    let symbol = format!("{}-{}-{}-{}", underlying, exp_formatted, strike, style_char);
+    let order_side = match side {
+        Side::Buy => OrderSide::Buy,
+        Side::Sell => OrderSide::Sell,
+    };
+    let tracked_tif = match api_tif {
+        ApiTimeInForce::Gtc => OrderTimeInForce::Gtc,
+        ApiTimeInForce::Ioc => OrderTimeInForce::Ioc,
+        ApiTimeInForce::Fok => OrderTimeInForce::Fok,
+        ApiTimeInForce::Gtd => OrderTimeInForce::Gtd,
+    };
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let order_info = OrderInfo {
+        order_id: order_id.to_string(),
+        symbol,
+        underlying: underlying.clone(),
+        expiration: exp_formatted,
+        strike,
+        style: canonical_style.to_string(),
+        side: order_side,
+        price: body.price,
+        original_quantity: body.quantity,
+        remaining_quantity,
+        filled_quantity,
+        status: order_status,
+        time_in_force: tracked_tif,
+        created_at_ms: now,
+        updated_at_ms: now,
+        fills,
+    };
+    state.orders.insert(order_id.to_string(), order_info);
+
+    tracing::debug!(
+        order_id = %order_id,
+        underlying = %underlying,
+        strike = strike,
+        side = ?order_side,
+        filled_quantity = filled_quantity,
+        remaining_quantity = remaining_quantity,
+        "order submitted and tracked"
+    );
+
+    let response_status = if is_complete {
+        LimitOrderStatus::Filled
+    } else if filled_quantity > 0 {
+        LimitOrderStatus::Partial
+    } else {
+        LimitOrderStatus::Accepted
+    };
+
+    Ok(Json(AddOrderResponse {
+        order_id: order_id.to_string(),
+        status: response_status,
+        filled_quantity,
+        remaining_quantity,
+        message: format!("Order added successfully with TIF={}", tif),
+    }))
 }
 
 /// Cancel order from option book.
@@ -1464,6 +1566,26 @@ pub async fn cancel_order(
     let success = option_book
         .cancel_order(order_id)
         .map_err(|e| ApiError::OrderBook(e.to_string()))?;
+
+    // Reconcile tracking so a cancelled order no longer shows as Active, keeping
+    // the single-order path consistent with cancel-all / bulk-cancel.
+    if success {
+        // The order was resting and is now cancelled — drop it from tracking.
+        state.orders.remove(&order_id_str);
+    } else if let Some(mut entry) = state.orders.get_mut(&order_id_str) {
+        // Not resting despite being tracked: the order left the book by filling.
+        // Mark it terminal (Filled) so it is not reported as Active any longer.
+        entry.filled_quantity = entry.original_quantity;
+        entry.remaining_quantity = 0;
+        entry.status = OrderStatus::Filled;
+        entry.updated_at_ms = chrono::Utc::now().timestamp_millis() as u64;
+    }
+
+    tracing::debug!(
+        order_id = %order_id,
+        success = success,
+        "order cancel processed"
+    );
 
     Ok(Json(CancelOrderResponse {
         success,
@@ -1572,20 +1694,66 @@ pub async fn modify_order(
         }));
     }
 
+    // The original order has now been cancelled in the book, so drop its tracking
+    // entry unconditionally — it no longer exists regardless of whether it was
+    // tracked before (single-order, bulk, or untracked). Tracking is then
+    // reconciled below by the outcome of the replacement, so neither the
+    // replace-succeeded nor the cancel-ok/replace-fail path can leave a stale
+    // `Active` entry behind.
+    state.orders.remove(&order_id_str);
+
     // Create a new order with the updated parameters
     let new_order_id = OrderId::new();
 
     match option_book.add_limit_order(new_order_id, side, new_price, new_quantity) {
         Ok(()) => {
-            // Update order info in AppState
-            if let Some(order_info) = state.orders.remove(&order_id_str) {
-                let mut updated_info = order_info.1;
-                updated_info.order_id = new_order_id.to_string();
-                updated_info.price = new_price;
-                updated_info.remaining_quantity = new_quantity;
-                updated_info.updated_at_ms = chrono::Utc::now().timestamp_millis() as u64;
-                state.orders.insert(new_order_id.to_string(), updated_info);
-            }
+            // The replacement rests as a fresh order; track it under the new id
+            // using the authoritative path/book data so it is uniformly visible
+            // and cancellable. `add_limit_order` places a GTC order, so the
+            // tracked time-in-force reflects that book reality.
+            let order_side = match side {
+                Side::Buy => OrderSide::Buy,
+                Side::Sell => OrderSide::Sell,
+            };
+            let style_char = match option_style {
+                OptionStyle::Call => "C",
+                OptionStyle::Put => "P",
+            };
+            let canonical_style = match option_style {
+                OptionStyle::Call => "call",
+                OptionStyle::Put => "put",
+            };
+            // `exp_str` matched `find_expiration_by_str` above, so it is already
+            // the canonical YYYYMMDD form used by the cancel book lookups.
+            let symbol = format!("{}-{}-{}-{}", underlying, exp_str, strike, style_char);
+            let now = chrono::Utc::now().timestamp_millis() as u64;
+            let order_info = OrderInfo {
+                order_id: new_order_id.to_string(),
+                symbol,
+                underlying: underlying.clone(),
+                expiration: exp_str.clone(),
+                strike,
+                style: canonical_style.to_string(),
+                side: order_side,
+                price: new_price,
+                original_quantity: new_quantity,
+                remaining_quantity: new_quantity,
+                filled_quantity: 0,
+                status: OrderStatus::Active,
+                time_in_force: OrderTimeInForce::Gtc,
+                created_at_ms: now,
+                updated_at_ms: now,
+                fills: vec![],
+            };
+            state.orders.insert(new_order_id.to_string(), order_info);
+
+            tracing::debug!(
+                old_order_id = %order_id_str,
+                new_order_id = %new_order_id,
+                new_price = new_price,
+                new_quantity = new_quantity,
+                "order modified (cancel-and-replace)"
+            );
 
             Ok(Json(ModifyOrderResponse {
                 order_id: new_order_id.to_string(),
@@ -1597,7 +1765,15 @@ pub async fn modify_order(
             }))
         }
         Err(e) => {
-            // Failed to place new order - the original is already canceled
+            // Cancel succeeded but the replacement failed: nothing is live. The
+            // old entry was already removed above, so no stale `Active` entry
+            // remains, and `new_order_id` is never tracked because no order was
+            // placed under it.
+            tracing::warn!(
+                order_id = %order_id_str,
+                error = %e,
+                "order modify: original cancelled but replacement failed to place"
+            );
             Ok(Json(ModifyOrderResponse {
                 order_id: order_id_str,
                 status: ModifyOrderStatus::Rejected,
@@ -3591,6 +3767,356 @@ mod tests {
 
         assert_eq!(response.status, LimitOrderStatus::Accepted);
         assert!(response.message.contains("GTC"));
+    }
+
+    // ------------------------------------------------------------------------
+    // Issue #53: single-order endpoints must track orders in `state.orders` so
+    // they are uniformly visible / cancellable, exactly like the bulk path.
+    // ------------------------------------------------------------------------
+
+    /// Submits a resting GTC buy via the `add_order` handler and returns the
+    /// `(order_id, expiration_path)` pair.
+    ///
+    /// The order has no opposing liquidity, so it rests as `Active` with nothing
+    /// filled — a clean, deterministic fixture for the tracking assertions.
+    ///
+    /// The returned `expiration_path` is the expiration string the system
+    /// recorded for the order (`OrderInfo::expiration`), i.e. the canonical
+    /// form that `find_expiration_by_str` resolves back to the order's book.
+    /// Passing it as the path segment to `cancel_order` / `modify_order`
+    /// exercises the genuine end-to-end single-order flow regardless of how
+    /// `parse_expiration` normalizes the inbound `"20251231"` literal.
+    async fn submit_tracked_gtc_order(state: &Arc<AppState>) -> (String, String) {
+        let request = AddOrderRequest {
+            side: OrderSide::Buy,
+            price: 100,
+            quantity: 10,
+            time_in_force: Some(ApiTimeInForce::Gtc),
+            expire_at: None,
+        };
+        let order_id = add_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Json(request),
+        )
+        .await
+        .expect("order accepted")
+        .0
+        .order_id;
+        let expiration_path = state
+            .orders
+            .get(&order_id)
+            .expect("order must be tracked")
+            .expiration
+            .clone();
+        (order_id, expiration_path)
+    }
+
+    #[tokio::test]
+    async fn test_add_order_tracks_order_in_state() {
+        let state = create_test_state();
+        let (order_id, _exp) = submit_tracked_gtc_order(&state).await;
+
+        // Tracked in state.orders.
+        assert!(
+            state.orders.contains_key(&order_id),
+            "order created via add_order must be tracked"
+        );
+
+        // Visible via GET /orders/{id}.
+        let status = get_order_status(State(state.clone()), Path(order_id.clone()))
+            .await
+            .expect("order status must be found")
+            .0;
+        assert_eq!(status.order_id, order_id);
+        assert_eq!(status.status, OrderStatus::Active);
+        assert_eq!(status.original_quantity, 10);
+        assert_eq!(status.remaining_quantity, 10);
+        assert_eq!(status.filled_quantity, 0);
+        assert_eq!(status.price, 100);
+
+        // Visible via GET /orders.
+        let list = list_orders(
+            State(state.clone()),
+            Query(OrderListQuery {
+                underlying: None,
+                status: None,
+                side: None,
+                limit: 100,
+                offset: 0,
+            }),
+        )
+        .await
+        .expect("list ok")
+        .0;
+        assert_eq!(list.total, 1);
+        assert_eq!(list.orders[0].order_id, order_id);
+    }
+
+    #[tokio::test]
+    async fn test_add_order_cancellable_via_cancel_all() {
+        let state = create_test_state();
+        let (order_id, _exp) = submit_tracked_gtc_order(&state).await;
+
+        let resp = cancel_all_orders(
+            State(state.clone()),
+            Query(CancelAllQuery {
+                underlying: Some("TEST".to_string()),
+                expiration: None,
+                side: None,
+                style: None,
+            }),
+        )
+        .await
+        .expect("cancel-all ok")
+        .0;
+
+        assert_eq!(resp.canceled_count, 1);
+        assert_eq!(resp.failed_count, 0);
+        assert!(
+            !state.orders.contains_key(&order_id),
+            "order must be removed from tracking after cancel-all"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_order_cancellable_via_bulk_cancel() {
+        let state = create_test_state();
+        let (order_id, _exp) = submit_tracked_gtc_order(&state).await;
+
+        let resp = bulk_cancel_orders(
+            State(state.clone()),
+            Json(BulkCancelRequest {
+                order_ids: vec![order_id.clone()],
+            }),
+        )
+        .await
+        .expect("bulk-cancel ok")
+        .0;
+
+        assert_eq!(resp.success_count, 1);
+        assert_eq!(resp.failure_count, 0);
+        assert!(resp.results[0].canceled);
+        assert!(
+            !state.orders.contains_key(&order_id),
+            "order must be removed from tracking after bulk-cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order_removes_tracking() {
+        let state = create_test_state();
+        let (order_id, exp) = submit_tracked_gtc_order(&state).await;
+
+        let resp = cancel_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                exp,
+                100u64,
+                "call".to_string(),
+                order_id.clone(),
+            )),
+        )
+        .await
+        .expect("cancel ok")
+        .0;
+        assert!(resp.success);
+
+        // Removed from tracking and no longer shown as Active.
+        assert!(!state.orders.contains_key(&order_id));
+        let err = get_order_status(State(state.clone()), Path(order_id.clone()))
+            .await
+            .expect_err("cancelled order must be gone");
+        assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_updates_tracking() {
+        let state = create_test_state();
+        let (order_id, exp) = submit_tracked_gtc_order(&state).await;
+
+        let resp = modify_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                exp,
+                100u64,
+                "call".to_string(),
+                order_id.clone(),
+            )),
+            Json(ModifyOrderRequest {
+                price: Some(120),
+                quantity: Some(7),
+            }),
+        )
+        .await
+        .expect("modify ok")
+        .0;
+
+        assert_eq!(resp.status, ModifyOrderStatus::Modified);
+        assert_eq!(resp.new_price, Some(120));
+        assert_eq!(resp.new_quantity, Some(7));
+        let new_id = resp.order_id.clone();
+        assert_ne!(new_id, order_id, "modify must mint a new order id");
+
+        // Old id removed; new id tracked with the new price/quantity.
+        assert!(
+            !state.orders.contains_key(&order_id),
+            "stale old entry must not remain"
+        );
+        {
+            let tracked = state.orders.get(&new_id).expect("new id must be tracked");
+            assert_eq!(tracked.price, 120);
+            assert_eq!(tracked.original_quantity, 7);
+            assert_eq!(tracked.remaining_quantity, 7);
+            assert_eq!(tracked.filled_quantity, 0);
+            assert_eq!(tracked.status, OrderStatus::Active);
+        }
+        // Exactly one order tracked overall — no stale duplicate.
+        assert_eq!(state.orders.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_cancel_ok_replace_fail_leaves_no_stale_entry() {
+        let state = create_test_state();
+        let (order_id, exp) = submit_tracked_gtc_order(&state).await;
+
+        // Halt the instrument: a resting order is left in place and `cancel_order`
+        // does not check the active status (so the cancel succeeds), but the
+        // replacement `add_limit_order` fails the active check. This deterministically
+        // drives the cancel-ok / replace-fail path.
+        let underlying_book = state.manager.get("TEST").expect("underlying exists");
+        let expiration = find_expiration_by_str(&underlying_book, &exp).expect("expiration exists");
+        let exp_book = underlying_book
+            .get_expiration(&expiration)
+            .expect("expiration book");
+        let strike_book = exp_book.get_strike(100).expect("strike book");
+        strike_book
+            .get(OptionStyle::Call)
+            .halt()
+            .expect("halt must succeed from Active");
+
+        let resp = modify_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                exp,
+                100u64,
+                "call".to_string(),
+                order_id.clone(),
+            )),
+            Json(ModifyOrderRequest {
+                price: Some(120),
+                quantity: Some(7),
+            }),
+        )
+        .await
+        .expect("modify returns an Ok response describing the rejection")
+        .0;
+
+        assert_eq!(resp.status, ModifyOrderStatus::Rejected);
+        assert!(
+            resp.message.contains("failed to place replacement"),
+            "message should describe the cancel-ok/replace-fail outcome: {}",
+            resp.message
+        );
+
+        // No stale Active entry: the old id is gone and no new id was tracked.
+        assert!(
+            !state.orders.contains_key(&order_id),
+            "the cancelled original must not linger as Active"
+        );
+        assert_eq!(
+            state.orders.len(),
+            0,
+            "no order should be tracked after a failed replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_order_lifecycle_create_status_modify_cancel_consistency() {
+        let state = create_test_state();
+
+        // create
+        let (order_id, exp) = submit_tracked_gtc_order(&state).await;
+
+        // status
+        let s = get_order_status(State(state.clone()), Path(order_id.clone()))
+            .await
+            .expect("status")
+            .0;
+        assert_eq!(s.status, OrderStatus::Active);
+        assert_eq!(s.price, 100);
+        assert_eq!(s.original_quantity, 10);
+
+        // modify (price only; quantity preserved at the current 10)
+        let m = modify_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                exp.clone(),
+                100u64,
+                "call".to_string(),
+                order_id.clone(),
+            )),
+            Json(ModifyOrderRequest {
+                price: Some(105),
+                quantity: None,
+            }),
+        )
+        .await
+        .expect("modify")
+        .0;
+        assert_eq!(m.status, ModifyOrderStatus::Modified);
+        assert_eq!(m.new_price, Some(105));
+        assert_eq!(m.new_quantity, Some(10));
+        let new_id = m.order_id.clone();
+
+        // status reflects the modified order; old id is gone
+        let s2 = get_order_status(State(state.clone()), Path(new_id.clone()))
+            .await
+            .expect("status of modified order")
+            .0;
+        assert_eq!(s2.price, 105);
+        assert_eq!(s2.original_quantity, 10);
+        assert_eq!(s2.status, OrderStatus::Active);
+        assert!(
+            get_order_status(State(state.clone()), Path(order_id.clone()))
+                .await
+                .is_err(),
+            "old id must no longer resolve"
+        );
+
+        // cancel the modified order (the replacement carries the same expiration
+        // path, so the single cancel endpoint resolves it end-to-end)
+        let c = cancel_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                exp,
+                100u64,
+                "call".to_string(),
+                new_id.clone(),
+            )),
+        )
+        .await
+        .expect("cancel")
+        .0;
+        assert!(c.success);
+
+        // fully consistent: nothing tracked, nothing resolvable
+        assert!(
+            get_order_status(State(state.clone()), Path(new_id.clone()))
+                .await
+                .is_err()
+        );
+        assert_eq!(state.orders.len(), 0);
     }
 
     #[tokio::test]
