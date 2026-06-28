@@ -765,31 +765,49 @@ pub struct PositionResponse {
     pub underlying: String,
     /// Position quantity (positive = long, negative = short).
     pub quantity: i64,
-    /// Average entry price in smallest units.
+    /// Average entry price in smallest units (cents).
     pub average_price: u128,
-    /// Current market price in smallest units.
-    pub current_price: u128,
-    /// Unrealized P&L in smallest units.
-    pub unrealized_pnl: i64,
-    /// Realized P&L in smallest units.
+    /// Current market price in smallest units (cents).
+    ///
+    /// None/omitted when the symbol has no current quote (the position is
+    /// unpriced; it is NOT marked at 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_price: Option<u128>,
+    /// Unrealized P&L in smallest units (cents).
+    ///
+    /// None/omitted when the symbol has no current quote (the position is
+    /// unpriced; no mark means no unrealized PnL can be computed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unrealized_pnl: Option<i64>,
+    /// Realized P&L in smallest units (cents).
     pub realized_pnl: i64,
     /// Delta exposure (quantity * delta).
     pub delta_exposure: f64,
-    /// Notional value (current_price * abs(quantity)).
-    pub notional_value: u128,
+    /// Notional value (current_price * abs(quantity)) in smallest units (cents).
+    ///
+    /// None/omitted when the symbol has no current quote (the position is
+    /// unpriced; it is NOT reported as 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notional_value: Option<u128>,
 }
 
 /// Summary of all positions.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PositionSummary {
-    /// Total unrealized P&L across all positions.
+    /// Total unrealized P&L (cents) across PRICED open positions only — those
+    /// with a current quote. Unpriced open positions are excluded (they cannot
+    /// be marked); `unpriced_count` reports how many were left out so the partial
+    /// total is honest.
     pub total_unrealized_pnl: i64,
-    /// Total realized P&L across all positions.
+    /// Total realized P&L (cents) across all positions.
     pub total_realized_pnl: i64,
-    /// Net delta exposure across all positions.
+    /// Net delta exposure across PRICED open positions only.
     pub net_delta: f64,
     /// Number of open positions.
     pub position_count: usize,
+    /// Number of open positions excluded from `total_unrealized_pnl` / `net_delta`
+    /// because they have no current quote (unpriced).
+    pub unpriced_count: usize,
 }
 
 /// Response for listing all positions.
