@@ -8,11 +8,11 @@ use crate::models::{
     ChainQuery, ChainStrikeRow, CreateSnapshotResponse, DepthMetrics, EnrichedSnapshotResponse,
     ExecutionInfo, ExecutionSummary, ExecutionsListResponse, ExecutionsQuery, ExpirationSummary,
     ExpirationsListResponse, FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse,
-    HealthResponse, ImpactMetrics, LastTradeResponse, LimitOrderStatus, MarketImpactMetrics,
-    MarketOrderRequest, MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest,
-    ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery, OhlcResponse,
-    OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderFillInfo, OrderInfo,
-    OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
+    HealthResponse, ImpactMetrics, LastTradeInfo, LastTradeResponse, LimitOrderStatus,
+    MarketImpactMetrics, MarketOrderRequest, MarketOrderResponse, MarketOrderStatus,
+    ModifyOrderRequest, ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery,
+    OhlcResponse, OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderFillInfo,
+    OrderInfo, OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
     OrderTimeInForce, OrderbookMetricsResponse, OrderbookSnapshotInfo, PositionInfo, PositionQuery,
     PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo, PriceMetrics,
     QuoteResponse, RestoreSnapshotResponse, SnapshotDepth, SnapshotQuery, SnapshotStats,
@@ -1484,6 +1484,29 @@ pub async fn add_order(
     };
     state.orders.insert(order_id.to_string(), order_info);
 
+    // A marketable limit order that (partially) fills on submit is the taker for
+    // the executed portion: record those fills into the live market-data stores
+    // so GET /positions, /last-trade, /ohlc, and /executions reflect the trade.
+    // The recording symbol uses the raw request path expiration so it matches the
+    // lookup key the GET handlers reconstruct (which is independent of how
+    // `OrderInfo.symbol` formats the expiration for book lookups).
+    if filled_quantity > 0 {
+        let record_symbol = format!("{}-{}-{}-{}", underlying, exp_str, strike, style_char);
+        let trades = match_result.trades().as_vec();
+        let mut executed: Vec<ExecutedFill> = Vec::with_capacity(trades.len());
+        for t in trades {
+            executed.push(ExecutedFill {
+                price: t.price().as_u128(),
+                quantity: t.quantity().as_u64(),
+                timestamp_ms: t.timestamp().as_u64(),
+                trade_id: t.trade_id().to_string(),
+                taker_order_id: t.taker_order_id().to_string(),
+                maker_order_id: t.maker_order_id().to_string(),
+            });
+        }
+        record_fills(&state, &record_symbol, &underlying, body.side, &executed);
+    }
+
     tracing::debug!(
         order_id = %order_id,
         underlying = %underlying,
@@ -2296,6 +2319,31 @@ pub async fn submit_market_order(
                 MarketOrderStatus::Rejected
             };
 
+            // Record the executed fills into the live market-data stores so
+            // GET /positions, /last-trade, /ohlc, and /executions reflect this
+            // trade. The recording symbol is built from the raw request path so
+            // it matches the lookup key those GET handlers reconstruct.
+            if filled_quantity > 0 {
+                let style_char = match option_style {
+                    OptionStyle::Call => "C",
+                    OptionStyle::Put => "P",
+                };
+                let symbol = format!("{}-{}-{}-{}", underlying, exp_str, strike, style_char);
+                let trades = match_result.trades().as_vec();
+                let mut executed: Vec<ExecutedFill> = Vec::with_capacity(trades.len());
+                for t in trades {
+                    executed.push(ExecutedFill {
+                        price: t.price().as_u128(),
+                        quantity: t.quantity().as_u64(),
+                        timestamp_ms: t.timestamp().as_u64(),
+                        trade_id: t.trade_id().to_string(),
+                        taker_order_id: t.taker_order_id().to_string(),
+                        maker_order_id: t.maker_order_id().to_string(),
+                    });
+                }
+                record_fills(&state, &symbol, &underlying, body.side, &executed);
+            }
+
             Ok(Json(MarketOrderResponse {
                 order_id: order_id.to_string(),
                 status,
@@ -2653,12 +2701,33 @@ fn submit_single_order(
         "{}-{}-{}-{}",
         item.underlying, item.expiration, item.strike, style_char
     );
-
-    // Track order in AppState with the REAL fill/remaining state.
     let order_side = match side {
         Side::Buy => OrderSide::Buy,
         Side::Sell => OrderSide::Sell,
     };
+
+    // A bulk limit order that (partially) fills on submit is the taker for the
+    // executed portion: record those fills into the live market-data stores so
+    // the bulk path is consistent with the single-order and market-order paths.
+    // The symbol uses the raw `item.expiration` form, matching the other call
+    // sites and the GET handlers' lookup key.
+    if filled_quantity > 0 {
+        let trades = match_result.trades().as_vec();
+        let mut executed: Vec<ExecutedFill> = Vec::with_capacity(trades.len());
+        for t in trades {
+            executed.push(ExecutedFill {
+                price: t.price().as_u128(),
+                quantity: t.quantity().as_u64(),
+                timestamp_ms: t.timestamp().as_u64(),
+                trade_id: t.trade_id().to_string(),
+                taker_order_id: t.taker_order_id().to_string(),
+                maker_order_id: t.maker_order_id().to_string(),
+            });
+        }
+        record_fills(state, &symbol, &item.underlying, order_side, &executed);
+    }
+
+    // Track order in AppState with the REAL fill/remaining state.
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let order_info = OrderInfo {
         order_id: order_id.to_string(),
@@ -3396,8 +3465,23 @@ pub async fn list_positions(
     Query(query): Query<PositionQuery>,
 ) -> Result<Json<PositionsListResponse>, ApiError> {
     let mut total_unrealized_pnl = 0i64;
-    let mut total_realized_pnl = 0i64;
     let mut net_delta = 0.0f64;
+
+    // Realized PnL is booked permanently when a position is (partially) closed,
+    // so the summary total must include FLAT (`quantity == 0`) symbols too:
+    // closing a symbol to flat must not silently drop its realized PnL from the
+    // total while `get_position` (which has no quantity filter) still reports it
+    // (issue #55). Sum realized PnL across the full underlying-filtered set,
+    // independent of the non-flat filter the list view applies below.
+    let total_realized_pnl: i64 = state
+        .positions
+        .iter()
+        .filter(|entry| match query.underlying {
+            Some(ref underlying) => &entry.value().underlying == underlying,
+            None => true,
+        })
+        .map(|entry| entry.value().realized_pnl)
+        .sum();
 
     let positions: Vec<PositionResponse> = state
         .positions
@@ -3420,7 +3504,6 @@ pub async fn list_positions(
             let delta_exposure = 0.0;
 
             total_unrealized_pnl += unrealized_pnl;
-            total_realized_pnl += position.realized_pnl;
             net_delta += delta_exposure;
 
             PositionResponse {
@@ -3484,6 +3567,142 @@ fn get_current_price_for_symbol(state: &AppState, symbol: &str) -> Option<u128> 
         (Some(bid), None) => Some(bid.as_u128()),
         (None, Some(ask)) => Some(ask.as_u128()),
         (None, None) => None,
+    }
+}
+
+/// A single executed fill reduced to the primitive units the market-data stores
+/// speak: price in cents (`u128`), quantity in contracts, timestamp in
+/// milliseconds, plus the stable trade and counterparty identifiers.
+///
+/// Decoupling the recorder from the upstream `pricelevel::Trade` type (which the
+/// backend cannot name directly) keeps [`record_fills`] unit-testable without a
+/// live order-book match.
+struct ExecutedFill {
+    /// Execution price in cents.
+    price: u128,
+    /// Executed quantity in contracts.
+    quantity: u64,
+    /// Execution timestamp in milliseconds since epoch.
+    timestamp_ms: u64,
+    /// Stable per-fill trade identifier. Used as the execution-report key (and
+    /// recorded on the last-trade entry), so those two stores overwrite on a
+    /// replay of the same trade id. Positions and OHLC are additive and are NOT
+    /// replay-idempotent — see [`record_fills`].
+    trade_id: String,
+    /// The aggressor (taker) order id.
+    taker_order_id: String,
+    /// The resting (maker) counterparty order id.
+    maker_order_id: String,
+}
+
+/// Records the executed `fills` of a successful match into the four live
+/// market-data stores so the REST surface reflects real trades.
+///
+/// For each fill, consistently:
+/// * `state.positions` — the per-`symbol` net position is updated once from the
+///   taker's perspective (`taker_side`) via the existing
+///   [`update_position_on_fill`] avg-price / realized-PnL contract. There is a
+///   single position per symbol, so only the aggressor (operator/taker) side is
+///   applied; the maker is the counterparty and is not double-booked into the
+///   same key (doing so would net every fill to zero).
+/// * `state.last_trades` — overwritten with the most recent fill for `symbol`;
+///   `side` is the taker (aggressor) side per the DTO contract.
+/// * `state.ohlc_aggregator` — the fill is folded into every OHLC interval.
+/// * `state.executions` — one execution report per fill, keyed by the stable
+///   trade id.
+///
+/// **Replay semantics:** this is intended to be called exactly once per match.
+/// `executions` (keyed by trade id) and `last_trades` (overwritten) are
+/// effectively idempotent on a replay of the same trade ids, but `positions`
+/// (via [`update_position_on_fill`]) and the OHLC bars are ADDITIVE — replaying
+/// the same fills would double the position quantity / realized PnL and the OHLC
+/// volume / trade count. Callers must not record the same match twice.
+///
+/// `symbol` is the canonical `UNDERLYING-EXPIRATION-STRIKE-STYLE` key built from
+/// the request path so it matches the lookup key the GET handlers reconstruct.
+/// Prices are in cents, timestamps in milliseconds.
+fn record_fills(
+    state: &AppState,
+    symbol: &str,
+    underlying: &str,
+    taker_side: OrderSide,
+    fills: &[ExecutedFill],
+) {
+    for fill in fills {
+        // The market-data DTOs carry prices as cents in `u64`; the order book
+        // speaks `u128`. A price that does not fit `u64` is a structurally
+        // impossible cents value — skip this fill's recording with a warning
+        // rather than truncating money or panicking.
+        let price_u64 = match u64::try_from(fill.price) {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    symbol = %symbol,
+                    price = fill.price,
+                    "fill price exceeds u64 cents range; skipping market-data recording"
+                );
+                continue;
+            }
+        };
+
+        // Position: one update per fill, from the taker (aggressor) perspective.
+        update_position_on_fill(
+            state,
+            symbol,
+            underlying,
+            taker_side,
+            fill.quantity,
+            fill.price,
+            fill.timestamp_ms,
+        );
+
+        // Last trade: the most recent fill for the symbol wins.
+        state.last_trades.insert(
+            symbol.to_string(),
+            LastTradeInfo {
+                symbol: symbol.to_string(),
+                price: price_u64,
+                quantity: fill.quantity,
+                side: taker_side,
+                timestamp_ms: fill.timestamp_ms,
+                trade_id: fill.trade_id.clone(),
+            },
+        );
+
+        // OHLC: fold the fill into every interval bar.
+        state
+            .ohlc_aggregator
+            .record_trade(symbol, fill.timestamp_ms, fill.price, fill.quantity);
+
+        // Execution report: one per fill, from the taker perspective, keyed by
+        // the stable trade id for idempotency. The market / crossing-limit paths
+        // do not compute per-fill fees or edge, so both stay at their
+        // zero / `None` defaults.
+        state.executions.insert(
+            fill.trade_id.clone(),
+            ExecutionInfo {
+                execution_id: fill.trade_id.clone(),
+                order_id: fill.taker_order_id.clone(),
+                symbol: symbol.to_string(),
+                side: taker_side,
+                price: price_u64,
+                quantity: fill.quantity,
+                timestamp_ms: fill.timestamp_ms,
+                counterparty_order_id: Some(fill.maker_order_id.clone()),
+                is_maker: false,
+                fee: 0,
+                edge: None,
+            },
+        );
+
+        tracing::debug!(
+            symbol = %symbol,
+            price = price_u64,
+            quantity = fill.quantity,
+            side = ?taker_side,
+            trade_id = %fill.trade_id,
+            "fill recorded to market-data stores"
+        );
     }
 }
 
@@ -4402,6 +4621,421 @@ mod tests {
         assert_eq!(response.fills[1].quantity, 30);
         // Average price should be (30*150 + 30*155) / 60 = 152.5
         assert!((response.average_price.unwrap() - 152.5).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // Issue #54: executed fills must be recorded into the four market-data
+    // stores on the live paths (market order + crossing limit), so the GET
+    // consumers reflect real trades instead of staying empty/404.
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_market_order_fill_records_all_stores() {
+        let state = create_test_state();
+
+        // Seed resting ask liquidity: a limit sell of 100 @ 150.
+        let underlying_book = state.manager.get_or_create("REC");
+        let expiration = parse_expiration("20251231").unwrap();
+        let exp_book = underlying_book.get_or_create_expiration(expiration);
+        let strike_book = exp_book.get_or_create_strike(100);
+        let option_book = strike_book.get(OptionStyle::Call);
+        option_book
+            .add_limit_order(OrderId::new(), Side::Sell, 150, 100)
+            .expect("seed resting sell");
+
+        // Submit a market BUY for 40; it lifts 40 @ 150 from the resting ask.
+        let response = submit_market_order(
+            State(state.clone()),
+            Path((
+                "REC".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Json(MarketOrderRequest {
+                side: OrderSide::Buy,
+                quantity: 40,
+            }),
+        )
+        .await
+        .expect("market order must succeed")
+        .0;
+
+        assert_eq!(response.status, MarketOrderStatus::Filled);
+        assert_eq!(response.filled_quantity, 40);
+
+        let symbol = "REC-20251231-100-C";
+
+        // 1) Position: taker (buyer) is long 40 @ 150, no realized PnL yet.
+        let position = get_position(State(state.clone()), Path(symbol.to_string()))
+            .await
+            .expect("position must exist")
+            .0;
+        assert_eq!(position.symbol, symbol);
+        assert_eq!(position.underlying, "REC");
+        assert_eq!(position.quantity, 40);
+        assert_eq!(position.average_price, 150);
+        assert_eq!(position.realized_pnl, 0);
+
+        // 2) Last trade: price/qty/side reflect the taker fill.
+        let last_trade = get_last_trade(
+            State(state.clone()),
+            Path((
+                "REC".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+        )
+        .await
+        .expect("last trade must exist")
+        .0;
+        assert_eq!(last_trade.symbol, symbol);
+        assert_eq!(last_trade.price, 150);
+        assert_eq!(last_trade.quantity, 40);
+        assert_eq!(last_trade.side, OrderSide::Buy);
+
+        // 3) OHLC: a 1m bar exists with close 150 and volume 40.
+        let ohlc = get_ohlc(
+            State(state.clone()),
+            Path((
+                "REC".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Query(OhlcQuery {
+                interval: "1m".to_string(),
+                from: None,
+                to: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("ohlc must succeed")
+        .0;
+        assert_eq!(ohlc.bars.len(), 1);
+        assert_eq!(ohlc.bars[0].close, 150);
+        assert_eq!(ohlc.bars[0].volume, 40);
+
+        // 4) Executions: one taker execution for the fill.
+        let executions = list_executions(
+            State(state.clone()),
+            Query(ExecutionsQuery {
+                from: None,
+                to: None,
+                underlying: None,
+                symbol: Some(symbol.to_string()),
+                side: None,
+                limit: 1000,
+                offset: 0,
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(executions.executions.len(), 1);
+        let exec = &executions.executions[0];
+        assert_eq!(exec.symbol, symbol);
+        assert_eq!(exec.side, OrderSide::Buy);
+        assert_eq!(exec.price, 150);
+        assert_eq!(exec.quantity, 40);
+        assert!(!exec.is_maker);
+        assert_eq!(executions.summary.total_volume, 40);
+    }
+
+    #[tokio::test]
+    async fn test_crossing_limit_order_fill_records_all_stores() {
+        let state = create_test_state();
+
+        // Seed resting ask liquidity: a limit sell of 100 @ 150.
+        let underlying_book = state.manager.get_or_create("REC2");
+        let expiration = parse_expiration("20251231").unwrap();
+        let exp_book = underlying_book.get_or_create_expiration(expiration);
+        let strike_book = exp_book.get_or_create_strike(100);
+        let option_book = strike_book.get(OptionStyle::Call);
+        option_book
+            .add_limit_order(OrderId::new(), Side::Sell, 150, 100)
+            .expect("seed resting sell");
+
+        // Submit a crossing BUY limit (price 160 >= 150) for 30 via add_order;
+        // the marketable portion fills 30 @ 150 (the maker price) as the taker.
+        let response = add_order(
+            State(state.clone()),
+            Path((
+                "REC2".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Json(AddOrderRequest {
+                side: OrderSide::Buy,
+                price: 160,
+                quantity: 30,
+                time_in_force: Some(ApiTimeInForce::Gtc),
+                expire_at: None,
+            }),
+        )
+        .await
+        .expect("crossing limit must succeed")
+        .0;
+
+        assert_eq!(response.status, LimitOrderStatus::Filled);
+        assert_eq!(response.filled_quantity, 30);
+
+        let symbol = "REC2-20251231-100-C";
+
+        // Position: taker (buyer) is long 30 @ 150 (the maker price, not 160).
+        let position = get_position(State(state.clone()), Path(symbol.to_string()))
+            .await
+            .expect("position must exist")
+            .0;
+        assert_eq!(position.quantity, 30);
+        assert_eq!(position.average_price, 150);
+
+        // Last trade reflects the taker fill at the maker price.
+        let last_trade = get_last_trade(
+            State(state.clone()),
+            Path((
+                "REC2".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+        )
+        .await
+        .expect("last trade must exist")
+        .0;
+        assert_eq!(last_trade.price, 150);
+        assert_eq!(last_trade.quantity, 30);
+        assert_eq!(last_trade.side, OrderSide::Buy);
+
+        // OHLC bar recorded.
+        let ohlc = get_ohlc(
+            State(state.clone()),
+            Path((
+                "REC2".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Query(OhlcQuery {
+                interval: "1m".to_string(),
+                from: None,
+                to: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("ohlc must succeed")
+        .0;
+        assert_eq!(ohlc.bars.len(), 1);
+        assert_eq!(ohlc.bars[0].close, 150);
+        assert_eq!(ohlc.bars[0].volume, 30);
+
+        // One taker execution recorded.
+        let executions = list_executions(
+            State(state.clone()),
+            Query(ExecutionsQuery {
+                from: None,
+                to: None,
+                underlying: None,
+                symbol: Some(symbol.to_string()),
+                side: None,
+                limit: 1000,
+                offset: 0,
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(executions.executions.len(), 1);
+        assert_eq!(executions.executions[0].price, 150);
+        assert_eq!(executions.executions[0].quantity, 30);
+        assert!(!executions.executions[0].is_maker);
+    }
+
+    /// A direct [`record_fills`] unit test asserting it writes all four stores
+    /// and documenting the ACTUAL replay behavior: `executions` (keyed by trade
+    /// id) and `last_trades` (overwritten) are stable on a replay, but
+    /// `positions` and OHLC are ADDITIVE — re-recording doubles them. This is a
+    /// caller invariant ("record each match once"), not an idempotency guarantee.
+    #[tokio::test]
+    async fn test_record_fills_writes_all_stores_and_replay_is_additive() {
+        let state = create_test_state();
+        let symbol = "REC3-20251231-100-C";
+        let fills = [ExecutedFill {
+            price: 250,
+            quantity: 10,
+            timestamp_ms: 1_704_067_200_000,
+            trade_id: "trade-1".to_string(),
+            taker_order_id: "taker-1".to_string(),
+            maker_order_id: "maker-1".to_string(),
+        }];
+
+        record_fills(&state, symbol, "REC3", OrderSide::Sell, &fills);
+
+        // Position: a sell makes the taker short 10 @ 250.
+        let position = state.positions.get(symbol).expect("position recorded");
+        assert_eq!(position.quantity, -10);
+        assert_eq!(position.average_price, 250);
+        drop(position);
+
+        // Last trade + OHLC + execution recorded.
+        assert_eq!(state.last_trades.get(symbol).unwrap().price, 250);
+        let bar = state
+            .ohlc_aggregator
+            .get_latest_bar(symbol, OhlcInterval::OneMinute)
+            .expect("ohlc bar recorded");
+        assert_eq!(bar.close, 250);
+        assert_eq!(bar.volume, 10);
+        assert_eq!(bar.trade_count, 1);
+        assert!(state.executions.contains_key("trade-1"));
+
+        // Replay the same fills. `executions` is keyed by trade id and
+        // `last_trades` is overwritten, so both stay stable; but `positions` and
+        // OHLC are additive, so the quantity and bar volume/trade_count double.
+        record_fills(&state, symbol, "REC3", OrderSide::Sell, &fills);
+
+        assert_eq!(state.executions.len(), 1, "execution is keyed by trade id");
+        assert_eq!(state.last_trades.get(symbol).unwrap().quantity, 10);
+
+        let position = state.positions.get(symbol).expect("position recorded");
+        assert_eq!(position.quantity, -20, "position is additive on replay");
+        drop(position);
+
+        let bar = state
+            .ohlc_aggregator
+            .get_latest_bar(symbol, OhlcInterval::OneMinute)
+            .expect("ohlc bar recorded");
+        assert_eq!(bar.volume, 20, "OHLC volume is additive on replay");
+        assert_eq!(bar.trade_count, 2, "OHLC trade count is additive on replay");
+    }
+
+    #[tokio::test]
+    async fn test_list_positions_summary_includes_flat_realized_pnl() {
+        // Issue #55: realized PnL is booked permanently when a symbol is closed.
+        // Once a position is flattened (quantity == 0) it drops out of the list
+        // view, but its realized PnL must STILL be in `summary.total_realized_pnl`
+        // and must agree with what `get_position` reports for the same symbol.
+        let state = create_test_state();
+        let symbol = "FLAT-20251231-100-C";
+
+        // Open long 10 @ 100, then fully close by selling 10 @ 120.
+        update_position_on_fill(
+            &state,
+            symbol,
+            "FLAT",
+            OrderSide::Buy,
+            10,
+            100,
+            1_704_067_200_000,
+        );
+        update_position_on_fill(
+            &state,
+            symbol,
+            "FLAT",
+            OrderSide::Sell,
+            10,
+            120,
+            1_704_067_260_000,
+        );
+
+        // Realized PnL = (120 - 100) * 10 = 200; position is now flat.
+        let position = get_position(State(state.clone()), Path(symbol.to_string()))
+            .await
+            .expect("flat position is still reported by get_position")
+            .0;
+        assert_eq!(position.quantity, 0);
+        assert_eq!(position.realized_pnl, 200);
+
+        let listed = list_positions(
+            State(state.clone()),
+            Query(PositionQuery { underlying: None }),
+        )
+        .await
+        .expect("list positions succeeds")
+        .0;
+
+        // The flat symbol is excluded from the list view ...
+        assert!(
+            listed.positions.iter().all(|p| p.symbol != symbol),
+            "flat position must not appear in the open-positions list"
+        );
+        // ... but its realized PnL is still counted in the summary total, and the
+        // total agrees with get_position.
+        assert_eq!(listed.summary.total_realized_pnl, 200);
+        assert_eq!(listed.summary.total_realized_pnl, position.realized_pnl);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_crossing_fill_records_all_stores() {
+        // Concern: a bulk-submitted limit order that crosses on submit must record
+        // its fills into the four market-data stores, like the single-order and
+        // market-order paths.
+        let state = create_test_state();
+        let underlying = "BULKREC";
+        let strike = 12000u64;
+        let exp = seed_book_with_strikes(&state, underlying, &[strike]);
+
+        // Resting opposite-side liquidity: SELL 10 @ 100.
+        place_resting_call(&state, underlying, &exp, strike, Side::Sell, 100, 10);
+
+        // Bulk: a marketable BUY 10 @ 150 fully crosses the ask, filling 10 @ 100.
+        let crossing_buy = BulkOrderItem {
+            underlying: underlying.to_string(),
+            expiration: exp.clone(),
+            strike,
+            style: "call".to_string(),
+            side: "buy".to_string(),
+            price: 150,
+            quantity: 10,
+        };
+        let Json(response) = bulk_submit_orders(
+            State(state.clone()),
+            Json(BulkOrderRequest {
+                orders: vec![crossing_buy],
+                atomic: false,
+            }),
+        )
+        .await
+        .expect("bulk submit returns a response");
+        assert_eq!(response.success_count, 1);
+
+        // The recording symbol uses the bulk item's raw expiration string.
+        let symbol = format!("{}-{}-{}-C", underlying, exp, strike);
+
+        let position = get_position(State(state.clone()), Path(symbol.clone()))
+            .await
+            .expect("position recorded")
+            .0;
+        assert_eq!(position.quantity, 10);
+        assert_eq!(position.average_price, 100);
+
+        assert_eq!(state.last_trades.get(&symbol).unwrap().price, 100);
+        assert!(
+            state
+                .ohlc_aggregator
+                .bar_count(&symbol, OhlcInterval::OneMinute)
+                > 0
+        );
+
+        let executions = list_executions(
+            State(state.clone()),
+            Query(ExecutionsQuery {
+                from: None,
+                to: None,
+                underlying: None,
+                symbol: Some(symbol.clone()),
+                side: None,
+                limit: 1000,
+                offset: 0,
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(executions.executions.len(), 1);
+        assert_eq!(executions.executions[0].price, 100);
+        assert_eq!(executions.executions[0].quantity, 10);
+        assert!(!executions.executions[0].is_maker);
     }
 
     // ========================================================================
