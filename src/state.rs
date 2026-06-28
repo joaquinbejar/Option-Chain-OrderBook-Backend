@@ -119,10 +119,19 @@ impl AppState {
 
         let market_maker = Arc::new(MarketMakerEngine::new(Arc::clone(&manager), db.clone()));
 
-        // Set initial prices in market maker
+        // Set initial prices in market maker, rounding dollars→cents through the
+        // single canonical helper. A non-finite or out-of-range price is logged
+        // and that asset is skipped (defensive: prices are already validated by
+        // `Config::validate`) rather than seeded with a truncated value.
         for asset in &config.assets {
-            let price_cents = (asset.initial_price * 100.0) as u64;
-            market_maker.update_price(&asset.symbol, price_cents);
+            match crate::config::dollars_to_cents(asset.initial_price) {
+                Some(price_cents) => market_maker.update_price(&asset.symbol, price_cents),
+                None => warn!(
+                    symbol = %asset.symbol,
+                    initial_price = asset.initial_price,
+                    "skipping initial price seed: non-finite or out-of-range value"
+                ),
+            }
         }
 
         // Create price simulator
@@ -363,5 +372,28 @@ mod tests {
         assert!(state.orders.contains_key("active1")); // Active kept
         assert!(!state.orders.contains_key("filled1")); // Old filled removed
         assert!(state.orders.contains_key("filled_recent")); // Recent filled kept
+    }
+
+    #[test]
+    fn test_from_config_seeds_rounded_initial_price() {
+        // A `.999` initial price must be ROUNDED to the nearest cent when seeded
+        // into the market maker (10100), not truncated downward (10099) as the
+        // old `as u64` cast did.
+        let config = Config {
+            assets: vec![AssetConfig {
+                symbol: "RND".to_string(),
+                name: "Rounding".to_string(),
+                initial_price: 100.999,
+                volatility: 0.2,
+                drift: 0.0,
+                expirations: vec!["20251231".to_string()],
+                num_strikes: 2,
+                strike_spacing: 10.0,
+            }],
+            ..Config::default()
+        };
+
+        let state = AppState::from_config(config, None);
+        assert_eq!(state.market_maker.get_price("RND"), Some(10100));
     }
 }
