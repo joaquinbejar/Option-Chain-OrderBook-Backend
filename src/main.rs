@@ -258,13 +258,26 @@ async fn main() -> anyhow::Result<()> {
     }
     let state = Arc::new(app_state);
 
+    // Shutdown signal shared with every spawned background task. A `watch`
+    // channel (tokio is already a dependency) lets each loop `select!` between its
+    // periodic work and `changed()`; flipping it to `true` after the server stops
+    // drives every loop to break so its `JoinHandle` can be awaited. Using `watch`
+    // avoids adding `tokio-util` / `CancellationToken` as a new dependency.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Keep one receiver alive so shutdown_tx.send(true) below is always infallible
+    // (tasks use clones); do not delete this binding as "unused".
+    // Retained handles for all background tasks so none is left detached: each is
+    // signalled then awaited during graceful shutdown.
+    let mut task_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // Start price simulation if enabled
     if let Some(ref simulator) = state.price_simulator {
         let sim = Arc::clone(simulator);
         let mm = Arc::clone(&state.market_maker);
-        tokio::spawn(async move {
-            sim.run(Some(mm)).await;
-        });
+        let sim_shutdown = shutdown_rx.clone();
+        task_handles.push(tokio::spawn(async move {
+            sim.run(Some(mm), sim_shutdown).await;
+        }));
         info!("Price simulation started");
     }
 
@@ -275,17 +288,26 @@ async fn main() -> anyhow::Result<()> {
         let retention_secs = config.cleanup.retention_seconds;
 
         if interval_secs > 0 {
-            tokio::spawn(async move {
+            let mut cleanup_shutdown = shutdown_rx.clone();
+            task_handles.push(tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
                 // Skip the first immediate tick
                 interval.tick().await;
 
                 loop {
-                    interval.tick().await;
-                    state_clone.cleanup_old_orders(retention_secs);
+                    tokio::select! {
+                        // Shutdown requested: break so the task can be awaited.
+                        _ = cleanup_shutdown.changed() => {
+                            info!("order cleanup task shutting down");
+                            break;
+                        }
+                        _ = interval.tick() => {
+                            state_clone.cleanup_old_orders(retention_secs);
+                        }
+                    }
                 }
-            });
+            }));
             info!(
                 "Order cleanup task started (interval: {}s, retention: {}s)",
                 interval_secs, retention_secs
@@ -295,22 +317,32 @@ async fn main() -> anyhow::Result<()> {
 
     // Start the rate-limit window sweep task. It periodically reaps fully-expired
     // buckets so the window map cannot accumulate one entry per distinct subject
-    // or peer IP forever (issue #48). The `JoinHandle` is aborted after the
-    // server stops, giving the task a clear shutdown path.
+    // or peer IP forever (issue #48). It now shares the same `watch` shutdown
+    // signal as the other background tasks and is awaited (not detached/aborted)
+    // during graceful shutdown.
     let sweep_auth = Arc::clone(&state.auth);
-    let sweep_handle = tokio::spawn(async move {
+    let mut sweep_shutdown = shutdown_rx.clone();
+    task_handles.push(tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_secs(RATE_LIMIT_SWEEP_INTERVAL_SECS));
         // Skip the first immediate tick.
         interval.tick().await;
         loop {
-            interval.tick().await;
-            let removed = sweep_auth.sweep_rate_limit_windows();
-            if removed > 0 {
-                tracing::debug!(removed, "swept expired rate-limit windows");
+            tokio::select! {
+                // Shutdown requested: break so the task can be awaited.
+                _ = sweep_shutdown.changed() => {
+                    info!("rate-limit window sweep task shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    let removed = sweep_auth.sweep_rate_limit_windows();
+                    if removed > 0 {
+                        tracing::debug!(removed, "swept expired rate-limit windows");
+                    }
+                }
             }
         }
-    });
+    }));
     info!(
         "Rate-limit window sweep task started (interval: {}s)",
         RATE_LIMIT_SWEEP_INTERVAL_SECS
@@ -377,14 +409,60 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await;
 
-    // Server has stopped: tear down the background sweep task.
-    sweep_handle.abort();
+    // The server has stopped (shutdown signal received, or a serve error):
+    // broadcast the shutdown signal so every background loop breaks, then await
+    // each retained handle so no task is left detached.
+    if let Err(e) = shutdown_tx.send(true) {
+        warn!("failed to broadcast shutdown to background tasks: {e}");
+    }
+    for handle in task_handles {
+        if let Err(e) = handle.await {
+            warn!("background task did not shut down cleanly: {e}");
+        }
+    }
 
     serve_result?;
 
     Ok(())
+}
+
+/// Resolves when the process is asked to shut down: Ctrl-C (SIGINT) on any
+/// platform, or SIGTERM on Unix. Passed to `axum::serve(...).with_graceful_shutdown`
+/// so in-flight requests can drain before the listener stops accepting.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            // Failure to install the handler is logged; the SIGTERM arm (Unix)
+            // remains as the shutdown trigger.
+            error!("failed to install Ctrl-C handler: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                error!("failed to install SIGTERM handler: {e}");
+                // Leave Ctrl-C as the sole trigger by never resolving here.
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received Ctrl-C, starting graceful shutdown"),
+        _ = terminate => info!("received SIGTERM, starting graceful shutdown"),
+    }
 }
 
 /// Loads the JWT auth core from the resolved auth configuration (env vars +
