@@ -449,7 +449,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
     let sender_clone = Arc::clone(&sender);
     let subscribed_symbols_clone = Arc::clone(&subscribed_symbols);
     let subscribed_trades_clone = Arc::clone(&subscribed_trades);
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = tokio::spawn(async move {
         while let Some(msg) = receiver.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
@@ -486,7 +486,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
     let sender_clone = Arc::clone(&sender);
     let subscribed_symbols_clone = Arc::clone(&subscribed_symbols);
     let subscribed_trades_clone = Arc::clone(&subscribed_trades);
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         // Construct the heartbeat ticker ONCE, outside the loop, so its cadence is
         // wall-clock fixed and independent of outbound event traffic. (Issue #65:
         // a `sleep` rebuilt inside the loop is dropped and restarted whenever
@@ -590,10 +590,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
         }
     });
 
-    // Wait for either task to complete
+    // Wait for either task to complete, then abort the sibling so the socket and
+    // its broadcast receivers are released promptly. Dropping the still-running
+    // handle would only DETACH it (issue #66): e.g. if `send_task` ends first,
+    // `recv_task` would keep awaiting `receiver.next().await` until the client
+    // disconnects, holding its `Arc` clone of the split sink alive. `&mut` keeps
+    // the surviving handle usable for `.abort()`; awaiting only the aborted
+    // sibling lets the cancellation settle (a cancelled task surfaces as
+    // `JoinError::is_cancelled()`, which is expected here and ignored).
     tokio::select! {
-        _ = recv_task => {}
-        _ = send_task => {}
+        _ = &mut recv_task => {
+            send_task.abort();
+            let _ = send_task.await;
+        }
+        _ = &mut send_task => {
+            recv_task.abort();
+            let _ = recv_task.await;
+        }
     }
 
     info!("WebSocket connection closed");
@@ -1916,6 +1929,47 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(95),
             "heartbeat cadence drifted, elapsed {elapsed:?}"
+        );
+    }
+
+    /// Issue #66: when one of the two `handle_socket` tasks ends, the sibling
+    /// must be torn down deterministically rather than detached.
+    ///
+    /// This mirrors the production `select! { _ = &mut recv_task => send_task
+    /// .abort(), _ = &mut send_task => recv_task.abort() }` wiring instead of
+    /// driving `handle_socket` directly (which would need a full WebSocket
+    /// harness around the split sink/stream). It therefore characterizes the
+    /// fix: `a` finishes immediately, `b` would run forever, and the surviving
+    /// handle must be aborted. Under the OLD drop-the-handle behavior `b` would
+    /// be detached and keep running, so the bounded await below would never
+    /// resolve and the test would time out.
+    #[tokio::test]
+    async fn test_sibling_task_aborted_when_one_completes() {
+        use std::future::pending;
+        use tokio::time::{Duration, timeout};
+
+        // `a` completes immediately; `b` never completes on its own.
+        let mut a = tokio::spawn(async {});
+        let mut b = tokio::spawn(async {
+            pending::<()>().await;
+        });
+
+        // Identical sibling-abort wiring to `handle_socket` (issue #66).
+        tokio::select! {
+            _ = &mut a => { b.abort(); }
+            _ = &mut b => { a.abort(); }
+        }
+
+        // The long-running sibling must resolve promptly to a cancelled
+        // `JoinError`. With a detached (dropped) handle this await would hang
+        // until the timeout fires.
+        let join_result = timeout(Duration::from_secs(5), b)
+            .await
+            .expect("aborted sibling should resolve promptly, not hang");
+        let join_err = join_result.expect_err("aborted task should yield a JoinError");
+        assert!(
+            join_err.is_cancelled(),
+            "sibling task should be cancelled, got {join_err:?}"
         );
     }
 }
