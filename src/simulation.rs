@@ -16,7 +16,7 @@ use std::fmt::Display;
 use std::ops::AddAssign;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -281,9 +281,19 @@ impl PriceSimulator {
 
     /// Starts the price simulation loop.
     ///
+    /// The loop runs until `shutdown_rx` observes a `true` value, at which point
+    /// it breaks cleanly between ticks so the spawning task can be awaited during
+    /// graceful shutdown rather than being dropped mid-iteration.
+    ///
     /// # Arguments
     /// * `market_maker` - Optional market maker engine to notify of price changes.
-    pub async fn run(self: Arc<Self>, market_maker: Option<Arc<MarketMakerEngine>>) {
+    /// * `shutdown_rx` - Watch receiver that signals the loop to terminate when it
+    ///   transitions to `true`.
+    pub async fn run(
+        self: Arc<Self>,
+        market_maker: Option<Arc<MarketMakerEngine>>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
         if !self.config.enabled {
             info!("Price simulation disabled");
             return;
@@ -297,20 +307,28 @@ impl PriceSimulator {
         let mut ticker = interval(Duration::from_millis(self.config.interval_ms));
 
         loop {
-            ticker.tick().await;
-
-            for asset in &self.assets {
-                let new_price = self.get_next_price(&asset.symbol, asset);
-
-                if let Some(ref mm) = market_maker {
-                    mm.update_price(&asset.symbol, new_price);
+            tokio::select! {
+                // Shutdown requested: stop the loop cleanly so the task returns.
+                _ = shutdown_rx.changed() => {
+                    info!("price simulation shutting down");
+                    break;
                 }
+                // Periodic price-walk tick (unchanged behavior).
+                _ = ticker.tick() => {
+                    for asset in &self.assets {
+                        let new_price = self.get_next_price(&asset.symbol, asset);
 
-                debug!(
-                    "Price update: {} = ${:.2}",
-                    asset.symbol,
-                    new_price as f64 / 100.0
-                );
+                        if let Some(ref mm) = market_maker {
+                            mm.update_price(&asset.symbol, new_price);
+                        }
+
+                        debug!(
+                            "Price update: {} = ${:.2}",
+                            asset.symbol,
+                            new_price as f64 / 100.0
+                        );
+                    }
+                }
             }
         }
     }
@@ -506,5 +524,87 @@ mod tests {
         // Prices should be positive
         assert!(price1 > 0);
         assert!(price2 > 0);
+    }
+
+    /// The run loop MUST terminate once the watch signal flips to `true`. Under
+    /// the old unbounded loop this task would never return and the timeout below
+    /// would elapse (the test would fail/hang).
+    #[tokio::test]
+    async fn test_run_terminates_on_shutdown_signal() {
+        let assets = vec![test_asset()];
+        let config = SimulationConfig::default();
+        let simulator = Arc::new(PriceSimulator::new(assets, config));
+
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(simulator.run(None, rx));
+
+        // Request shutdown and confirm the task returns well within the timeout.
+        tx.send(true)
+            .expect("watch receiver kept alive by the task");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert!(
+            joined.is_ok(),
+            "price simulation run loop did not terminate after shutdown signal"
+        );
+        joined
+            .expect("did not time out")
+            .expect("run task should not panic");
+    }
+
+    /// A disabled simulation returns immediately regardless of the shutdown
+    /// signal, so the task is never left detached.
+    #[tokio::test]
+    async fn test_run_returns_when_disabled() {
+        let assets = vec![test_asset()];
+        let config = SimulationConfig {
+            enabled: false,
+            ..SimulationConfig::default()
+        };
+        let simulator = Arc::new(PriceSimulator::new(assets, config));
+
+        let (_tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(simulator.run(None, rx));
+
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            joined.is_ok(),
+            "disabled price simulation run loop did not return promptly"
+        );
+        joined
+            .expect("did not time out")
+            .expect("run task should not panic");
+    }
+
+    /// A `select!` over a watch shutdown receiver and a periodic interval (the
+    /// shape used by the order-cleanup and rate-limit-sweep tasks in `main.rs`)
+    /// MUST exit promptly when the signal flips, not on the next tick boundary.
+    #[tokio::test]
+    async fn test_select_loop_exits_on_signal() {
+        let (tx, mut shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            // A deliberately long interval: if the loop waited for a tick instead
+            // of the signal, the timeout below would elapse.
+            let mut ticker = interval(Duration::from_secs(3600));
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = ticker.tick() => {}
+                }
+            }
+        });
+
+        tx.send(true)
+            .expect("watch receiver kept alive by the task");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            joined.is_ok(),
+            "select! loop did not exit promptly on shutdown signal"
+        );
+        joined
+            .expect("did not time out")
+            .expect("task should not panic");
     }
 }
