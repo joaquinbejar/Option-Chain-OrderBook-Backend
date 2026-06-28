@@ -632,32 +632,63 @@ pub struct PositionQuery {
 }
 
 /// Summary statistics for positions.
+///
+/// Mirrors the server `PositionSummary` DTO.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionSummary {
-    /// Total number of positions.
-    pub total_positions: u64,
-    /// Total long positions.
-    pub long_positions: u64,
-    /// Total short positions.
-    pub short_positions: u64,
-    /// Total realized P&L.
+    /// Total unrealized P&L (cents) across PRICED open positions only — those
+    /// with a current quote. Unpriced open positions are excluded;
+    /// `unpriced_count` reports how many were left out.
+    pub total_unrealized_pnl: i64,
+    /// Total realized P&L (cents) across all positions.
     pub total_realized_pnl: i64,
+    /// Net delta exposure across PRICED open positions only.
+    pub net_delta: f64,
+    /// Number of open positions.
+    pub position_count: usize,
+    /// Number of open positions excluded from `total_unrealized_pnl` /
+    /// `net_delta` because they have no current quote (unpriced).
+    pub unpriced_count: usize,
 }
 
 /// Response for listing positions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionsListResponse {
     /// List of positions.
-    pub positions: Vec<PositionInfo>,
+    pub positions: Vec<PositionResponse>,
     /// Summary statistics.
     pub summary: PositionSummary,
 }
 
 /// Response for a single position.
+///
+/// Mirrors the server `PositionResponse` DTO. The mark-dependent fields
+/// (`current_price`, `unrealized_pnl`, `notional_value`) are `None`/omitted when
+/// the symbol has no current quote — an unpriced position is NOT fabricated at 0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionResponse {
-    /// Position information.
-    pub position: PositionInfo,
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
+    pub symbol: String,
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Position quantity (positive = long, negative = short).
+    pub quantity: i64,
+    /// Average entry price in cents.
+    pub average_price: u128,
+    /// Current market price in cents; `None`/omitted when the symbol is unpriced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_price: Option<u128>,
+    /// Unrealized P&L in cents; `None`/omitted when the symbol is unpriced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unrealized_pnl: Option<i64>,
+    /// Realized P&L in cents.
+    pub realized_pnl: i64,
+    /// Delta exposure (quantity * delta).
+    pub delta_exposure: f64,
+    /// Notional value (current_price * abs(quantity)) in cents; `None`/omitted
+    /// when the symbol is unpriced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notional_value: Option<u128>,
 }
 
 // ============================================================================

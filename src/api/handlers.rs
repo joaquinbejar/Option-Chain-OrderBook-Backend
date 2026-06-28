@@ -3419,10 +3419,21 @@ pub async fn get_position(
 ) -> Result<Json<PositionResponse>, ApiError> {
     match state.positions.get(&symbol) {
         Some(position) => {
-            // Get current market price from quote
-            let current_price = get_current_price_for_symbol(&state, &symbol).unwrap_or(0);
-            let unrealized_pnl = position.unrealized_pnl(current_price);
-            let notional_value = position.notional_value(current_price);
+            // Mark the position at the current quote when one exists. A symbol
+            // with no quote is left UNPRICED (None) rather than fabricated at 0:
+            // a 0 mark would misreport a full-loss `unrealized_pnl` and a 0
+            // `notional_value`, misrepresenting an unpriced position as a real
+            // 0-priced one (issue #59). `realized_pnl` needs no mark and is
+            // always reported.
+            let mark = get_current_price_for_symbol(&state, &symbol);
+            let (current_price, unrealized_pnl, notional_value) = match mark {
+                Some(price) => (
+                    Some(price),
+                    Some(position.unrealized_pnl(price)),
+                    Some(position.notional_value(price)),
+                ),
+                None => (None, None, None),
+            };
 
             // TODO: Calculate delta from option pricer when available
             let delta_exposure = 0.0;
@@ -3466,6 +3477,10 @@ pub async fn list_positions(
 ) -> Result<Json<PositionsListResponse>, ApiError> {
     let mut total_unrealized_pnl = 0i64;
     let mut net_delta = 0.0f64;
+    // Open positions with no current quote: excluded from the partial
+    // `total_unrealized_pnl` / `net_delta` totals (issue #59) and surfaced so the
+    // partial total is honest.
+    let mut unpriced_count = 0usize;
 
     // Realized PnL is booked permanently when a position is (partially) closed,
     // so the summary total must include FLAT (`quantity == 0`) symbols too:
@@ -3496,15 +3511,29 @@ pub async fn list_positions(
         .filter(|entry| entry.value().quantity != 0) // Only include open positions
         .map(|entry| {
             let position = entry.value();
-            let current_price = get_current_price_for_symbol(&state, &position.symbol).unwrap_or(0);
-            let unrealized_pnl = position.unrealized_pnl(current_price);
-            let notional_value = position.notional_value(current_price);
 
             // TODO: Calculate delta from option pricer when available
             let delta_exposure = 0.0;
 
-            total_unrealized_pnl += unrealized_pnl;
-            net_delta += delta_exposure;
+            // Mark only when a quote exists; an unpriced position is left None
+            // (not fabricated at 0) and excluded from the partial totals so they
+            // reflect only what could actually be marked (issue #59).
+            let (current_price, unrealized_pnl, notional_value) =
+                match get_current_price_for_symbol(&state, &position.symbol) {
+                    Some(price) => {
+                        total_unrealized_pnl += position.unrealized_pnl(price);
+                        net_delta += delta_exposure;
+                        (
+                            Some(price),
+                            Some(position.unrealized_pnl(price)),
+                            Some(position.notional_value(price)),
+                        )
+                    }
+                    None => {
+                        unpriced_count += 1;
+                        (None, None, None)
+                    }
+                };
 
             PositionResponse {
                 symbol: position.symbol.clone(),
@@ -3529,6 +3558,7 @@ pub async fn list_positions(
             total_realized_pnl,
             net_delta,
             position_count,
+            unpriced_count,
         },
     }))
 }
@@ -4964,6 +4994,168 @@ mod tests {
         // total agrees with get_position.
         assert_eq!(listed.summary.total_realized_pnl, 200);
         assert_eq!(listed.summary.total_realized_pnl, position.realized_pnl);
+    }
+
+    #[tokio::test]
+    async fn test_get_position_priced_reports_some_marks() {
+        // Issue #59: when a quote exists, the mark-dependent fields are Some and
+        // computed against the current mark.
+        let state = create_test_state();
+        // `submit_tracked_gtc_order` rests a bid at 100 on TEST/20251231/100/call,
+        // which is exactly the symbol below once formatted.
+        let symbol = "TEST-20251231-100-C";
+
+        let (_order_id, _exp) = submit_tracked_gtc_order(&state).await;
+        assert_eq!(
+            get_current_price_for_symbol(&state, symbol),
+            Some(100),
+            "the resting bid at 100 must be the current mark"
+        );
+
+        // Open long 10 @ 90.
+        update_position_on_fill(
+            &state,
+            symbol,
+            "TEST",
+            OrderSide::Buy,
+            10,
+            90,
+            1_704_067_200_000,
+        );
+
+        let position = get_position(State(state.clone()), Path(symbol.to_string()))
+            .await
+            .expect("priced position is reported")
+            .0;
+
+        assert_eq!(position.current_price, Some(100));
+        // unrealized = (100 - 90) * 10 = 100
+        assert_eq!(position.unrealized_pnl, Some(100));
+        // notional = 100 * 10 = 1000
+        assert_eq!(position.notional_value, Some(1000));
+        // realized PnL is mark-independent and always present.
+        assert_eq!(position.realized_pnl, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_position_unpriced_omits_mark_fields() {
+        // Issue #59: with no quote, the mark-dependent fields are None and OMITTED
+        // from the JSON, so an unpriced position is distinct on the wire from a
+        // genuine Some(0) mark.
+        let state = create_test_state();
+        let symbol = "NOQUOTE-20251231-100-C";
+        assert_eq!(
+            get_current_price_for_symbol(&state, symbol),
+            None,
+            "symbol has no order book / quote in this test"
+        );
+
+        update_position_on_fill(
+            &state,
+            symbol,
+            "NOQUOTE",
+            OrderSide::Buy,
+            5,
+            100,
+            1_704_067_200_000,
+        );
+
+        let position = get_position(State(state.clone()), Path(symbol.to_string()))
+            .await
+            .expect("unpriced position is still reported")
+            .0;
+
+        // Not fabricated at 0: the three mark-dependent fields are None.
+        assert_eq!(position.current_price, None);
+        assert_eq!(position.unrealized_pnl, None);
+        assert_eq!(position.notional_value, None);
+        // realized PnL stays present.
+        assert_eq!(position.realized_pnl, 0);
+
+        // The serialized JSON OMITS the unpriced keys.
+        let json = serde_json::to_value(&position).expect("serialize position");
+        assert!(
+            json.get("current_price").is_none(),
+            "current_price must be omitted when unpriced"
+        );
+        assert!(
+            json.get("unrealized_pnl").is_none(),
+            "unrealized_pnl must be omitted when unpriced"
+        );
+        assert!(
+            json.get("notional_value").is_none(),
+            "notional_value must be omitted when unpriced"
+        );
+        // An always-present field stays in the JSON.
+        assert!(json.get("realized_pnl").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_positions_summary_excludes_unpriced() {
+        // Issue #59: `total_unrealized_pnl`/`net_delta` sum only priced positions,
+        // and `unpriced_count` reports the open positions excluded for lack of a
+        // quote.
+        let state = create_test_state();
+
+        // Priced symbol: rest a bid at 100, then open long 10 @ 90.
+        let priced = "TEST-20251231-100-C";
+        let (_order_id, _exp) = submit_tracked_gtc_order(&state).await;
+        assert_eq!(get_current_price_for_symbol(&state, priced), Some(100));
+        update_position_on_fill(
+            &state,
+            priced,
+            "TEST",
+            OrderSide::Buy,
+            10,
+            90,
+            1_704_067_200_000,
+        );
+
+        // Unpriced symbol: open a position but never create a quote.
+        let unpriced = "NOQUOTE-20251231-100-C";
+        update_position_on_fill(
+            &state,
+            unpriced,
+            "NOQUOTE",
+            OrderSide::Buy,
+            5,
+            100,
+            1_704_067_200_000,
+        );
+        assert_eq!(get_current_price_for_symbol(&state, unpriced), None);
+
+        let listed = list_positions(
+            State(state.clone()),
+            Query(PositionQuery { underlying: None }),
+        )
+        .await
+        .expect("list positions succeeds")
+        .0;
+
+        // Both open positions appear in the list view ...
+        assert_eq!(listed.summary.position_count, 2);
+        // ... but exactly one is unpriced ...
+        assert_eq!(listed.summary.unpriced_count, 1);
+        // ... and the total counts ONLY the priced one: (100 - 90) * 10 = 100.
+        assert_eq!(listed.summary.total_unrealized_pnl, 100);
+
+        let unpriced_resp = listed
+            .positions
+            .iter()
+            .find(|p| p.symbol == unpriced)
+            .expect("unpriced position present in list");
+        assert_eq!(unpriced_resp.current_price, None);
+        assert_eq!(unpriced_resp.unrealized_pnl, None);
+        assert_eq!(unpriced_resp.notional_value, None);
+
+        let priced_resp = listed
+            .positions
+            .iter()
+            .find(|p| p.symbol == priced)
+            .expect("priced position present in list");
+        assert_eq!(priced_resp.current_price, Some(100));
+        assert_eq!(priced_resp.unrealized_pnl, Some(100));
+        assert_eq!(priced_resp.notional_value, Some(1000));
     }
 
     #[tokio::test]
