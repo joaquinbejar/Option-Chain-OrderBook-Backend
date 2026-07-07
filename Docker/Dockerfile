@@ -1,5 +1,5 @@
 # Stage 1: Build the application
-FROM rust:1.92-alpine3.23 AS builder
+FROM rust:1.96.1-alpine3.23 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
