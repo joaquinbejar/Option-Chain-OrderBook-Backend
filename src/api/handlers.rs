@@ -5,20 +5,20 @@ use crate::models::{
     ATMTermStructurePoint, AddOrderRequest, AddOrderResponse, ApiTimeInForce, BulkCancelRequest,
     BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
     BulkOrderResultItem, BulkOrderStatus, CancelAllQuery, CancelAllResponse, CancelOrderResponse,
-    ChainQuery, ChainStrikeRow, CreateSnapshotResponse, DepthMetrics, EnrichedSnapshotResponse,
-    ExecutionInfo, ExecutionSummary, ExecutionsListResponse, ExecutionsQuery, ExpirationSummary,
-    ExpirationsListResponse, FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse,
-    HealthResponse, ImpactMetrics, LastTradeInfo, LastTradeResponse, LimitOrderStatus,
-    MarketImpactMetrics, MarketOrderRequest, MarketOrderResponse, MarketOrderStatus,
-    ModifyOrderRequest, ModifyOrderResponse, ModifyOrderStatus, OhlcInterval, OhlcQuery,
-    OhlcResponse, OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse, OrderFillInfo,
-    OrderInfo, OrderListQuery, OrderListResponse, OrderSide, OrderStatus, OrderStatusResponse,
-    OrderTimeInForce, OrderbookMetricsResponse, OrderbookSnapshotInfo, PositionInfo, PositionQuery,
-    PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo, PriceMetrics,
-    QuoteResponse, RestoreSnapshotResponse, SnapshotDepth, SnapshotQuery, SnapshotStats,
-    SnapshotSummary, SnapshotsListResponse, SpreadMetrics, StrikeIV, StrikeSummary,
-    StrikesListResponse, TokenRequest, TokenResponse, UnderlyingSummary, UnderlyingsListResponse,
-    VolatilitySurfaceResponse,
+    ChainQuery, ChainStrikeRow, CreateSnapshotResponse, DeleteUnderlyingResponse, DepthMetrics,
+    EnrichedSnapshotResponse, ExecutionInfo, ExecutionSummary, ExecutionsListResponse,
+    ExecutionsQuery, ExpirationSummary, ExpirationsListResponse, FillInfo, GlobalStatsResponse,
+    GreeksData, GreeksResponse, HealthResponse, ImpactMetrics, LastTradeInfo, LastTradeResponse,
+    LimitOrderStatus, MarketImpactMetrics, MarketOrderRequest, MarketOrderResponse,
+    MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse, ModifyOrderStatus, OhlcInterval,
+    OhlcQuery, OhlcResponse, OptionChainResponse, OptionQuoteData, OrderBookSnapshotResponse,
+    OrderFillInfo, OrderInfo, OrderListQuery, OrderListResponse, OrderSide, OrderStatus,
+    OrderStatusResponse, OrderTimeInForce, OrderbookMetricsResponse, OrderbookSnapshotInfo,
+    PositionInfo, PositionQuery, PositionResponse, PositionSummary, PositionsListResponse,
+    PriceLevelInfo, PriceMetrics, QuoteResponse, RestoreSnapshotResponse, SnapshotDepth,
+    SnapshotQuery, SnapshotStats, SnapshotSummary, SnapshotsListResponse, SpreadMetrics, StrikeIV,
+    StrikeSummary, StrikesListResponse, TokenRequest, TokenResponse, UnderlyingSummary,
+    UnderlyingsListResponse, VolatilitySurfaceResponse,
 };
 use crate::state::{AppState, StoredSnapshot};
 use axum::Json;
@@ -829,7 +829,7 @@ pub async fn get_underlying(
         ("underlying" = String, Path, description = "Underlying symbol")
     ),
     responses(
-        (status = 200, description = "Underlying deleted"),
+        (status = 200, description = "Underlying deleted", body = DeleteUnderlyingResponse),
         (status = 404, description = "Underlying not found")
     ),
     tag = "Underlyings"
@@ -837,11 +837,12 @@ pub async fn get_underlying(
 pub async fn delete_underlying(
     State(state): State<Arc<AppState>>,
     Path(underlying): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<DeleteUnderlyingResponse>, ApiError> {
     if state.manager.remove(&underlying) {
-        Ok(Json(serde_json::json!({
-            "message": format!("Underlying {} deleted", underlying)
-        })))
+        Ok(Json(DeleteUnderlyingResponse {
+            success: true,
+            message: format!("Underlying {} deleted", underlying),
+        }))
     } else {
         Err(ApiError::UnderlyingNotFound(underlying))
     }
@@ -4058,6 +4059,35 @@ mod tests {
 
     fn create_test_state() -> Arc<AppState> {
         Arc::new(AppState::new())
+    }
+
+    /// `delete_underlying` must return the typed `DeleteUnderlyingResponse`
+    /// (issue #60) — success + message on deletion, a typed 404 otherwise.
+    #[tokio::test]
+    async fn test_delete_underlying_returns_typed_response() {
+        let state = create_test_state();
+        state.manager.get_or_create("DELME");
+
+        let response = delete_underlying(State(state.clone()), Path("DELME".to_string()))
+            .await
+            .expect("deleting an existing underlying succeeds");
+        assert!(response.0.success);
+        assert!(response.0.message.contains("DELME"));
+
+        // Deleting again -> typed 404, not an opaque body.
+        let err = delete_underlying(State(state), Path("DELME".to_string())).await;
+        assert!(matches!(err, Err(ApiError::UnderlyingNotFound(_))));
+    }
+
+    #[test]
+    fn test_delete_underlying_response_serialization() {
+        let response = DeleteUnderlyingResponse {
+            success: true,
+            message: "Underlying BTC deleted".to_string(),
+        };
+        let json = serde_json::to_string(&response).expect("serializes");
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"message\":\"Underlying BTC deleted\""));
     }
 
     #[test]
