@@ -4,7 +4,7 @@
 //! server's retention cap (16) evicts the oldest ones, and the create
 //! response reports serialization failures separately from saved books.
 
-use orderbook_client::Permission;
+use orderbook_client::{Error, Permission};
 use orderbook_tests::create_authenticated_client;
 
 /// Mirrors `AppState::MAX_RETAINED_SNAPSHOTS` on the server.
@@ -61,6 +61,8 @@ async fn test_snapshots_are_bounded_and_oldest_evicted() {
     );
 
     // The evicted snapshot is also gone from the by-ID endpoint (404).
-    let err = client.get_snapshot(oldest).await;
-    assert!(err.is_err(), "evicted snapshot must return an error (404)");
+    match client.get_snapshot(oldest).await {
+        Err(Error::NotFound(_)) => {}
+        other => panic!("evicted snapshot must return NotFound (404), got {other:?}"),
+    }
 }

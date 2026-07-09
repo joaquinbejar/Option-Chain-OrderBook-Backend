@@ -523,10 +523,7 @@ pub async fn create_snapshot(State(state): State<Arc<AppState>>) -> Json<CreateS
     // Store the snapshot, evicting the oldest one past the retention cap.
     state.insert_snapshot_bounded(
         snapshot_id.clone(),
-        StoredSnapshot {
-            created_at_ms: now,
-            infos: snapshot_infos,
-        },
+        StoredSnapshot::new(now, snapshot_infos),
     );
 
     Json(CreateSnapshotResponse {
