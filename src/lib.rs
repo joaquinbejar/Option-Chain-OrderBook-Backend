@@ -21,7 +21,9 @@
 //!
 //! - **Execution Reports**: Complete audit trail of all trade executions.
 //!
-//! - **Orderbook Persistence**: Snapshot and restore orderbook state.
+//! - **Orderbook Persistence**: Snapshot and restore orderbook state. At most
+//!   16 snapshots are retained in memory; creating one beyond the cap evicts
+//!   the oldest.
 //!
 //! - **Rate Limiting**: Sliding-window rate limiting keyed by the JWT subject.
 //!

@@ -1753,7 +1753,9 @@ pub struct OrderbookSnapshotInfo {
 /// Response for creating a snapshot.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CreateSnapshotResponse {
-    /// Whether the operation was successful.
+    /// `true` when every orderbook was saved; `false` when at least one
+    /// orderbook was skipped (see `orderbooks_failed`), i.e. the snapshot is
+    /// partial.
     pub success: bool,
     /// Unique snapshot identifier.
     pub snapshot_id: String,
@@ -1761,6 +1763,8 @@ pub struct CreateSnapshotResponse {
     pub orderbooks_saved: u64,
     /// Total number of orders saved.
     pub orders_saved: u64,
+    /// Number of orderbooks skipped because their state failed to serialize.
+    pub orderbooks_failed: u64,
     /// Timestamp of the snapshot.
     pub timestamp_ms: u64,
 }
@@ -1790,14 +1794,19 @@ pub struct SnapshotSummary {
 /// Response for restoring a snapshot.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RestoreSnapshotResponse {
-    /// Whether the operation was successful.
+    /// `true` when every orderbook in the snapshot was restored; `false` when
+    /// at least one orderbook was skipped (see `orderbooks_failed`), i.e. the
+    /// restore is partial.
     pub success: bool,
     /// Snapshot ID that was restored.
     pub snapshot_id: String,
     /// Number of orderbooks restored.
     pub orderbooks_restored: u64,
-    /// Total number of orders restored.
+    /// Total number of orders restored (as counted at snapshot time).
     pub orders_restored: u64,
+    /// Number of orderbooks that could not be restored (unparseable data,
+    /// invalid expiration/style, or an upstream restore failure).
+    pub orderbooks_failed: u64,
     /// Timestamp of the restore operation.
     pub timestamp_ms: u64,
 }

@@ -30,10 +30,11 @@ use option_chain_orderbook_backend::api::controls::{
 use option_chain_orderbook_backend::db::{InsertPriceRequest, UpdateParametersRequest};
 use option_chain_orderbook_backend::models::{
     AddOrderRequest, AddOrderResponse, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
-    BulkOrderResultItem, BulkOrderStatus, CancelOrderResponse, ExpirationSummary,
-    ExpirationsListResponse, GlobalStatsResponse, HealthResponse, OrderBookSnapshotResponse,
-    QuoteResponse, StrikeSummary, StrikesListResponse, TokenRequest, TokenResponse,
-    UnderlyingSummary, UnderlyingsListResponse,
+    BulkOrderResultItem, BulkOrderStatus, CancelOrderResponse, CreateSnapshotResponse,
+    ExpirationSummary, ExpirationsListResponse, GlobalStatsResponse, HealthResponse,
+    OrderBookSnapshotResponse, OrderbookSnapshotInfo, QuoteResponse, RestoreSnapshotResponse,
+    SnapshotSummary, SnapshotsListResponse, StrikeSummary, StrikesListResponse, TokenRequest,
+    TokenResponse, UnderlyingSummary, UnderlyingsListResponse,
 };
 
 /// Interval between background sweeps of expired rate-limit window buckets
@@ -101,6 +102,10 @@ impl utoipa::Modify for SecurityAddon {
         option_chain_orderbook_backend::api::handlers::cancel_order,
         option_chain_orderbook_backend::api::handlers::get_option_quote,
         option_chain_orderbook_backend::api::handlers::bulk_submit_orders,
+        option_chain_orderbook_backend::api::handlers::create_snapshot,
+        option_chain_orderbook_backend::api::handlers::list_snapshots,
+        option_chain_orderbook_backend::api::handlers::get_snapshot,
+        option_chain_orderbook_backend::api::handlers::restore_snapshot,
         option_chain_orderbook_backend::api::controls::get_controls,
         option_chain_orderbook_backend::api::controls::kill_switch,
         option_chain_orderbook_backend::api::controls::enable_quoting,
@@ -144,6 +149,11 @@ impl utoipa::Modify for SecurityAddon {
             InsertPriceRequest,
             InsertPriceResponse,
             LatestPriceResponse,
+            CreateSnapshotResponse,
+            SnapshotsListResponse,
+            SnapshotSummary,
+            OrderbookSnapshotInfo,
+            RestoreSnapshotResponse,
         )
     ),
     tags(
@@ -157,6 +167,7 @@ impl utoipa::Modify for SecurityAddon {
         (name = "Expirations", description = "Expiration date management"),
         (name = "Strikes", description = "Strike price management"),
         (name = "Options", description = "Option order book management"),
+        (name = "Admin", description = "Administrative endpoints (orderbook snapshots)"),
     ),
     info(
         title = "Option Chain OrderBook API",

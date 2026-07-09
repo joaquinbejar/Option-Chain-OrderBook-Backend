@@ -20,7 +20,7 @@ use crate::models::{
     StrikesListResponse, TokenRequest, TokenResponse, UnderlyingSummary, UnderlyingsListResponse,
     VolatilitySurfaceResponse,
 };
-use crate::state::AppState;
+use crate::state::{AppState, StoredSnapshot};
 use axum::Json;
 use axum::extract::Query;
 use axum::extract::{Path, State};
@@ -421,7 +421,11 @@ pub async fn get_execution(
 
 /// Create a snapshot of all orderbooks.
 ///
-/// Saves the current state of all orderbooks for later recovery.
+/// Saves the current state of all orderbooks for later recovery. At most
+/// [`AppState::MAX_RETAINED_SNAPSHOTS`] snapshots are retained; creating one
+/// beyond the cap evicts the oldest. An orderbook whose state fails to
+/// serialize is skipped (and counted in `orderbooks_failed`) instead of being
+/// stored empty.
 #[utoipa::path(
     post,
     path = "/api/v1/admin/snapshot",
@@ -439,6 +443,7 @@ pub async fn create_snapshot(State(state): State<Arc<AppState>>) -> Json<CreateS
 
     let mut orderbooks_saved: u64 = 0;
     let mut orders_saved: u64 = 0;
+    let mut orderbooks_failed: u64 = 0;
     let mut snapshot_infos: Vec<OrderbookSnapshotInfo> = Vec::new();
 
     // Iterate through all underlyings
@@ -474,7 +479,21 @@ pub async fn create_snapshot(State(state): State<Arc<AppState>>) -> Json<CreateS
                                         .sum::<usize>();
 
                                 if order_count > 0 {
-                                    let data = serde_json::to_string(&snapshot).unwrap_or_default();
+                                    let data = match serde_json::to_string(&snapshot) {
+                                        Ok(data) => data,
+                                        Err(e) => {
+                                            orderbooks_failed = orderbooks_failed.saturating_add(1);
+                                            tracing::warn!(
+                                                underlying = %underlying_symbol,
+                                                expiration = %exp_str,
+                                                strike,
+                                                style = style_str,
+                                                error = %e,
+                                                "skipping orderbook in snapshot: serialization failed"
+                                            );
+                                            continue;
+                                        }
+                                    };
 
                                     let info = OrderbookSnapshotInfo {
                                         snapshot_id: snapshot_id.clone(),
@@ -501,14 +520,21 @@ pub async fn create_snapshot(State(state): State<Arc<AppState>>) -> Json<CreateS
         }
     }
 
-    // Store the snapshot
-    state.snapshots.insert(snapshot_id.clone(), snapshot_infos);
+    // Store the snapshot, evicting the oldest one past the retention cap.
+    state.insert_snapshot_bounded(
+        snapshot_id.clone(),
+        StoredSnapshot {
+            created_at_ms: now,
+            infos: snapshot_infos,
+        },
+    );
 
     Json(CreateSnapshotResponse {
-        success: true,
+        success: orderbooks_failed == 0,
         snapshot_id,
         orderbooks_saved,
         orders_saved,
+        orderbooks_failed,
         timestamp_ms: now,
     })
 }
@@ -527,15 +553,14 @@ pub async fn list_snapshots(State(state): State<Arc<AppState>>) -> Json<Snapshot
 
     for entry in state.snapshots.iter() {
         let snapshot_id: String = entry.key().clone();
-        let infos: &Vec<OrderbookSnapshotInfo> = entry.value();
-        let total_orders: u64 = infos.iter().map(|i| i.order_count).sum();
-        let created_at = infos.first().map(|i| i.created_at).unwrap_or(0);
+        let stored = entry.value();
+        let total_orders: u64 = stored.infos.iter().map(|i| i.order_count).sum();
 
         snapshots.push(SnapshotSummary {
             snapshot_id,
-            orderbook_count: infos.len() as u64,
+            orderbook_count: stored.infos.len() as u64,
             total_orders,
-            created_at,
+            created_at: stored.created_at_ms,
         });
     }
 
@@ -563,7 +588,7 @@ pub async fn get_snapshot(
 ) -> Result<Json<Vec<OrderbookSnapshotInfo>>, ApiError> {
     match state.snapshots.get(&snapshot_id) {
         Some(entry) => {
-            let infos: Vec<OrderbookSnapshotInfo> = entry.value().clone();
+            let infos: Vec<OrderbookSnapshotInfo> = entry.value().infos.clone();
             Ok(Json(infos))
         }
         None => Err(ApiError::NotFound(format!(
@@ -596,7 +621,7 @@ pub async fn restore_snapshot(
         .as_millis() as u64;
 
     let snapshot_infos: Vec<OrderbookSnapshotInfo> = match state.snapshots.get(&snapshot_id) {
-        Some(entry) => entry.value().clone(),
+        Some(entry) => entry.value().infos.clone(),
         None => {
             return Err(ApiError::NotFound(format!(
                 "Snapshot {} not found",
@@ -607,12 +632,25 @@ pub async fn restore_snapshot(
 
     let mut orderbooks_restored: u64 = 0;
     let mut orders_restored: u64 = 0;
+    let mut orderbooks_failed: u64 = 0;
 
     for info in &snapshot_infos {
         // Parse the snapshot data
         let snapshot: orderbook_rs::OrderBookSnapshot = match serde_json::from_str(&info.data) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                orderbooks_failed = orderbooks_failed.saturating_add(1);
+                tracing::warn!(
+                    snapshot_id = %snapshot_id,
+                    underlying = %info.underlying,
+                    expiration = %info.expiration,
+                    strike = info.strike,
+                    style = %info.style,
+                    error = %e,
+                    "skipping orderbook during restore: snapshot data failed to parse"
+                );
+                continue;
+            }
         };
 
         // Get or create the underlying
@@ -621,7 +659,16 @@ pub async fn restore_snapshot(
         // Parse expiration
         let exp = match parse_expiration(&info.expiration) {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(_) => {
+                orderbooks_failed = orderbooks_failed.saturating_add(1);
+                tracing::warn!(
+                    snapshot_id = %snapshot_id,
+                    underlying = %info.underlying,
+                    expiration = %info.expiration,
+                    "skipping orderbook during restore: invalid expiration"
+                );
+                continue;
+            }
         };
 
         // Get or create expiration book
@@ -634,23 +681,47 @@ pub async fn restore_snapshot(
         let style = match info.style.as_str() {
             "call" => OptionStyle::Call,
             "put" => OptionStyle::Put,
-            _ => continue,
+            _ => {
+                orderbooks_failed = orderbooks_failed.saturating_add(1);
+                tracing::warn!(
+                    snapshot_id = %snapshot_id,
+                    underlying = %info.underlying,
+                    style = %info.style,
+                    "skipping orderbook during restore: unknown option style"
+                );
+                continue;
+            }
         };
 
         let option_book = strike_book.get(style);
 
         // Restore the snapshot
-        if option_book.inner().restore_from_snapshot(snapshot).is_ok() {
-            orderbooks_restored += 1;
-            orders_restored += info.order_count;
+        match option_book.inner().restore_from_snapshot(snapshot) {
+            Ok(()) => {
+                orderbooks_restored += 1;
+                orders_restored += info.order_count;
+            }
+            Err(e) => {
+                orderbooks_failed = orderbooks_failed.saturating_add(1);
+                tracing::warn!(
+                    snapshot_id = %snapshot_id,
+                    underlying = %info.underlying,
+                    expiration = %info.expiration,
+                    strike = info.strike,
+                    style = %info.style,
+                    error = %e,
+                    "orderbook restore failed"
+                );
+            }
         }
     }
 
     Ok(Json(RestoreSnapshotResponse {
-        success: true,
+        success: orderbooks_failed == 0,
         snapshot_id,
         orderbooks_restored,
         orders_restored,
+        orderbooks_failed,
         timestamp_ms: now,
     }))
 }
@@ -8741,18 +8812,20 @@ mod tests {
         use crate::models::CreateSnapshotResponse;
 
         let response = CreateSnapshotResponse {
-            success: true,
+            success: false,
             snapshot_id: "snap-789".to_string(),
             orderbooks_saved: 150,
             orders_saved: 5000,
+            orderbooks_failed: 2,
             timestamp_ms: 1704067200000,
         };
 
         let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"success\":false"));
         assert!(json.contains("\"snapshot_id\":\"snap-789\""));
         assert!(json.contains("\"orderbooks_saved\":150"));
         assert!(json.contains("\"orders_saved\":5000"));
+        assert!(json.contains("\"orderbooks_failed\":2"));
     }
 
     #[test]
@@ -8800,6 +8873,7 @@ mod tests {
             snapshot_id: "snap-restore".to_string(),
             orderbooks_restored: 75,
             orders_restored: 1500,
+            orderbooks_failed: 0,
             timestamp_ms: 1704067200000,
         };
 
@@ -8808,6 +8882,7 @@ mod tests {
         assert!(json.contains("\"snapshot_id\":\"snap-restore\""));
         assert!(json.contains("\"orderbooks_restored\":75"));
         assert!(json.contains("\"orders_restored\":1500"));
+        assert!(json.contains("\"orderbooks_failed\":0"));
     }
 
     #[tokio::test]
