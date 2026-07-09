@@ -14,6 +14,10 @@ pub struct QuoteParams {
     pub bid_size: u64,
     /// Ask size.
     pub ask_size: u64,
+    /// Theoretical value in cents the quote was built around. Stored with the
+    /// resting orders so the captured edge can be computed when one fills
+    /// (issue #69).
+    pub theo_price: u64,
 }
 
 /// Input parameters for quote generation.
@@ -156,6 +160,7 @@ impl Quoter {
             ask_price,
             bid_size: bid_size.max(1),
             ask_size: ask_size.max(1),
+            theo_price: theo_cents,
         })
     }
 
@@ -163,11 +168,13 @@ impl Quoter {
     ///
     /// # Arguments
     /// * `fill_price_cents` - Price at which the order was filled
-    /// * `theo_cents` - Theoretical value at fill time
-    /// * `side` - Buy or Sell
+    /// * `theo_cents` - Theoretical value the caller attributes to the fill
+    ///   (the engine supplies the quote-time theo as a within-one-tick
+    ///   approximation of the fill-time value)
+    /// * `is_buy` - True for the buy leg, false for the sell leg
     ///
     /// # Returns
-    /// Edge in cents (positive = favorable, negative = adverse).
+    /// Edge in cents per contract (positive = favorable, negative = adverse).
     #[must_use]
     pub fn calculate_edge(fill_price_cents: u64, theo_cents: u64, is_buy: bool) -> i64 {
         if is_buy {

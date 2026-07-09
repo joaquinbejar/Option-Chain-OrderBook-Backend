@@ -4007,6 +4007,17 @@ fn record_fills(
             },
         );
 
+        // Market-maker fill detection (issue #69): if the resting maker side
+        // of this fill is one of the market maker's tracked quotes, the
+        // engine computes the captured edge and broadcasts an OrderFilled
+        // event (delivered over WS as a `fill` message). Unknown maker ids —
+        // i.e. user resting orders — are ignored by the engine.
+        if let Ok(maker_id) = fill.maker_order_id.parse::<OrderId>() {
+            state
+                .market_maker
+                .on_order_filled(maker_id, fill.price, fill.quantity);
+        }
+
         tracing::debug!(
             symbol = %symbol,
             price = price_u64,
@@ -4059,6 +4070,51 @@ mod tests {
 
     fn create_test_state() -> Arc<AppState> {
         Arc::new(AppState::new())
+    }
+
+    /// Issue #69 seam test: `record_fills` must notify the market maker via
+    /// the fill's `maker_order_id` STRING (the `to_string()` → `parse` round
+    /// trip), producing a broadcast `OrderFilled` with the computed edge.
+    #[tokio::test]
+    async fn test_record_fills_notifies_market_maker_by_maker_id() {
+        use crate::market_maker::MarketMakerEvent;
+
+        let state = create_test_state();
+        let mut events = state.market_maker.subscribe();
+        // A tracked MM bid with theo 100: a fill at 95 captures +5 edge.
+        let maker_id = state.market_maker.track_order_for_test(true, 100, 10);
+
+        record_fills(
+            &state,
+            "BTC-20351231-100000-C",
+            "BTC",
+            OrderSide::Sell,
+            &[ExecutedFill {
+                price: 95,
+                quantity: 3,
+                timestamp_ms: 1,
+                trade_id: "seam-trade-1".to_string(),
+                taker_order_id: "user-taker".to_string(),
+                maker_order_id: maker_id.to_string(),
+            }],
+        );
+
+        match events
+            .try_recv()
+            .expect("OrderFilled must be broadcast through the maker-id seam")
+        {
+            MarketMakerEvent::OrderFilled {
+                order_id,
+                quantity,
+                edge,
+                ..
+            } => {
+                assert_eq!(order_id, maker_id.to_string());
+                assert_eq!(quantity, 3);
+                assert_eq!(edge, 5);
+            }
+            other => panic!("expected OrderFilled, got {other:?}"),
+        }
     }
 
     /// `delete_underlying` must return the typed `DeleteUnderlyingResponse`

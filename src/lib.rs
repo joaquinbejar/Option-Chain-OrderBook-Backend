@@ -217,6 +217,9 @@
 //! - `orderbook:{symbol}` - Orderbook updates
 //! - `trades:{symbol}` - Trade executions
 //! - `quotes:{symbol}` - Quote updates
+//! - `fill` messages - market-maker fills with the captured per-contract
+//!   edge; broadcast to every connected client (not subscription-gated) and
+//!   best-effort — REST executions are authoritative
 //!
 //! ## Example Usage
 //!
