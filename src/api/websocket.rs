@@ -1,6 +1,7 @@
 //! WebSocket handler for real-time updates.
 
 use crate::auth::Claims;
+use crate::error::ErrorResponse;
 use crate::market_maker::{
     DIRECTIONAL_SKEW_MAX, DIRECTIONAL_SKEW_MIN, MarketMakerEvent, SIZE_SCALAR_MAX, SIZE_SCALAR_MIN,
     SPREAD_MULTIPLIER_MAX, SPREAD_MULTIPLIER_MIN, validate_control_value,
@@ -398,7 +399,7 @@ impl Default for OrderbookSubscriptionManager {
     path = "/ws",
     responses(
         (status = 101, description = "WebSocket connection established"),
-        (status = 401, description = "Missing or invalid authentication token")
+        (status = 401, description = "Missing or invalid authentication token", body = ErrorResponse)
     ),
     security(("bearer_auth" = [])),
     tag = "WebSocket"
