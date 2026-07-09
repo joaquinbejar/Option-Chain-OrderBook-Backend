@@ -4085,9 +4085,17 @@ mod tests {
             success: true,
             message: "Underlying BTC deleted".to_string(),
         };
-        let json = serde_json::to_string(&response).expect("serializes");
-        assert!(json.contains("\"success\":true"));
-        assert!(json.contains("\"message\":\"Underlying BTC deleted\""));
+        let value = serde_json::to_value(&response).expect("serializes");
+        assert_eq!(value["success"], serde_json::json!(true));
+        assert_eq!(
+            value["message"],
+            serde_json::json!("Underlying BTC deleted")
+        );
+
+        // Round-trip through the same shape the SDK deserializes.
+        let back: DeleteUnderlyingResponse = serde_json::from_value(value).expect("round-trips");
+        assert!(back.success);
+        assert_eq!(back.message, "Underlying BTC deleted");
     }
 
     #[test]
