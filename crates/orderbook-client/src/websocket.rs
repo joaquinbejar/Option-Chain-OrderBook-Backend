@@ -22,9 +22,9 @@ pub enum WsMessage {
         /// Option style (call/put).
         style: String,
         /// Bid price in cents.
-        bid_price: u64,
+        bid_price: u128,
         /// Ask price in cents.
-        ask_price: u64,
+        ask_price: u128,
         /// Bid size.
         bid_size: u64,
         /// Ask size.
@@ -47,7 +47,7 @@ pub enum WsMessage {
         /// Filled quantity.
         quantity: u64,
         /// Fill price in cents.
-        price: u64,
+        price: u128,
         /// Edge captured in cents per contract (total = `edge × quantity`).
         edge: i64,
     },
@@ -660,5 +660,43 @@ impl WsClient {
     /// Returns error if the send fails.
     pub async fn list_subscriptions(&self) -> Result<(), Error> {
         self.send(ClientCommand::list_subscriptions()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #79: the client's price widths mirror the server's `u128`
+    /// serialization — a quote or fill with a price beyond `u64::MAX` must
+    /// deserialize instead of dropping the whole message.
+    #[test]
+    fn test_quote_message_deserializes_beyond_u64_prices() {
+        // u64::MAX is 18446744073709551615; both prices exceed it.
+        let json = r#"{"type":"quote","data":{"symbol":"BTC","expiration":"20251231","strike":100000,"style":"call","bid_price":18446744073709551616,"ask_price":36893488147419103232,"bid_size":1,"ask_size":2}}"#;
+        let msg: WsMessage = serde_json::from_str(json).expect("u128-wide quote deserializes");
+        match msg {
+            WsMessage::Quote {
+                bid_price,
+                ask_price,
+                ..
+            } => {
+                assert_eq!(bid_price, 18_446_744_073_709_551_616u128);
+                assert_eq!(ask_price, 36_893_488_147_419_103_232u128);
+            }
+            other => panic!("expected Quote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fill_message_deserializes_beyond_u64_price() {
+        let json = r#"{"type":"fill","data":{"order_id":"o1","symbol":"BTC","instrument":"BTC-20251231-100000-C","side":"buy","quantity":1,"price":18446744073709551616,"edge":5}}"#;
+        let msg: WsMessage = serde_json::from_str(json).expect("u128-wide fill deserializes");
+        match msg {
+            WsMessage::Fill { price, .. } => {
+                assert_eq!(price, 18_446_744_073_709_551_616u128);
+            }
+            other => panic!("expected Fill, got {other:?}"),
+        }
     }
 }
