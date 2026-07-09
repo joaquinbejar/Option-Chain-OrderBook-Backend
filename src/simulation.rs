@@ -26,10 +26,20 @@ use tracing::{debug, error, info, warn};
 /// blocking task and never performed while a lock is held.
 const WALK_STEPS: usize = 43_200;
 
-/// Error returned when a price path cannot be generated from invalid inputs.
+/// Number of ticks a walk stays dormant after a failed regeneration before the
+/// next retry is attempted (~10 minutes at the default 1000 ms tick).
 ///
-/// Each variant carries the offending value so a caller can log a `WARN` and skip
-/// the misconfigured asset instead of panicking the whole simulation.
+/// While dormant the last known price is reused and the heavy generation is
+/// never re-run, so a persistently failing walk costs one cheap retry per
+/// back-off window instead of a per-tick regeneration storm — while a
+/// transient failure recovers on the next retry instead of freezing forever.
+const DORMANT_RETRY_TICKS: u32 = 600;
+
+/// Error returned when a price path cannot be generated.
+///
+/// Each variant carries enough context for the caller to log a structured
+/// `WARN` and back off (dormant + retry) instead of panicking the whole
+/// simulation or silently producing an empty path.
 #[derive(Debug, thiserror::Error)]
 pub enum SimulationError {
     /// The initial price was not a valid, finite, positive value.
@@ -38,6 +48,14 @@ pub enum SimulationError {
     /// The volatility was not a valid, finite, positive value.
     #[error("invalid volatility: {0}")]
     InvalidVolatility(f64),
+    /// The upstream walker failed to generate a path.
+    #[error("walk generation failed ({walk_type}): {message}")]
+    WalkGeneration {
+        /// Which walk variant was being generated.
+        walk_type: &'static str,
+        /// The upstream error, rendered to a string so the variant stays `Send`.
+        message: String,
+    },
 }
 
 /// Price update event broadcast to subscribers.
@@ -121,35 +139,38 @@ fn generate_price_path(
         walker: Box::new(Walker::new()),
     };
 
-    // Generate y-values using the walker
-    let y_steps = match &walk_params.walk_type {
-        WalkType::Brownian { .. } => walk_params
-            .walker
-            .brownian(&walk_params)
-            .unwrap_or_default(),
-        WalkType::GeometricBrownian { .. } => walk_params
-            .walker
-            .geometric_brownian(&walk_params)
-            .unwrap_or_default(),
-        WalkType::LogReturns { .. } => walk_params
-            .walker
-            .log_returns(&walk_params)
-            .unwrap_or_default(),
-        WalkType::MeanReverting { .. } => walk_params
-            .walker
-            .mean_reverting(&walk_params)
-            .unwrap_or_default(),
-        WalkType::JumpDiffusion { .. } => walk_params
-            .walker
-            .jump_diffusion(&walk_params)
-            .unwrap_or_default(),
-        WalkType::Garch { .. } => walk_params.walker.garch(&walk_params).unwrap_or_default(),
-        WalkType::Heston { .. } => walk_params.walker.heston(&walk_params).unwrap_or_default(),
-        _ => walk_params
-            .walker
-            .geometric_brownian(&walk_params)
-            .unwrap_or_default(),
+    // Generate y-values using the walker. A walker error is propagated as a
+    // typed error (issue #71) — never swallowed into an empty path, which
+    // would silently freeze prices and re-trigger regeneration every tick.
+    let (walk_name, result) = match &walk_params.walk_type {
+        WalkType::Brownian { .. } => ("brownian", walk_params.walker.brownian(&walk_params)),
+        WalkType::GeometricBrownian { .. } => (
+            "geometric_brownian",
+            walk_params.walker.geometric_brownian(&walk_params),
+        ),
+        WalkType::LogReturns { .. } => {
+            ("log_returns", walk_params.walker.log_returns(&walk_params))
+        }
+        WalkType::MeanReverting { .. } => (
+            "mean_reverting",
+            walk_params.walker.mean_reverting(&walk_params),
+        ),
+        WalkType::JumpDiffusion { .. } => (
+            "jump_diffusion",
+            walk_params.walker.jump_diffusion(&walk_params),
+        ),
+        WalkType::Garch { .. } => ("garch", walk_params.walker.garch(&walk_params)),
+        WalkType::Heston { .. } => ("heston", walk_params.walker.heston(&walk_params)),
+        _ => (
+            "geometric_brownian",
+            walk_params.walker.geometric_brownian(&walk_params),
+        ),
     };
+
+    let y_steps = result.map_err(|e| SimulationError::WalkGeneration {
+        walk_type: walk_name,
+        message: e.to_string(),
+    })?;
 
     // Convert Positive values to f64
     Ok(y_steps.into_iter().map(|p: Positive| p.to_f64()).collect())
@@ -161,11 +182,13 @@ struct AssetSimulation {
     current_index: usize,
     /// Generated price path (f64 values).
     prices: Vec<f64>,
-    /// When `true`, the most recent regeneration produced an empty or too-short
-    /// path. The walk is left dormant (the last price is reused) instead of
-    /// re-running the heavy generation every tick. Comprehensive recovery of a
-    /// dormant walk is tracked separately (issue #71).
-    unproducible: bool,
+    /// When greater than zero the walk is dormant: the most recent
+    /// regeneration failed (walker error or empty/too-short path), the last
+    /// price is reused, and the counter is decremented each tick. When it
+    /// reaches zero the next tick retries the regeneration (issue #71
+    /// recovery), so a transient failure heals instead of freezing forever
+    /// while a persistent one costs one retry per back-off window.
+    dormant_ticks_remaining: u32,
 }
 
 /// Outcome of advancing a single asset's walk by one step under a short lock.
@@ -179,7 +202,8 @@ enum StepOutcome {
     Price(f64),
     /// The walk is exhausted; regeneration is required off the async thread.
     NeedsRegen,
-    /// The walk is dormant (`unproducible`); the last price should be reused.
+    /// The walk is dormant (backing off after a failed regeneration); the last
+    /// price should be reused.
     Dormant,
     /// No simulation is registered for this symbol.
     NoSim,
@@ -242,7 +266,7 @@ impl PriceSimulator {
                         AssetSimulation {
                             current_index: 0,
                             prices,
-                            unproducible: false,
+                            dormant_ticks_remaining: 0,
                         },
                     );
                 }
@@ -391,9 +415,10 @@ impl PriceSimulator {
             StepOutcome::Price(price_dollars) => self.store_walk_price(symbol, price_dollars),
             StepOutcome::NeedsRegen => self.regenerate(symbol, asset).await,
             StepOutcome::Dormant => {
-                // The walk produced an empty/too-short path on its last
-                // regeneration. Reuse the last known price instead of re-running
-                // the heavy generation every tick (the storm guard).
+                // The last regeneration failed; the walk is backing off. Reuse
+                // the last known price instead of re-running the heavy
+                // generation every tick (the storm guard); the retry happens
+                // when the back-off counter runs out.
                 self.get_price(symbol)
                     .or_else(|| crate::config::dollars_to_cents(asset.initial_price))
                     .unwrap_or(0)
@@ -422,14 +447,23 @@ impl PriceSimulator {
     ///
     /// This NEVER performs regeneration: when the walk is exhausted it returns
     /// [`StepOutcome::NeedsRegen`] so the heavy work can happen off the lock.
+    ///
+    /// `simulations` mutation (index advance, back-off decrement) assumes the
+    /// single `process_tick` driver per simulator; a second concurrent driver
+    /// for the same symbol could double-advance or double-retry.
     fn advance_step(&self, symbol: &str) -> StepOutcome {
         let mut simulations = self.simulations.write();
         let Some(sim) = simulations.get_mut(symbol) else {
             return StepOutcome::NoSim;
         };
 
-        // A dormant walk is left alone: no index advance, no regeneration.
-        if sim.unproducible {
+        // A dormant walk reuses the last price without advancing the index;
+        // when the back-off counter runs out, retry the regeneration.
+        if sim.dormant_ticks_remaining > 0 {
+            sim.dormant_ticks_remaining -= 1;
+            if sim.dormant_ticks_remaining == 0 {
+                return StepOutcome::NeedsRegen;
+            }
             return StepOutcome::Dormant;
         }
 
@@ -475,9 +509,12 @@ impl PriceSimulator {
     /// Control flow: (a) read the starting price under a short lock and release
     /// it; (b) run [`generate_price_path`] inside `spawn_blocking` with no lock
     /// held; (c) re-acquire the lock briefly to store the new path and reset the
-    /// index. An empty/too-short result marks the walk dormant so the heavy
-    /// generation does not run every tick. A join error is logged and the tick is
-    /// skipped (the current price is reused) rather than panicking.
+    /// index. A failed generation (walker error, invalid inputs, or an
+    /// empty/too-short path) marks the walk dormant for [`DORMANT_RETRY_TICKS`]
+    /// ticks — the last price is reused meanwhile, and the regeneration is
+    /// retried when the back-off runs out (issue #71). A join error is logged
+    /// and the tick is skipped (the current price is reused) rather than
+    /// panicking.
     async fn regenerate(&self, symbol: &str, asset: &AssetConfig) -> u64 {
         // (a) Starting point, under a short lock via `get_price`, released here.
         let current_price = self
@@ -507,24 +544,38 @@ impl PriceSimulator {
         let prices = match result {
             Ok(Ok(prices)) => prices,
             Ok(Err(e)) => {
-                // Invalid inputs: cheap to detect (no heavy walk ran). Mark the
-                // walk dormant so we do not retry the generation every tick.
+                // Invalid inputs or a walker error. Mark the walk dormant so
+                // the generation is not retried every tick; the back-off
+                // counter schedules the next retry.
                 warn!(
                     symbol = %symbol,
                     error = %e,
-                    "failed to regenerate price path; marking walk dormant and reusing price"
+                    "price walk generation failed; walk dormant, reusing last price until retry"
                 );
-                self.mark_unproducible(symbol);
+                self.mark_dormant(symbol);
                 return current_price;
             }
             Err(join_err) => {
-                // The blocking task could not complete (extremely rare). Skip the
-                // tick by reusing the current price; leave the walk schedulable.
-                warn!(
-                    symbol = %symbol,
-                    error = %join_err,
-                    "price path regeneration task failed to join; reusing current price"
-                );
+                // A panic inside the blocking generation is deterministic for
+                // the same inputs, so back off like any other generation
+                // failure — otherwise the exhausted walk would re-run the
+                // heavy generation every tick. A non-panic join error
+                // (cancellation, e.g. runtime shutdown) is transient: skip the
+                // tick and leave the walk schedulable.
+                if join_err.is_panic() {
+                    warn!(
+                        symbol = %symbol,
+                        error = %join_err,
+                        "price walk generation panicked; walk dormant, reusing last price until retry"
+                    );
+                    self.mark_dormant(symbol);
+                } else {
+                    warn!(
+                        symbol = %symbol,
+                        error = %join_err,
+                        "price path regeneration task cancelled; reusing current price"
+                    );
+                }
                 return current_price;
             }
         };
@@ -537,7 +588,7 @@ impl PriceSimulator {
                 len = prices.len(),
                 "regenerated price path is empty or too short; marking walk dormant"
             );
-            self.mark_unproducible(symbol);
+            self.mark_dormant(symbol);
             return current_price;
         }
 
@@ -561,10 +612,11 @@ impl PriceSimulator {
         }
     }
 
-    /// Marks a walk dormant under a short lock so it is not regenerated each tick.
-    fn mark_unproducible(&self, symbol: &str) {
+    /// Marks a walk dormant under a short lock so it is not regenerated each
+    /// tick; the regeneration is retried after [`DORMANT_RETRY_TICKS`] ticks.
+    fn mark_dormant(&self, symbol: &str) {
         if let Some(sim) = self.simulations.write().get_mut(symbol) {
-            sim.unproducible = true;
+            sim.dormant_ticks_remaining = DORMANT_RETRY_TICKS;
         }
     }
 }
@@ -705,8 +757,8 @@ mod tests {
 
         let sims = simulator.simulations.read();
         let sim = sims.get("TEST").expect("simulation still registered");
-        assert!(
-            !sim.unproducible,
+        assert_eq!(
+            sim.dormant_ticks_remaining, 0,
             "a healthy walk must not be marked dormant"
         );
         assert!(sim.prices.len() >= 2, "walk should have been refilled");
@@ -735,14 +787,15 @@ mod tests {
         {
             let sims = simulator.simulations.read();
             let sim = sims.get("TEST").expect("simulation still registered");
-            assert!(
-                sim.unproducible,
-                "an unusable regeneration must mark the walk dormant"
+            assert_eq!(
+                sim.dormant_ticks_remaining, DORMANT_RETRY_TICKS,
+                "an unusable regeneration must mark the walk dormant for the full back-off"
             );
         }
 
         // Back-off: many subsequent ticks must complete near-instantly (the
-        // dormant branch skips regeneration entirely — no per-tick 43k storm).
+        // dormant branch skips the heavy generation; the one retry per back-off
+        // window fails cheaply on input validation and re-arms the counter).
         let elapsed = tokio::time::timeout(Duration::from_secs(1), async {
             let start = std::time::Instant::now();
             for _ in 0..1000 {
@@ -759,10 +812,59 @@ mod tests {
             "1000 dormant ticks should be cheap, took {elapsed:?}"
         );
 
-        // The walk stays dormant; the index is not advanced while dormant.
+        // The walk stays dormant while the failure persists; the index is not
+        // advanced while dormant.
         let sims = simulator.simulations.read();
         let sim = sims.get("TEST").expect("simulation still registered");
-        assert!(sim.unproducible, "walk must remain dormant after back-off");
+        assert!(
+            sim.dormant_ticks_remaining > 0,
+            "walk must remain dormant while regeneration keeps failing"
+        );
+    }
+
+    /// A dormant walk MUST recover once the back-off elapses and the inputs are
+    /// valid again: the retry regenerates a fresh path, the dormant flag clears,
+    /// and prices resume advancing instead of staying frozen forever (issue #71).
+    #[tokio::test]
+    async fn test_dormant_walk_recovers_after_backoff() {
+        let assets = vec![test_asset()];
+        let simulator = PriceSimulator::new(assets.clone(), SimulationConfig::default());
+
+        // Force the walk dormant via a failing regeneration (invalid volatility).
+        let mut bad = test_asset();
+        bad.volatility = -1.0;
+        exhaust_walk(&simulator, "TEST");
+        let _ = simulator.get_next_price("TEST", &bad).await;
+
+        // Fast-forward the back-off to its final tick instead of looping
+        // DORMANT_RETRY_TICKS times.
+        {
+            let mut sims = simulator.simulations.write();
+            let sim = sims.get_mut("TEST").expect("simulation still registered");
+            assert!(sim.dormant_ticks_remaining > 0, "walk must be dormant");
+            sim.dormant_ticks_remaining = 1;
+        }
+
+        // The next tick exhausts the back-off and retries; with valid inputs the
+        // regeneration succeeds and the walk wakes up.
+        let price = tokio::time::timeout(
+            Duration::from_secs(5),
+            simulator.get_next_price("TEST", &assets[0]),
+        )
+        .await
+        .expect("retry regeneration completed within the timeout");
+        assert!(price > 0, "recovered walk must yield a positive price");
+
+        let sims = simulator.simulations.read();
+        let sim = sims.get("TEST").expect("simulation still registered");
+        assert_eq!(
+            sim.dormant_ticks_remaining, 0,
+            "a successful retry must clear the dormant back-off"
+        );
+        assert!(
+            sim.prices.len() >= 2,
+            "walk must have been refilled on retry"
+        );
     }
 
     /// The run loop MUST still observe the shutdown signal promptly even when a
