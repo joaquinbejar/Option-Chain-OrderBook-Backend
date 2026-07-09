@@ -28,12 +28,14 @@ const HEALTH_PATH: &str = "/health";
 /// Token-issuance path (exempt from authentication, IP rate-limited).
 const TOKEN_PATH: &str = "/api/v1/auth/token";
 
-/// Returns the current Unix time in seconds.
+/// Returns the current Unix time in whole seconds, rounded UP from
+/// milliseconds — the same rounding as [`RateLimitDecision::reset_secs`], so
+/// `reset - now` never overstates `Retry-After` by a second.
 #[inline]
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| (d.as_millis() as u64).div_ceil(1000))
         .unwrap_or(0)
 }
 
