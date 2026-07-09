@@ -4,15 +4,13 @@
 //! `get_bootstrap_secret`). They exercise the authorized path plus the `401`
 //! (missing / invalid token) and `403` (insufficient permission) paths.
 
-use orderbook_client::{ClientCommand, Error, OrderbookClient, Permission, WsClient, WsMessage};
-use orderbook_tests::{create_authenticated_client, create_test_client, get_api_url};
+use orderbook_client::{ClientCommand, Error, OrderbookClient, WsClient, WsMessage};
+use orderbook_tests::{admin_client, create_test_client, get_api_url, read_client};
 use std::time::Duration;
 
 #[tokio::test]
 async fn test_authorized_read_succeeds() {
-    let client = create_authenticated_client(vec![Permission::Read])
-        .await
-        .expect("obtain read token");
+    let client = read_client().await.expect("obtain read token");
 
     let stats = client
         .get_global_stats()
@@ -45,9 +43,7 @@ async fn test_invalid_token_is_unauthorized() {
 #[tokio::test]
 async fn test_insufficient_permission_is_forbidden() {
     // A read-only token cannot reach an admin-only controls endpoint.
-    let client = create_authenticated_client(vec![Permission::Read])
-        .await
-        .expect("obtain read token");
+    let client = read_client().await.expect("obtain read token");
 
     match client.get_controls().await {
         Err(Error::Api { status, .. }) => assert_eq!(status, 403),
@@ -57,9 +53,7 @@ async fn test_insufficient_permission_is_forbidden() {
 
 #[tokio::test]
 async fn test_admin_token_reaches_controls() {
-    let client = create_authenticated_client(vec![Permission::Admin])
-        .await
-        .expect("obtain admin token");
+    let client = admin_client().await.expect("obtain admin token");
 
     // Admin implies all, so the controls endpoint is reachable.
     let controls = client
@@ -73,9 +67,7 @@ async fn test_admin_token_reaches_controls() {
 async fn test_readonly_token_cannot_control_over_ws() {
     // A read-only token may open the WS but must NOT be able to run the
     // market-maker control commands (`kill`/`set_*`/`enable`).
-    let client = create_authenticated_client(vec![Permission::Read])
-        .await
-        .expect("obtain read token");
+    let client = read_client().await.expect("obtain read token");
 
     let mut ws = WsClient::connect(&client.ws_url())
         .await

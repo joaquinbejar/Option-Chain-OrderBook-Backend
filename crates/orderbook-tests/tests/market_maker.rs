@@ -1,25 +1,32 @@
-//! Market maker control endpoint tests.
+//! Market maker control and price endpoint tests.
+//!
+//! The control endpoints (`/api/v1/controls/*`) require an `Admin` token and act
+//! on GLOBAL market-maker state, so every test that mutates a global parameter
+//! restores it before returning.
 
 use orderbook_client::{InsertPriceRequest, UpdateParametersRequest};
-use orderbook_tests::{create_test_client, unique_symbol};
+use orderbook_tests::{admin_client, cleanup_underlying, read_client, unique_symbol};
 
 #[tokio::test]
 async fn test_get_controls() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = admin_client().await.expect("admin client");
 
     let controls = client.get_controls().await.expect("Failed to get controls");
 
-    // Controls should have valid values
+    // Controls should have valid values.
     assert!(controls.spread_multiplier > 0.0);
-    assert!(controls.size_scalar >= 0.0);
+    assert!(controls.size_scalar >= 0.0 && controls.size_scalar <= 1.0);
     assert!(controls.directional_skew >= -1.0 && controls.directional_skew <= 1.0);
 }
 
 #[tokio::test]
 async fn test_kill_switch_and_enable() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = admin_client().await.expect("admin client");
 
-    // Activate kill switch
+    // Record the starting state so we can restore it.
+    let initial = client.get_controls().await.expect("controls");
+
+    // Activate kill switch.
     let kill_response = client
         .kill_switch()
         .await
@@ -27,11 +34,10 @@ async fn test_kill_switch_and_enable() {
     assert!(kill_response.success);
     assert!(!kill_response.master_enabled);
 
-    // Verify controls show disabled
     let controls = client.get_controls().await.expect("Failed to get controls");
     assert!(!controls.master_enabled);
 
-    // Re-enable quoting
+    // Re-enable quoting.
     let enable_response = client
         .enable_quoting()
         .await
@@ -39,19 +45,21 @@ async fn test_kill_switch_and_enable() {
     assert!(enable_response.success);
     assert!(enable_response.master_enabled);
 
-    // Verify controls show enabled
     let controls = client.get_controls().await.expect("Failed to get controls");
     assert!(controls.master_enabled);
+
+    // Restore the initial master state.
+    if !initial.master_enabled {
+        client.kill_switch().await.expect("restore kill state");
+    }
 }
 
 #[tokio::test]
 async fn test_update_parameters() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = admin_client().await.expect("admin client");
 
-    // Get current parameters
     let initial = client.get_controls().await.expect("Failed to get controls");
 
-    // Update parameters
     let update_response = client
         .update_parameters(&UpdateParametersRequest {
             spread_multiplier: Some(1.5),
@@ -66,12 +74,11 @@ async fn test_update_parameters() {
     assert!((update_response.size_scalar - 0.75).abs() < 0.01);
     assert!((update_response.directional_skew - 0.1).abs() < 0.01);
 
-    // Issue #82 acceptance: the value GET reports can be POSTed back
-    // unchanged and round-trips to the same state.
+    // Issue #82 acceptance: the value GET reports round-trips through a POST.
     let read_back = client.get_controls().await.expect("Failed to get controls");
     assert!((read_back.size_scalar - 0.75).abs() < 0.01);
 
-    // Restore original parameters — unchanged representation, no conversion.
+    // Restore the original parameters — the same representation, no conversion.
     client
         .update_parameters(&UpdateParametersRequest {
             spread_multiplier: Some(initial.spread_multiplier),
@@ -84,41 +91,35 @@ async fn test_update_parameters() {
 
 #[tokio::test]
 async fn test_list_instruments() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = admin_client().await.expect("admin client");
     let symbol = unique_symbol("INST");
 
-    // Create an underlying first
     client
         .create_underlying(&symbol)
         .await
         .expect("Failed to create underlying");
 
-    // List instruments
     let instruments = client
         .list_instruments()
         .await
         .expect("Failed to list instruments");
 
-    // Should include our new instrument
     let found = instruments.instruments.iter().any(|i| i.symbol == symbol);
     assert!(found, "Created instrument not found in list");
 
-    // Clean up
-    client.delete_underlying(&symbol).await.unwrap();
+    cleanup_underlying(&client, &symbol).await;
 }
 
 #[tokio::test]
 async fn test_toggle_instrument() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = admin_client().await.expect("admin client");
     let symbol = unique_symbol("TOG");
 
-    // Create an underlying
     client
         .create_underlying(&symbol)
         .await
         .expect("Failed to create underlying");
 
-    // Toggle instrument (should disable if enabled, or enable if disabled)
     let toggle1 = client
         .toggle_instrument(&symbol)
         .await
@@ -127,7 +128,6 @@ async fn test_toggle_instrument() {
     assert_eq!(toggle1.symbol, symbol);
     let first_state = toggle1.enabled;
 
-    // Toggle again (should reverse)
     let toggle2 = client
         .toggle_instrument(&symbol)
         .await
@@ -135,22 +135,19 @@ async fn test_toggle_instrument() {
     assert!(toggle2.success);
     assert_eq!(toggle2.enabled, !first_state);
 
-    // Clean up
-    client.delete_underlying(&symbol).await.unwrap();
+    cleanup_underlying(&client, &symbol).await;
 }
 
 #[tokio::test]
 async fn test_insert_and_get_price() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = admin_client().await.expect("admin client");
     let symbol = unique_symbol("PRC");
 
-    // Create underlying first
     client
         .create_underlying(&symbol)
         .await
         .expect("Failed to create underlying");
 
-    // Insert a price
     let insert_response = client
         .insert_price(&InsertPriceRequest {
             symbol: symbol.clone(),
@@ -167,7 +164,6 @@ async fn test_insert_and_get_price() {
     assert_eq!(insert_response.symbol, symbol);
     assert_eq!(insert_response.price_cents, 10050);
 
-    // Get the price
     let price = client
         .get_latest_price(&symbol)
         .await
@@ -176,17 +172,15 @@ async fn test_insert_and_get_price() {
     assert_eq!(price.symbol, symbol);
     assert!((price.price - 100.50).abs() < 0.01);
 
-    // Clean up
-    client.delete_underlying(&symbol).await.unwrap();
+    cleanup_underlying(&client, &symbol).await;
 }
 
 #[tokio::test]
 async fn test_get_all_prices() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = admin_client().await.expect("admin client");
     let symbol = unique_symbol("ALL");
 
-    // Create underlying and insert price
-    client.create_underlying(&symbol).await.unwrap();
+    client.create_underlying(&symbol).await.expect("create");
     client
         .insert_price(&InsertPriceRequest {
             symbol: symbol.clone(),
@@ -197,29 +191,24 @@ async fn test_get_all_prices() {
             source: None,
         })
         .await
-        .unwrap();
+        .expect("insert price");
 
-    // Get all prices
     let prices = client
         .get_all_prices()
         .await
         .expect("Failed to get all prices");
 
-    // Should include our price
     let found = prices.iter().any(|p| p.symbol == symbol);
     assert!(found, "Inserted price not found in all prices");
 
-    // Clean up
-    client.delete_underlying(&symbol).await.unwrap();
+    cleanup_underlying(&client, &symbol).await;
 }
 
 #[tokio::test]
 async fn test_price_not_found() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = read_client().await.expect("read client");
 
-    // Try to get price for non-existent symbol
+    // A symbol that was never priced returns 404 -> NotFound.
     let result = client.get_latest_price("NONEXISTENT_SYMBOL_12345").await;
-
-    // Should return NotFound error
     assert!(result.is_err());
 }

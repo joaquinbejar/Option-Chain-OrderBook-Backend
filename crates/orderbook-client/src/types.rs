@@ -576,7 +576,7 @@ pub struct ExecutionSummary {
 }
 
 /// Query parameters for listing executions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionsQuery {
     /// Filter by start date (ISO 8601).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -603,6 +603,20 @@ pub struct ExecutionsQuery {
 
 fn default_executions_limit() -> u64 {
     1000
+}
+
+impl Default for ExecutionsQuery {
+    fn default() -> Self {
+        Self {
+            from: None,
+            to: None,
+            underlying: None,
+            symbol: None,
+            side: None,
+            limit: default_executions_limit(),
+            offset: 0,
+        }
+    }
 }
 
 /// Response for listing executions.
@@ -798,81 +812,126 @@ pub struct RestoreSnapshotResponse {
 // Orders (Extended)
 // ============================================================================
 
-/// Order status.
+/// Order status in the lifecycle. Mirrors the server `OrderStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OrderStatus {
-    /// Order is active.
+    /// Order is pending (not yet in the book).
+    Pending,
+    /// Order is active in the book.
     Active,
-    /// Order was filled.
+    /// Order is partially filled.
+    Partial,
+    /// Order is completely filled.
     Filled,
     /// Order was canceled.
     Canceled,
-    /// Order expired.
-    Expired,
 }
 
-/// Order information.
+/// Time in force for orders. Mirrors the server `OrderTimeInForce`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum OrderTimeInForce {
+    /// Good till canceled.
+    Gtc,
+    /// Immediate or cancel.
+    Ioc,
+    /// Fill or kill.
+    Fok,
+    /// Good till date.
+    Gtd,
+}
+
+/// Information about a single fill in an order's fill history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrderInfo {
-    /// Order ID.
+pub struct OrderFillInfo {
+    /// Execution price in smallest units.
+    pub price: u128,
+    /// Executed quantity.
+    pub quantity: u64,
+    /// Timestamp of the fill in milliseconds.
+    pub timestamp_ms: u64,
+}
+
+/// Response for a single order status query.
+///
+/// Mirrors the server's flat `OrderStatusResponse`: all order fields are at the
+/// top level (there is no `order` wrapper). Timestamps are ISO-8601 strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderStatusResponse {
+    /// Unique order identifier.
     pub order_id: String,
-    /// Option symbol.
+    /// Option symbol (e.g., "AAPL-20240329-150-C").
     pub symbol: String,
     /// Order side.
     pub side: OrderSide,
-    /// Limit price in cents.
+    /// Limit price in smallest units.
     pub price: u128,
-    /// Original quantity.
-    pub quantity: u64,
+    /// Original order quantity.
+    pub original_quantity: u64,
+    /// Remaining quantity.
+    pub remaining_quantity: u64,
     /// Filled quantity.
     pub filled_quantity: u64,
-    /// Order status.
+    /// Current order status.
     pub status: OrderStatus,
-    /// Creation timestamp in milliseconds.
-    pub created_at: u64,
-    /// Last update timestamp in milliseconds.
-    pub updated_at: u64,
+    /// Time in force.
+    pub time_in_force: OrderTimeInForce,
+    /// Creation timestamp (ISO 8601).
+    pub created_at: String,
+    /// Last update timestamp (ISO 8601).
+    pub updated_at: String,
+    /// Fill history.
+    pub fills: Vec<OrderFillInfo>,
 }
 
-/// Query parameters for listing orders.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Query parameters for listing orders. Mirrors the server `OrderListQuery`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderListQuery {
-    /// Filter by symbol.
+    /// Filter by underlying symbol.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<String>,
-    /// Filter by side.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub side: Option<OrderSide>,
+    pub underlying: Option<String>,
     /// Filter by status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<OrderStatus>,
+    /// Filter by side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<OrderSide>,
     /// Maximum number of results.
     #[serde(default = "default_order_limit")]
-    pub limit: u64,
+    pub limit: usize,
     /// Offset for pagination.
     #[serde(default)]
-    pub offset: u64,
+    pub offset: usize,
 }
 
-fn default_order_limit() -> u64 {
-    1000
+fn default_order_limit() -> usize {
+    100
 }
 
-/// Response for listing orders.
+impl Default for OrderListQuery {
+    fn default() -> Self {
+        Self {
+            underlying: None,
+            status: None,
+            side: None,
+            limit: default_order_limit(),
+            offset: 0,
+        }
+    }
+}
+
+/// Response for listing orders. Mirrors the server `OrderListResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderListResponse {
     /// List of orders.
-    pub orders: Vec<OrderInfo>,
-    /// Total count.
-    pub total: u64,
-}
-
-/// Response for order status.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrderStatusResponse {
-    /// Order information.
-    pub order: OrderInfo,
+    pub orders: Vec<OrderStatusResponse>,
+    /// Total number of matching orders.
+    pub total: usize,
+    /// Limit used for pagination.
+    pub limit: usize,
+    /// Offset used for pagination.
+    pub offset: usize,
 }
 
 /// Request to modify an order.
@@ -886,30 +945,48 @@ pub struct ModifyOrderRequest {
     pub quantity: Option<u64>,
 }
 
-/// Response for modifying an order.
+/// Status of an order modification request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModifyOrderStatus {
+    /// Order was successfully modified.
+    Modified,
+    /// Order modification was rejected.
+    Rejected,
+}
+
+/// Response for modifying an order. Mirrors the server `ModifyOrderResponse`.
+///
+/// Modification is cancel-and-replace, so `order_id` is the id of the NEW resting
+/// order on success and `priority_changed` is always `true` for a successful
+/// modification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModifyOrderResponse {
-    /// Whether the operation was successful.
-    pub success: bool,
-    /// Message describing the result.
+    /// The resulting order ID (the new id on success).
+    pub order_id: String,
+    /// Status of the modification.
+    pub status: ModifyOrderStatus,
+    /// New price after modification (if changed).
+    pub new_price: Option<u128>,
+    /// New quantity after modification (if changed).
+    pub new_quantity: Option<u64>,
+    /// Whether the order lost time priority due to the modification.
+    pub priority_changed: bool,
+    /// Descriptive message.
     pub message: String,
-    /// Updated order information.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub order: Option<OrderInfo>,
 }
 
-/// Request for bulk order submission.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BulkOrderRequest {
-    /// List of orders to submit.
-    pub orders: Vec<BulkOrderItem>,
-}
-
-/// Single order in a bulk request.
+/// Single order item in a bulk order request. Mirrors the server `BulkOrderItem`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkOrderItem {
-    /// Option symbol.
-    pub symbol: String,
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Expiration date string.
+    pub expiration: String,
+    /// Strike price.
+    pub strike: u64,
+    /// Option style: "call" or "put".
+    pub style: String,
     /// Order side.
     pub side: OrderSide,
     /// Limit price in cents.
@@ -918,28 +995,56 @@ pub struct BulkOrderItem {
     pub quantity: u64,
 }
 
-/// Response for bulk order submission.
+/// Request for bulk order submission. Mirrors the server `BulkOrderRequest`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BulkOrderResponse {
-    /// Number of orders submitted.
-    pub submitted: u64,
-    /// Number of orders that failed.
-    pub failed: u64,
-    /// Results for each order.
-    pub results: Vec<BulkOrderResultItem>,
+pub struct BulkOrderRequest {
+    /// List of orders to submit.
+    pub orders: Vec<BulkOrderItem>,
+    /// If true, all orders must succeed or none are left resting (atomic).
+    #[serde(default)]
+    pub atomic: bool,
 }
 
-/// Result for a single order in bulk submission.
+/// Status of an individual order in a bulk submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BulkOrderStatus {
+    /// Order was accepted by the book.
+    Accepted,
+    /// Order was rejected.
+    Rejected,
+}
+
+/// Result for a single order in bulk submission. Mirrors the server
+/// `BulkOrderResultItem`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkOrderResultItem {
-    /// Order ID (if successful).
+    /// Index of the order in the request array.
+    pub index: usize,
+    /// Order ID (present when accepted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_id: Option<String>,
-    /// Whether the order was successful.
-    pub success: bool,
-    /// Error message (if failed).
+    /// Status of the order.
+    pub status: BulkOrderStatus,
+    /// Error message (present when rejected).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Response for bulk order submission. Mirrors the server `BulkOrderResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkOrderResponse {
+    /// Number of orders accepted by the book (placed or filled).
+    pub success_count: usize,
+    /// Number of orders not left in the live state after the request.
+    pub failure_count: usize,
+    /// Results for each order.
+    pub results: Vec<BulkOrderResultItem>,
+    /// True when an atomic rollback was performed because an order failed.
+    pub rolled_back: bool,
+    /// Best-effort rollback warnings (present only when non-empty).
+    #[serde(default)]
+    pub rollback_warnings: Vec<String>,
 }
 
 /// Request for bulk order cancellation.
@@ -949,47 +1054,54 @@ pub struct BulkCancelRequest {
     pub order_ids: Vec<String>,
 }
 
-/// Response for bulk order cancellation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BulkCancelResponse {
-    /// Number of orders canceled.
-    pub canceled: u64,
-    /// Number of orders that failed.
-    pub failed: u64,
-    /// Results for each order.
-    pub results: Vec<BulkCancelResultItem>,
-}
-
-/// Result for a single order in bulk cancellation.
+/// Result for a single order in bulk cancellation. Mirrors the server
+/// `BulkCancelResultItem`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkCancelResultItem {
-    /// Order ID.
+    /// Order ID that was attempted.
     pub order_id: String,
-    /// Whether the cancellation was successful.
-    pub success: bool,
-    /// Error message (if failed).
+    /// Whether the cancellation succeeded.
+    pub canceled: bool,
+    /// Error message (present when the cancellation failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Query parameters for cancel-all.
+/// Response for bulk order cancellation. Mirrors the server `BulkCancelResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkCancelResponse {
+    /// Number of orders successfully canceled.
+    pub success_count: usize,
+    /// Number of orders that failed to cancel.
+    pub failure_count: usize,
+    /// Results for each order.
+    pub results: Vec<BulkCancelResultItem>,
+}
+
+/// Query parameters for cancel-all. Mirrors the server `CancelAllQuery`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CancelAllQuery {
-    /// Filter by symbol.
+    /// Filter by underlying symbol.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<String>,
+    pub underlying: Option<String>,
+    /// Filter by expiration date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiration: Option<String>,
     /// Filter by side.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub side: Option<OrderSide>,
+    /// Filter by option style.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
 }
 
-/// Response for cancel-all.
+/// Response for cancel-all. Mirrors the server `CancelAllResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelAllResponse {
-    /// Number of orders canceled.
-    pub canceled: u64,
-    /// Message describing the result.
-    pub message: String,
+    /// Number of orders successfully canceled.
+    pub canceled_count: usize,
+    /// Number of orders that failed to cancel.
+    pub failed_count: usize,
 }
 
 // ============================================================================
@@ -1011,17 +1123,17 @@ pub struct GreeksData {
     pub rho: f64,
 }
 
-/// Response for option greeks.
+/// Response for option greeks. Mirrors the server `GreeksResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GreeksResponse {
     /// Option symbol.
     pub symbol: String,
     /// Greeks data.
     pub greeks: GreeksData,
-    /// Underlying price used for calculation.
-    pub underlying_price: f64,
-    /// Implied volatility used.
-    pub implied_volatility: f64,
+    /// Implied volatility used for the calculation.
+    pub iv: f64,
+    /// Theoretical option value.
+    pub theoretical_value: f64,
     /// Timestamp in milliseconds.
     pub timestamp_ms: u64,
 }
@@ -1030,37 +1142,36 @@ pub struct GreeksResponse {
 // Last Trade
 // ============================================================================
 
-/// Last trade information.
+/// Response for last trade. Mirrors the server's flat `LastTradeResponse`.
+///
+/// The server returns `404` (mapped to [`Error::NotFound`](crate::Error::NotFound))
+/// when the option has no recorded trade, so a successful response always
+/// describes a real trade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LastTradeInfo {
+pub struct LastTradeResponse {
     /// Option symbol.
     pub symbol: String,
     /// Trade price in cents.
     pub price: u64,
     /// Trade quantity.
     pub quantity: u64,
-    /// Trade side.
+    /// Side of the taker (aggressor).
     pub side: OrderSide,
     /// Trade timestamp in milliseconds.
     pub timestamp_ms: u64,
-}
-
-/// Response for last trade.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LastTradeResponse {
-    /// Last trade information.
-    pub trade: Option<LastTradeInfo>,
+    /// Unique trade identifier.
+    pub trade_id: String,
 }
 
 // ============================================================================
 // OHLC
 // ============================================================================
 
-/// OHLC bar data.
+/// OHLC bar data. Mirrors the server `OhlcBar`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OhlcBar {
-    /// Bar open time in milliseconds.
-    pub timestamp_ms: u64,
+    /// Bar start time in seconds since epoch.
+    pub timestamp: u64,
     /// Open price in cents.
     pub open: u128,
     /// High price in cents.
@@ -1107,29 +1218,27 @@ pub struct OhlcResponse {
 // Orderbook Metrics
 // ============================================================================
 
-/// Spread metrics.
+/// Spread metrics. Mirrors the server `SpreadMetrics`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpreadMetrics {
-    /// Absolute spread in cents.
-    pub spread_absolute: Option<u64>,
+    /// Current spread in price units.
+    pub current: Option<u64>,
     /// Spread in basis points.
     pub spread_bps: Option<f64>,
-    /// Spread as percentage.
-    pub spread_percent: Option<f64>,
 }
 
-/// Depth metrics.
+/// Depth metrics. Mirrors the server `DepthMetrics`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepthMetrics {
-    /// Total bid depth.
-    pub bid_depth: u64,
-    /// Total ask depth.
-    pub ask_depth: u64,
-    /// Order book imbalance.
+    /// Total bid depth (quantity).
+    pub bid_depth_total: u64,
+    /// Total ask depth (quantity).
+    pub ask_depth_total: u64,
+    /// Order book imbalance (-1 to 1, positive = more bids).
     pub imbalance: f64,
 }
 
-/// Price metrics.
+/// Price metrics. Mirrors the server `PriceMetrics`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceMetrics {
     /// Mid price.
@@ -1142,31 +1251,32 @@ pub struct PriceMetrics {
     pub vwap_ask: Option<f64>,
 }
 
-/// Market impact metrics.
+/// Market impact metrics for buy and sell sides. Mirrors the server
+/// `MarketImpactMetrics`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketImpactMetrics {
     /// Impact for buying 100 units.
-    pub buy_100: Option<ImpactMetrics>,
+    pub buy_100: ImpactMetrics,
     /// Impact for selling 100 units.
-    pub sell_100: Option<ImpactMetrics>,
+    pub sell_100: ImpactMetrics,
 }
 
-/// Impact metrics for a specific quantity.
+/// Market impact metrics for a single side. Mirrors the server `ImpactMetrics`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImpactMetrics {
     /// Average execution price.
-    pub average_price: f64,
-    /// Price impact in basis points.
-    pub impact_bps: f64,
-    /// Total cost.
-    pub total_cost: u64,
+    pub avg_price: Option<f64>,
+    /// Slippage in basis points from the mid price.
+    pub slippage_bps: Option<f64>,
 }
 
-/// Response for orderbook metrics.
+/// Response for orderbook metrics. Mirrors the server `OrderbookMetricsResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderbookMetricsResponse {
     /// Option symbol.
     pub symbol: String,
+    /// Timestamp in milliseconds.
+    pub timestamp_ms: u64,
     /// Spread metrics.
     pub spread: SpreadMetrics,
     /// Depth metrics.
@@ -1174,69 +1284,93 @@ pub struct OrderbookMetricsResponse {
     /// Price metrics.
     pub prices: PriceMetrics,
     /// Market impact metrics.
-    pub impact: MarketImpactMetrics,
-    /// Timestamp in milliseconds.
-    pub timestamp_ms: u64,
+    pub market_impact: MarketImpactMetrics,
 }
 
 // ============================================================================
 // Volatility Surface
 // ============================================================================
 
-/// Strike IV data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Strike IV data. Mirrors the server `StrikeIV`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StrikeIV {
     /// Call implied volatility.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub call_iv: Option<f64>,
     /// Put implied volatility.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub put_iv: Option<f64>,
 }
 
-/// Response for volatility surface.
+/// A point in the ATM term structure. Mirrors the server `ATMTermStructurePoint`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ATMTermStructurePoint {
+    /// Expiration date string.
+    pub expiration: String,
+    /// Days to expiration.
+    pub days: u64,
+    /// ATM implied volatility.
+    pub iv: f64,
+}
+
+/// Response for volatility surface. Mirrors the server `VolatilitySurfaceResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolatilitySurfaceResponse {
     /// Underlying symbol.
     pub underlying: String,
-    /// Underlying price.
-    pub underlying_price: Option<f64>,
+    /// Current spot price (if available).
+    pub spot_price: Option<u64>,
+    /// Timestamp in milliseconds.
+    pub timestamp_ms: u64,
     /// List of expirations.
     pub expirations: Vec<String>,
     /// List of strikes.
     pub strikes: Vec<u64>,
     /// Surface data: expiration -> strike -> StrikeIV.
     pub surface: std::collections::HashMap<String, std::collections::HashMap<u64, StrikeIV>>,
-    /// Timestamp in milliseconds.
-    pub timestamp_ms: u64,
+    /// ATM term structure.
+    pub atm_term_structure: Vec<ATMTermStructurePoint>,
 }
 
 // ============================================================================
 // Option Chain
 // ============================================================================
 
-/// Option quote data for chain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Option quote data for a chain cell. Mirrors the server `OptionQuoteData`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OptionQuoteData {
-    /// Bid price.
+    /// Best bid price.
     pub bid: Option<u128>,
-    /// Ask price.
+    /// Best ask price.
     pub ask: Option<u128>,
     /// Bid size.
     pub bid_size: u64,
     /// Ask size.
     pub ask_size: u64,
     /// Last trade price.
-    pub last: Option<u64>,
+    pub last_trade: Option<u128>,
     /// Volume.
     pub volume: u64,
     /// Open interest.
     pub open_interest: u64,
-    /// Implied volatility.
-    pub iv: Option<f64>,
-    /// Delta.
+    /// Delta (present when greeks are calculated).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<f64>,
+    /// Gamma (present when greeks are calculated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gamma: Option<f64>,
+    /// Theta (present when greeks are calculated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theta: Option<f64>,
+    /// Vega (present when greeks are calculated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vega: Option<f64>,
+    /// Implied volatility (present when calculated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iv: Option<f64>,
 }
 
-/// Chain strike row.
+/// Chain strike row. Mirrors the server `ChainStrikeRow`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainStrikeRow {
     /// Strike price.
@@ -1247,17 +1381,17 @@ pub struct ChainStrikeRow {
     pub put: OptionQuoteData,
 }
 
-/// Response for option chain.
+/// Response for option chain. Mirrors the server `OptionChainResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptionChainResponse {
     /// Underlying symbol.
     pub underlying: String,
     /// Expiration date.
     pub expiration: String,
-    /// Underlying price.
-    pub underlying_price: Option<f64>,
+    /// Current spot price (if available).
+    pub spot_price: Option<u128>,
+    /// At-the-money strike (closest to spot price).
+    pub atm_strike: Option<u64>,
     /// Chain rows.
     pub chain: Vec<ChainStrikeRow>,
-    /// Timestamp in milliseconds.
-    pub timestamp_ms: u64,
 }

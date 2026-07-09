@@ -1,37 +1,40 @@
 //! Orderbook CRUD operation tests.
+//!
+//! Placement uses [`TEST_EXPIRATION`]; reads/cancels use the server-formatted
+//! expiration returned by the setup helpers (see the crate docs for bug #110).
 
 use orderbook_client::{
     AddOrderRequest, MarketOrderRequest, MarketOrderStatus, OptionPath, OrderSide,
 };
-use orderbook_tests::{create_test_client, unique_symbol};
+use orderbook_tests::{
+    TEST_EXPIRATION, TEST_STRIKE, admin_client, cleanup_underlying, formatted_expiration,
+    setup_underlying, unique_symbol,
+};
 
 #[tokio::test]
 async fn test_create_and_list_underlyings() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = admin_client().await.expect("admin client");
     let symbol = unique_symbol("TEST");
 
-    // Create underlying
     let created = client
         .create_underlying(&symbol)
         .await
         .expect("Failed to create underlying");
     assert_eq!(created.symbol, symbol);
 
-    // List underlyings should include our new one
     let list = client
         .list_underlyings()
         .await
         .expect("Failed to list underlyings");
     assert!(list.underlyings.contains(&symbol));
 
-    // Get underlying
     let fetched = client
         .get_underlying(&symbol)
         .await
         .expect("Failed to get underlying");
     assert_eq!(fetched.symbol, symbol);
 
-    // Clean up — the delete returns a typed confirmation (issue #60).
+    // The delete returns a typed confirmation (issue #60).
     let deleted = client
         .delete_underlying(&symbol)
         .await
@@ -42,73 +45,57 @@ async fn test_create_and_list_underlyings() {
 
 #[tokio::test]
 async fn test_create_expiration_and_strike() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = admin_client().await.expect("admin client");
     let symbol = unique_symbol("EXP");
-    let expiration = "20251231";
-    let strike = 10000u64;
 
-    // Create underlying
     client
         .create_underlying(&symbol)
         .await
         .expect("Failed to create underlying");
 
-    // Create expiration
+    // create_expiration returns the server's canonical expiration form (bug #110
+    // formats the parsed Days value), so assert only that it succeeds.
     let exp = client
-        .create_expiration(&symbol, expiration)
+        .create_expiration(&symbol, TEST_EXPIRATION)
         .await
         .expect("Failed to create expiration");
-    assert_eq!(exp.expiration, expiration);
+    assert!(!exp.expiration.is_empty());
 
-    // List expirations
+    // list_expirations reports the URL-safe formatted expiration used for reads.
+    let formatted = formatted_expiration(&client, &symbol).await;
     let exps = client
         .list_expirations(&symbol)
         .await
         .expect("Failed to list expirations");
-    assert!(exps.expirations.contains(&expiration.to_string()));
+    assert!(exps.expirations.contains(&formatted));
 
-    // Create strike
     let strike_info = client
-        .create_strike(&symbol, expiration, strike)
+        .create_strike(&symbol, TEST_EXPIRATION, TEST_STRIKE)
         .await
         .expect("Failed to create strike");
-    assert_eq!(strike_info.strike, strike);
+    assert_eq!(strike_info.strike, TEST_STRIKE);
 
-    // List strikes
+    // list_strikes resolves the book by the formatted expiration.
     let strikes = client
-        .list_strikes(&symbol, expiration)
+        .list_strikes(&symbol, &formatted)
         .await
         .expect("Failed to list strikes");
-    assert!(strikes.strikes.contains(&strike));
+    assert!(strikes.strikes.contains(&TEST_STRIKE));
 
-    // Clean up
-    client
-        .delete_underlying(&symbol)
-        .await
-        .expect("Failed to delete underlying");
+    cleanup_underlying(&client, &symbol).await;
 }
 
 #[tokio::test]
 async fn test_add_and_cancel_order() {
-    let client = create_test_client().expect("Failed to create client");
-    let symbol = unique_symbol("ORD");
-    let expiration = "20251231";
-    let strike = 10000u64;
+    let client = admin_client().await.expect("admin client");
+    let (underlying, formatted) = setup_underlying(&client, "ORD").await;
 
-    // Setup: create underlying, expiration, strike
-    client.create_underlying(&symbol).await.unwrap();
-    client.create_expiration(&symbol, expiration).await.unwrap();
-    client
-        .create_strike(&symbol, expiration, strike)
-        .await
-        .unwrap();
+    let place = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
+    let read = OptionPath::call(&underlying, &formatted, TEST_STRIKE);
 
-    let option = OptionPath::call(&symbol, expiration, strike);
-
-    // Add a limit order
     let order = client
         .add_order(
-            &option,
+            &place,
             &AddOrderRequest {
                 side: OrderSide::Buy,
                 price: 1500,
@@ -121,45 +108,32 @@ async fn test_add_and_cancel_order() {
     assert!(!order.order_id.is_empty());
     assert!(order.message.contains("success"));
 
-    // Get order book should show the order
     let book = client
-        .get_option_book(&option)
+        .get_option_book(&read)
         .await
         .expect("Failed to get order book");
     assert!(book.order_count > 0);
 
-    // Cancel the order
     let cancel = client
-        .cancel_order(&option, &order.order_id)
+        .cancel_order(&read, &order.order_id)
         .await
         .expect("Failed to cancel order");
     assert!(cancel.success);
 
-    // Clean up
-    client.delete_underlying(&symbol).await.unwrap();
+    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
 async fn test_get_option_quote() {
-    let client = create_test_client().expect("Failed to create client");
-    let symbol = unique_symbol("QUO");
-    let expiration = "20251231";
-    let strike = 10000u64;
+    let client = admin_client().await.expect("admin client");
+    let (underlying, formatted) = setup_underlying(&client, "QUO").await;
 
-    // Setup
-    client.create_underlying(&symbol).await.unwrap();
-    client.create_expiration(&symbol, expiration).await.unwrap();
-    client
-        .create_strike(&symbol, expiration, strike)
-        .await
-        .unwrap();
+    let place = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
+    let read = OptionPath::call(&underlying, &formatted, TEST_STRIKE);
 
-    let option = OptionPath::call(&symbol, expiration, strike);
-
-    // Add bid and ask orders
     client
         .add_order(
-            &option,
+            &place,
             &AddOrderRequest {
                 side: OrderSide::Buy,
                 price: 1400,
@@ -167,11 +141,11 @@ async fn test_get_option_quote() {
             },
         )
         .await
-        .unwrap();
+        .expect("add bid");
 
     client
         .add_order(
-            &option,
+            &place,
             &AddOrderRequest {
                 side: OrderSide::Sell,
                 price: 1600,
@@ -179,11 +153,10 @@ async fn test_get_option_quote() {
             },
         )
         .await
-        .unwrap();
+        .expect("add ask");
 
-    // Get quote
     let quote = client
-        .get_option_quote(&option)
+        .get_option_quote(&read)
         .await
         .expect("Failed to get quote");
 
@@ -192,31 +165,21 @@ async fn test_get_option_quote() {
     assert_eq!(quote.bid_size, 10);
     assert_eq!(quote.ask_size, 10);
 
-    // Clean up
-    client.delete_underlying(&symbol).await.unwrap();
+    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
 async fn test_market_order_execution() {
-    let client = create_test_client().expect("Failed to create client");
-    let symbol = unique_symbol("MKT");
-    let expiration = "20251231";
-    let strike = 10000u64;
+    let client = admin_client().await.expect("admin client");
+    let (underlying, _formatted) = setup_underlying(&client, "MKT").await;
 
-    // Setup
-    client.create_underlying(&symbol).await.unwrap();
-    client.create_expiration(&symbol, expiration).await.unwrap();
-    client
-        .create_strike(&symbol, expiration, strike)
-        .await
-        .unwrap();
+    // Placement resolves the book by parsing TEST_EXPIRATION, so the resting sell
+    // and the market buy land on the same book and cross.
+    let place = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
 
-    let option = OptionPath::call(&symbol, expiration, strike);
-
-    // Add a sell order (liquidity)
     client
         .add_order(
-            &option,
+            &place,
             &AddOrderRequest {
                 side: OrderSide::Sell,
                 price: 1500,
@@ -224,12 +187,11 @@ async fn test_market_order_execution() {
             },
         )
         .await
-        .unwrap();
+        .expect("add resting sell");
 
-    // Submit market buy order
     let result = client
         .submit_market_order(
-            &option,
+            &place,
             &MarketOrderRequest {
                 side: OrderSide::Buy,
                 quantity: 50,
@@ -244,31 +206,20 @@ async fn test_market_order_execution() {
     assert!(result.average_price.is_some());
     assert!(!result.fills.is_empty());
 
-    // Clean up
-    client.delete_underlying(&symbol).await.unwrap();
+    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
 async fn test_market_order_no_liquidity() {
-    let client = create_test_client().expect("Failed to create client");
-    let symbol = unique_symbol("NLQ");
-    let expiration = "20251231";
-    let strike = 10000u64;
+    let client = admin_client().await.expect("admin client");
+    let (underlying, _formatted) = setup_underlying(&client, "NLQ").await;
 
-    // Setup (no orders in the book)
-    client.create_underlying(&symbol).await.unwrap();
-    client.create_expiration(&symbol, expiration).await.unwrap();
-    client
-        .create_strike(&symbol, expiration, strike)
-        .await
-        .unwrap();
+    let place = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
 
-    let option = OptionPath::call(&symbol, expiration, strike);
-
-    // Submit market order with no liquidity - should fail
+    // No resting liquidity: the market order is rejected with an error.
     let result = client
         .submit_market_order(
-            &option,
+            &place,
             &MarketOrderRequest {
                 side: OrderSide::Buy,
                 quantity: 50,
@@ -276,34 +227,22 @@ async fn test_market_order_no_liquidity() {
         )
         .await;
 
-    // Should return an error due to no liquidity
     assert!(result.is_err());
 
-    // Clean up
-    client.delete_underlying(&symbol).await.unwrap();
+    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
 async fn test_put_option_operations() {
-    let client = create_test_client().expect("Failed to create client");
-    let symbol = unique_symbol("PUT");
-    let expiration = "20251231";
-    let strike = 10000u64;
+    let client = admin_client().await.expect("admin client");
+    let (underlying, formatted) = setup_underlying(&client, "PUT").await;
 
-    // Setup
-    client.create_underlying(&symbol).await.unwrap();
-    client.create_expiration(&symbol, expiration).await.unwrap();
-    client
-        .create_strike(&symbol, expiration, strike)
-        .await
-        .unwrap();
+    let place = OptionPath::put(&underlying, TEST_EXPIRATION, TEST_STRIKE);
+    let read = OptionPath::put(&underlying, &formatted, TEST_STRIKE);
 
-    let option = OptionPath::put(&symbol, expiration, strike);
-
-    // Add order to put option
     let order = client
         .add_order(
-            &option,
+            &place,
             &AddOrderRequest {
                 side: OrderSide::Buy,
                 price: 500,
@@ -312,16 +251,13 @@ async fn test_put_option_operations() {
         )
         .await
         .expect("Failed to add put order");
-
     assert!(!order.order_id.is_empty());
 
-    // Get put order book
     let book = client
-        .get_option_book(&option)
+        .get_option_book(&read)
         .await
         .expect("Failed to get put order book");
     assert!(book.order_count > 0);
 
-    // Clean up
-    client.delete_underlying(&symbol).await.unwrap();
+    cleanup_underlying(&client, &underlying).await;
 }

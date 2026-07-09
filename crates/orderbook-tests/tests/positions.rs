@@ -9,13 +9,13 @@
 use orderbook_client::{
     AddOrderRequest, MarketOrderRequest, MarketOrderStatus, OptionPath, OrderSide, PositionQuery,
 };
-use orderbook_tests::{create_test_client, unique_symbol};
+use orderbook_tests::{admin_client, cleanup_underlying, unique_symbol};
 
 /// Opens a long position whose order book is empty after the fill (no bid, no
 /// ask) and asserts the position is reported as unpriced everywhere.
 #[tokio::test]
 async fn test_unpriced_position_omits_mark_fields() {
-    let client = create_test_client().expect("Failed to create client");
+    let client = admin_client().await.expect("admin client");
     let underlying = unique_symbol("UNP");
     let expiration = "20251231";
     let strike = 10000u64;
@@ -106,8 +106,5 @@ async fn test_unpriced_position_omits_mark_fields() {
     assert_eq!(listed.summary.total_unrealized_pnl, 0);
 
     // Clean up.
-    client
-        .delete_underlying(&underlying)
-        .await
-        .expect("delete underlying");
+    cleanup_underlying(&client, &underlying).await;
 }
