@@ -147,7 +147,8 @@ option-chain-orderbook-backend mint-token --permissions read,trade --ttl 3600
 |--------|----------|-------------|
 | GET | `/api/v1/underlyings/{underlying}/volatility-surface` | Get IV surface |
 
-IVs are derived from the observed order-book mid prices via
+IVs are derived from the observed order-book mid prices (the lone bid or
+ask when only one side is quoted) via
 `optionstratlib` (European Black-Scholes, zero rate/dividend). The solver
 is a 0.1%-step grid search, so derivable IVs lie in `[0.001, 0.999)`; a
 value is omitted when no quote or spot price exists, the mid cannot be

@@ -1134,7 +1134,9 @@ fn build_option_quote_data(
 ///
 /// Returns IV data across all strikes and expirations, enabling volatility
 /// surface visualization and analysis. Each IV is derived from the observed
-/// order-book mid price via `optionstratlib::volatility::calculate_iv`
+/// order-book mid price — or the lone bid/ask when only one side is quoted
+/// (two-sided enforcement is tracked in issue #125) — via
+/// `optionstratlib::volatility::calculate_iv`
 /// (European Black-Scholes, zero risk-free rate and dividend yield; a
 /// 0.1%-step grid search, so derivable IVs lie in `[0.001, 0.999)`). An IV is
 /// omitted (`null`) when there is no quote for that leg, no spot price, or the
@@ -1364,12 +1366,12 @@ const IV_GRID_CEILING: f64 = 0.999;
 /// All monetary legs are passed in cents; Black-Scholes is homogeneous of
 /// degree one in (spot, strike, price), so the derived IV is identical to a
 /// dollar-denominated computation. The solver is a 0.1%-step grid search, so
-/// the derivable range is `[0.001, 0.999)`. Returns `None` — logged at DEBUG
-/// — when the spot price is unknown, an input cannot form a `Positive`, the
-/// solver cannot produce a volatility for the observed mid (e.g. a mid below
-/// intrinsic), or the result is pinned to the grid ceiling (a mid at or
-/// beyond what the highest candidate volatility can price). Callers must
-/// omit the field rather than substitute a synthetic value.
+/// the derivable range is `[0.001, 0.999)`. Returns `None` when the spot
+/// price is unknown or an input cannot form a `Positive`; market-level
+/// omissions — a mid at/above the no-volatility asymptote, a mid the solver
+/// cannot match (e.g. below intrinsic), or a result pinned to the grid
+/// ceiling — are additionally logged at DEBUG. Callers must omit the field
+/// rather than substitute a synthetic value.
 fn derive_iv(
     mid_cents: u128,
     strike_cents: u64,
