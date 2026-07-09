@@ -14,6 +14,41 @@ use optionstratlib::ExpirationDate;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Process-wide monotonic sequence for [`StoredSnapshot`] creation order.
+static SNAPSHOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A stored orderbook snapshot: the creation time plus the per-orderbook
+/// entries.
+///
+/// The creation timestamp is kept at the snapshot level (not derived from the
+/// entries) so that a snapshot with no entries — e.g. no resting orders, or
+/// every book failed to serialize — still orders correctly for retention
+/// eviction and listing instead of sorting as the epoch.
+#[derive(Debug, Clone)]
+pub struct StoredSnapshot {
+    /// Creation timestamp in milliseconds since the Unix epoch.
+    pub created_at_ms: u64,
+    /// Per-orderbook snapshot entries.
+    pub infos: Vec<OrderbookSnapshotInfo>,
+    /// Monotonic creation sequence, used to break `created_at_ms` ties during
+    /// eviction so that within the same millisecond the earliest-created
+    /// snapshot is evicted first — never the one just inserted.
+    seq: u64,
+}
+
+impl StoredSnapshot {
+    /// Creates a stored snapshot, stamping it with the next monotonic
+    /// creation sequence.
+    #[must_use]
+    pub fn new(created_at_ms: u64, infos: Vec<OrderbookSnapshotInfo>) -> Self {
+        Self {
+            created_at_ms,
+            infos,
+            seq: SNAPSHOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
 /// Application state shared across all handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -50,7 +85,7 @@ pub struct AppState {
     /// Storage for execution reports by execution ID.
     pub executions: Arc<DashMap<String, ExecutionInfo>>,
     /// Storage for orderbook snapshots by snapshot ID.
-    pub snapshots: Arc<DashMap<String, Vec<OrderbookSnapshotInfo>>>,
+    pub snapshots: Arc<DashMap<String, StoredSnapshot>>,
 }
 
 impl AppState {
@@ -265,6 +300,51 @@ impl AppState {
 
         count
     }
+
+    /// Maximum number of orderbook snapshots retained in memory.
+    ///
+    /// Creating a snapshot beyond this cap evicts the oldest retained snapshot
+    /// (by creation timestamp), so snapshot storage stays bounded regardless of
+    /// how many `POST /api/v1/admin/snapshot` requests arrive.
+    pub const MAX_RETAINED_SNAPSHOTS: usize = 16;
+
+    /// Inserts a snapshot and enforces the retention bound.
+    ///
+    /// After the insert, while more than
+    /// [`MAX_RETAINED_SNAPSHOTS`](Self::MAX_RETAINED_SNAPSHOTS) snapshots are
+    /// retained, the oldest snapshot (by creation timestamp, ties broken by
+    /// the monotonic creation sequence) is evicted — a timestamp tie can
+    /// never evict the snapshot that was just inserted.
+    pub fn insert_snapshot_bounded(&self, snapshot_id: String, snapshot: StoredSnapshot) {
+        self.snapshots.insert(snapshot_id, snapshot);
+
+        while self.snapshots.len() > Self::MAX_RETAINED_SNAPSHOTS {
+            // Dashmap deadlocks if you remove while holding an iter reference,
+            // so pick the eviction victim first, then remove.
+            let oldest = self
+                .snapshots
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.value().created_at_ms,
+                        entry.value().seq,
+                        entry.key().clone(),
+                    )
+                })
+                .min_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
+            let Some((created_at_ms, _seq, key)) = oldest else {
+                break;
+            };
+            warn!(
+                snapshot_id = %key,
+                created_at_ms,
+                cap = Self::MAX_RETAINED_SNAPSHOTS,
+                "snapshot retention cap exceeded; evicting oldest snapshot"
+            );
+            self.snapshots.remove(&key);
+        }
+    }
 }
 
 impl Default for AppState {
@@ -277,6 +357,108 @@ impl Default for AppState {
 mod tests {
     use super::*;
     use crate::models::{OrderSide, OrderStatus, OrderTimeInForce};
+
+    fn stored_snapshot(id: &str, created_at: u64) -> StoredSnapshot {
+        StoredSnapshot::new(
+            created_at,
+            vec![OrderbookSnapshotInfo {
+                snapshot_id: id.to_string(),
+                underlying: "BTC".to_string(),
+                expiration: "20251231".to_string(),
+                strike: 100_000,
+                style: "call".to_string(),
+                order_count: 1,
+                bid_levels: 1,
+                ask_levels: 1,
+                data: "{}".to_string(),
+                created_at,
+            }],
+        )
+    }
+
+    #[test]
+    fn test_insert_snapshot_bounded_evicts_oldest_past_cap() {
+        let state = AppState::new();
+        let total = AppState::MAX_RETAINED_SNAPSHOTS + 2;
+
+        for i in 0..total {
+            let id = format!("snap-{i:03}");
+            state.insert_snapshot_bounded(id.clone(), stored_snapshot(&id, 1_000 + i as u64));
+        }
+
+        assert_eq!(
+            state.snapshots.len(),
+            AppState::MAX_RETAINED_SNAPSHOTS,
+            "retention must be capped at MAX_RETAINED_SNAPSHOTS"
+        );
+        // The two oldest snapshots were evicted; the newest cap-many remain.
+        assert!(!state.snapshots.contains_key("snap-000"));
+        assert!(!state.snapshots.contains_key("snap-001"));
+        assert!(state.snapshots.contains_key("snap-002"));
+        assert!(
+            state
+                .snapshots
+                .contains_key(&format!("snap-{:03}", total - 1))
+        );
+    }
+
+    #[test]
+    fn test_insert_snapshot_bounded_under_cap_keeps_everything() {
+        let state = AppState::new();
+
+        for i in 0..AppState::MAX_RETAINED_SNAPSHOTS {
+            let id = format!("snap-{i:03}");
+            state.insert_snapshot_bounded(id.clone(), stored_snapshot(&id, 1_000 + i as u64));
+        }
+
+        assert_eq!(state.snapshots.len(), AppState::MAX_RETAINED_SNAPSHOTS);
+        assert!(state.snapshots.contains_key("snap-000"));
+    }
+
+    #[test]
+    fn test_insert_snapshot_bounded_empty_snapshot_keeps_its_timestamp() {
+        let state = AppState::new();
+
+        // Fill to the cap, then create a *newer* snapshot with no entries.
+        // Its snapshot-level timestamp must be honored: the oldest non-empty
+        // snapshot is evicted, never the fresh empty one (which would leave
+        // the caller holding a phantom snapshot ID).
+        for i in 0..AppState::MAX_RETAINED_SNAPSHOTS {
+            let id = format!("snap-{i:03}");
+            state.insert_snapshot_bounded(id.clone(), stored_snapshot(&id, 1_000 + i as u64));
+        }
+        state.insert_snapshot_bounded(
+            "empty-newest".to_string(),
+            StoredSnapshot::new(9_999, Vec::new()),
+        );
+
+        assert_eq!(state.snapshots.len(), AppState::MAX_RETAINED_SNAPSHOTS);
+        assert!(state.snapshots.contains_key("empty-newest"));
+        assert!(!state.snapshots.contains_key("snap-000"));
+    }
+
+    #[test]
+    fn test_insert_snapshot_bounded_same_timestamp_evicts_earliest_created() {
+        let state = AppState::new();
+        let total = AppState::MAX_RETAINED_SNAPSHOTS + 1;
+
+        // All snapshots share one created_at_ms (bursty creates within the
+        // same millisecond). The monotonic creation sequence must break the
+        // tie: the earliest-created snapshot is evicted, never the one that
+        // was just inserted — regardless of how the IDs sort.
+        for i in 0..total {
+            let id = format!("burst-{i:03}");
+            state.insert_snapshot_bounded(id.clone(), stored_snapshot(&id, 5_000));
+        }
+
+        assert_eq!(state.snapshots.len(), AppState::MAX_RETAINED_SNAPSHOTS);
+        assert!(!state.snapshots.contains_key("burst-000"));
+        assert!(
+            state
+                .snapshots
+                .contains_key(&format!("burst-{:03}", total - 1))
+        );
+    }
 
     #[test]
     fn test_parse_expiration_accepts_yyyymmdd() {
