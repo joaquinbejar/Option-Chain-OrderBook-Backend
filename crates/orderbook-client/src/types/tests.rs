@@ -792,3 +792,13 @@ fn test_position_query_default() {
 
     assert!(query.underlying.is_none());
 }
+
+/// Issue #79: `QuoteResponse` mirrors the server's `Option<u128>` price width —
+/// a response with prices beyond `u64::MAX` must deserialize.
+#[test]
+fn test_quote_response_deserializes_beyond_u64_prices() {
+    let json = r#"{"bid_price":18446744073709551616,"bid_size":1,"ask_price":36893488147419103232,"ask_size":2,"timestamp_ms":1}"#;
+    let quote: QuoteResponse = serde_json::from_str(json).expect("u128-wide prices deserialize");
+    assert_eq!(quote.bid_price, Some(18_446_744_073_709_551_616_u128));
+    assert_eq!(quote.ask_price, Some(36_893_488_147_419_103_232_u128));
+}

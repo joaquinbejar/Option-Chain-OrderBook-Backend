@@ -161,11 +161,11 @@ pub struct StrikeSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteResponse {
     /// Best bid price.
-    pub bid_price: Option<u64>,
+    pub bid_price: Option<u128>,
     /// Best bid size.
     pub bid_size: u64,
     /// Best ask price.
-    pub ask_price: Option<u64>,
+    pub ask_price: Option<u128>,
     /// Best ask size.
     pub ask_size: u64,
     /// Timestamp in milliseconds.
@@ -201,7 +201,7 @@ pub struct AddOrderRequest {
     /// Order side.
     pub side: OrderSide,
     /// Limit price in smallest units.
-    pub price: u64,
+    pub price: u128,
     /// Order quantity in smallest units.
     pub quantity: u64,
 }
@@ -237,7 +237,7 @@ pub struct MarketOrderRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillInfo {
     /// Execution price in smallest units.
-    pub price: u64,
+    pub price: u128,
     /// Executed quantity in smallest units.
     pub quantity: u64,
 }
@@ -267,7 +267,7 @@ pub struct MarketOrderResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceLevelInfo {
     /// Price in smallest units.
-    pub price: u64,
+    pub price: u128,
     /// Total visible quantity at this level.
     pub quantity: u64,
     /// Number of orders at this level.
@@ -626,7 +626,7 @@ pub struct PositionInfo {
     /// Net quantity (positive = long, negative = short).
     pub quantity: i64,
     /// Average entry price in cents.
-    pub average_price: u64,
+    pub average_price: u128,
     /// Realized P&L in cents.
     pub realized_pnl: i64,
     /// Last update timestamp in milliseconds.
@@ -822,7 +822,7 @@ pub struct OrderInfo {
     /// Order side.
     pub side: OrderSide,
     /// Limit price in cents.
-    pub price: u64,
+    pub price: u128,
     /// Original quantity.
     pub quantity: u64,
     /// Filled quantity.
@@ -880,7 +880,7 @@ pub struct OrderStatusResponse {
 pub struct ModifyOrderRequest {
     /// New price (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub price: Option<u64>,
+    pub price: Option<u128>,
     /// New quantity (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantity: Option<u64>,
@@ -913,7 +913,7 @@ pub struct BulkOrderItem {
     /// Order side.
     pub side: OrderSide,
     /// Limit price in cents.
-    pub price: u64,
+    pub price: u128,
     /// Order quantity.
     pub quantity: u64,
 }
@@ -1062,13 +1062,13 @@ pub struct OhlcBar {
     /// Bar open time in milliseconds.
     pub timestamp_ms: u64,
     /// Open price in cents.
-    pub open: u64,
+    pub open: u128,
     /// High price in cents.
-    pub high: u64,
+    pub high: u128,
     /// Low price in cents.
-    pub low: u64,
+    pub low: u128,
     /// Close price in cents.
-    pub close: u64,
+    pub close: u128,
     /// Volume.
     pub volume: u64,
     /// Number of trades.
@@ -1217,9 +1217,9 @@ pub struct VolatilitySurfaceResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptionQuoteData {
     /// Bid price.
-    pub bid: Option<u64>,
+    pub bid: Option<u128>,
     /// Ask price.
-    pub ask: Option<u64>,
+    pub ask: Option<u128>,
     /// Bid size.
     pub bid_size: u64,
     /// Ask size.
