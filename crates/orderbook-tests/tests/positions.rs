@@ -36,10 +36,11 @@ async fn test_unpriced_position_omits_mark_fields() {
 
     let option = OptionPath::call(&underlying, expiration, strike);
 
-    // Provide exactly enough resting sell liquidity for the market buy so the
-    // book is EMPTY (no bid, no ask) once the buy fully consumes it — the
-    // resulting long position then has no current quote.
-    client
+    // Phase 1: provide exactly enough resting sell liquidity for the market buy so
+    // the book is EMPTY (no bid, no ask) once the buy fully consumes it — the
+    // resulting long position then has no current quote. Every request is captured
+    // and only asserted after cleanup.
+    let rest = client
         .add_order(
             &option,
             &AddOrderRequest {
@@ -48,9 +49,7 @@ async fn test_unpriced_position_omits_mark_fields() {
                 quantity: 10,
             },
         )
-        .await
-        .expect("add resting sell");
-
+        .await;
     let result = client
         .submit_market_order(
             &option,
@@ -59,16 +58,29 @@ async fn test_unpriced_position_omits_mark_fields() {
                 quantity: 10,
             },
         )
-        .await
-        .expect("market order fills");
-    assert_eq!(result.status, MarketOrderStatus::Filled);
-    assert_eq!(result.filled_quantity, 10);
+        .await;
 
     // The server records the position under `{underlying}-{expiration}-{strike}-C`.
     let symbol = format!("{}-{}-{}-C", underlying, expiration, strike);
 
+    let position = client.get_position(&symbol).await;
+    let listed = client
+        .list_positions(Some(&PositionQuery {
+            underlying: Some(underlying.clone()),
+        }))
+        .await;
+
+    // Phase 2: cleanup.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3: assert.
+    rest.expect("add resting sell");
+    let result = result.expect("market order fills");
+    assert_eq!(result.status, MarketOrderStatus::Filled);
+    assert_eq!(result.filled_quantity, 10);
+
     // GET /positions/{symbol}: unpriced -> the three mark fields are absent.
-    let position = client.get_position(&symbol).await.expect("position found");
+    let position = position.expect("position found");
     assert_eq!(position.symbol, symbol);
     assert_eq!(position.quantity, 10);
     assert_eq!(
@@ -87,12 +99,7 @@ async fn test_unpriced_position_omits_mark_fields() {
     // GET /positions filtered to this underlying: the position appears, still
     // unpriced, and the summary counts it as unpriced while excluding it from
     // total_unrealized_pnl.
-    let listed = client
-        .list_positions(Some(&PositionQuery {
-            underlying: Some(underlying.clone()),
-        }))
-        .await
-        .expect("list positions");
+    let listed = listed.expect("list positions");
     let listed_pos = listed
         .positions
         .iter()
@@ -104,7 +111,4 @@ async fn test_unpriced_position_omits_mark_fields() {
     assert_eq!(listed.summary.position_count, 1);
     assert_eq!(listed.summary.unpriced_count, 1);
     assert_eq!(listed.summary.total_unrealized_pnl, 0);
-
-    // Clean up.
-    cleanup_underlying(&client, &underlying).await;
 }

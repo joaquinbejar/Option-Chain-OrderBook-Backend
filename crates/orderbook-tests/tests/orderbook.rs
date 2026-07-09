@@ -2,13 +2,17 @@
 //!
 //! Placement uses [`TEST_EXPIRATION`]; reads/cancels use the server-formatted
 //! expiration returned by the setup helpers (see the crate docs for bug #110).
+//!
+//! Every test that creates an underlying uses the capture-then-assert pattern:
+//! perform all requests capturing outcomes into plain variables, run
+//! [`cleanup_underlying`], and only THEN assert — so a failed assertion never
+//! leaks a test underlying on the server.
 
 use orderbook_client::{
     AddOrderRequest, MarketOrderRequest, MarketOrderStatus, OptionPath, OrderSide,
 };
 use orderbook_tests::{
-    TEST_EXPIRATION, TEST_STRIKE, admin_client, cleanup_underlying, formatted_expiration,
-    setup_underlying, unique_symbol,
+    TEST_EXPIRATION, TEST_STRIKE, admin_client, cleanup_underlying, setup_underlying, unique_symbol,
 };
 
 #[tokio::test]
@@ -16,29 +20,25 @@ async fn test_create_and_list_underlyings() {
     let client = admin_client().await.expect("admin client");
     let symbol = unique_symbol("TEST");
 
-    let created = client
-        .create_underlying(&symbol)
-        .await
-        .expect("Failed to create underlying");
+    // Phase 1: create / list / get / delete, captured. The delete is both the
+    // final assertion target AND the cleanup, so it always runs.
+    let created = client.create_underlying(&symbol).await;
+    let list = client.list_underlyings().await;
+    let fetched = client.get_underlying(&symbol).await;
+    let deleted = client.delete_underlying(&symbol).await;
+
+    // Phase 2: assert on the captured values.
+    let created = created.expect("Failed to create underlying");
     assert_eq!(created.symbol, symbol);
 
-    let list = client
-        .list_underlyings()
-        .await
-        .expect("Failed to list underlyings");
+    let list = list.expect("Failed to list underlyings");
     assert!(list.underlyings.contains(&symbol));
 
-    let fetched = client
-        .get_underlying(&symbol)
-        .await
-        .expect("Failed to get underlying");
+    let fetched = fetched.expect("Failed to get underlying");
     assert_eq!(fetched.symbol, symbol);
 
     // The delete returns a typed confirmation (issue #60).
-    let deleted = client
-        .delete_underlying(&symbol)
-        .await
-        .expect("Failed to delete underlying");
+    let deleted = deleted.expect("Failed to delete underlying");
     assert!(deleted.success);
     assert!(deleted.message.contains(&symbol));
 }
@@ -53,36 +53,42 @@ async fn test_create_expiration_and_strike() {
         .await
         .expect("Failed to create underlying");
 
+    // Phase 1: create expiration, list them, create strike, list strikes.
     // create_expiration returns the server's canonical expiration form (bug #110
-    // formats the parsed Days value), so assert only that it succeeds.
-    let exp = client
-        .create_expiration(&symbol, TEST_EXPIRATION)
-        .await
-        .expect("Failed to create expiration");
-    assert!(!exp.expiration.is_empty());
-
-    // list_expirations reports the URL-safe formatted expiration used for reads.
-    let formatted = formatted_expiration(&client, &symbol).await;
-    let exps = client
-        .list_expirations(&symbol)
-        .await
-        .expect("Failed to list expirations");
-    assert!(exps.expirations.contains(&formatted));
-
+    // formats the parsed Days value). list_expirations reports the URL-safe
+    // formatted expiration used for reads; list_strikes resolves the book by it.
+    let exp = client.create_expiration(&symbol, TEST_EXPIRATION).await;
+    let exps = client.list_expirations(&symbol).await;
     let strike_info = client
         .create_strike(&symbol, TEST_EXPIRATION, TEST_STRIKE)
-        .await
-        .expect("Failed to create strike");
+        .await;
+    let formatted = exps
+        .as_ref()
+        .ok()
+        .and_then(|e| e.expirations.first().cloned());
+    let strikes = match &formatted {
+        Some(f) => Some(client.list_strikes(&symbol, f).await),
+        None => None,
+    };
+
+    // Phase 2: cleanup.
+    cleanup_underlying(&client, &symbol).await;
+
+    // Phase 3: assert.
+    let exp = exp.expect("Failed to create expiration");
+    assert!(!exp.expiration.is_empty());
+
+    let exps = exps.expect("Failed to list expirations");
+    let formatted = formatted.expect("underlying has at least one expiration");
+    assert!(exps.expirations.contains(&formatted));
+
+    let strike_info = strike_info.expect("Failed to create strike");
     assert_eq!(strike_info.strike, TEST_STRIKE);
 
-    // list_strikes resolves the book by the formatted expiration.
-    let strikes = client
-        .list_strikes(&symbol, &formatted)
-        .await
+    let strikes = strikes
+        .expect("list_strikes should have run")
         .expect("Failed to list strikes");
     assert!(strikes.strikes.contains(&TEST_STRIKE));
-
-    cleanup_underlying(&client, &symbol).await;
 }
 
 #[tokio::test]
@@ -93,6 +99,7 @@ async fn test_add_and_cancel_order() {
     let place = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
     let read = OptionPath::call(&underlying, &formatted, TEST_STRIKE);
 
+    // Phase 1: add, read the book, cancel (the cancel depends on the order id).
     let order = client
         .add_order(
             &place,
@@ -102,25 +109,28 @@ async fn test_add_and_cancel_order() {
                 quantity: 10,
             },
         )
-        .await
-        .expect("Failed to add order");
+        .await;
+    let book = client.get_option_book(&read).await;
+    let cancel = match order.as_ref().ok() {
+        Some(o) => Some(client.cancel_order(&read, &o.order_id).await),
+        None => None,
+    };
 
+    // Phase 2: cleanup.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3: assert.
+    let order = order.expect("Failed to add order");
     assert!(!order.order_id.is_empty());
     assert!(order.message.contains("success"));
 
-    let book = client
-        .get_option_book(&read)
-        .await
-        .expect("Failed to get order book");
+    let book = book.expect("Failed to get order book");
     assert!(book.order_count > 0);
 
-    let cancel = client
-        .cancel_order(&read, &order.order_id)
-        .await
+    let cancel = cancel
+        .expect("order should have succeeded")
         .expect("Failed to cancel order");
     assert!(cancel.success);
-
-    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
@@ -131,7 +141,8 @@ async fn test_get_option_quote() {
     let place = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
     let read = OptionPath::call(&underlying, &formatted, TEST_STRIKE);
 
-    client
+    // Phase 1: rest a bid and an ask, then read the quote.
+    let bid = client
         .add_order(
             &place,
             &AddOrderRequest {
@@ -140,10 +151,8 @@ async fn test_get_option_quote() {
                 quantity: 10,
             },
         )
-        .await
-        .expect("add bid");
-
-    client
+        .await;
+    let ask = client
         .add_order(
             &place,
             &AddOrderRequest {
@@ -152,20 +161,20 @@ async fn test_get_option_quote() {
                 quantity: 10,
             },
         )
-        .await
-        .expect("add ask");
+        .await;
+    let quote = client.get_option_quote(&read).await;
 
-    let quote = client
-        .get_option_quote(&read)
-        .await
-        .expect("Failed to get quote");
+    // Phase 2: cleanup.
+    cleanup_underlying(&client, &underlying).await;
 
+    // Phase 3: assert.
+    bid.expect("add bid");
+    ask.expect("add ask");
+    let quote = quote.expect("Failed to get quote");
     assert_eq!(quote.bid_price, Some(1400));
     assert_eq!(quote.ask_price, Some(1600));
     assert_eq!(quote.bid_size, 10);
     assert_eq!(quote.ask_size, 10);
-
-    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
@@ -177,7 +186,8 @@ async fn test_market_order_execution() {
     // and the market buy land on the same book and cross.
     let place = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
 
-    client
+    // Phase 1: rest a sell, then take it with a market buy.
+    let rest = client
         .add_order(
             &place,
             &AddOrderRequest {
@@ -186,9 +196,7 @@ async fn test_market_order_execution() {
                 quantity: 100,
             },
         )
-        .await
-        .expect("add resting sell");
-
+        .await;
     let result = client
         .submit_market_order(
             &place,
@@ -197,16 +205,19 @@ async fn test_market_order_execution() {
                 quantity: 50,
             },
         )
-        .await
-        .expect("Failed to submit market order");
+        .await;
 
+    // Phase 2: cleanup.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3: assert.
+    rest.expect("add resting sell");
+    let result = result.expect("Failed to submit market order");
     assert_eq!(result.status, MarketOrderStatus::Filled);
     assert_eq!(result.filled_quantity, 50);
     assert_eq!(result.remaining_quantity, 0);
     assert!(result.average_price.is_some());
     assert!(!result.fills.is_empty());
-
-    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
@@ -227,9 +238,9 @@ async fn test_market_order_no_liquidity() {
         )
         .await;
 
-    assert!(result.is_err());
-
     cleanup_underlying(&client, &underlying).await;
+
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -240,6 +251,7 @@ async fn test_put_option_operations() {
     let place = OptionPath::put(&underlying, TEST_EXPIRATION, TEST_STRIKE);
     let read = OptionPath::put(&underlying, &formatted, TEST_STRIKE);
 
+    // Phase 1: add a put order, then read the put book.
     let order = client
         .add_order(
             &place,
@@ -249,15 +261,16 @@ async fn test_put_option_operations() {
                 quantity: 20,
             },
         )
-        .await
-        .expect("Failed to add put order");
+        .await;
+    let book = client.get_option_book(&read).await;
+
+    // Phase 2: cleanup.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3: assert.
+    let order = order.expect("Failed to add put order");
     assert!(!order.order_id.is_empty());
 
-    let book = client
-        .get_option_book(&read)
-        .await
-        .expect("Failed to get put order book");
+    let book = book.expect("Failed to get put order book");
     assert!(book.order_count > 0);
-
-    cleanup_underlying(&client, &underlying).await;
 }
