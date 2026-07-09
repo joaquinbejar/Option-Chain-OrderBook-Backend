@@ -1,6 +1,6 @@
 //! Health check and statistics endpoint tests.
 
-use orderbook_tests::{create_test_client, read_client};
+use orderbook_tests::{admin_client, create_test_client, unique_symbol};
 
 #[tokio::test]
 async fn test_health_check() {
@@ -15,18 +15,33 @@ async fn test_health_check() {
 
 #[tokio::test]
 async fn test_global_stats() {
-    // `/api/v1/stats` requires a Read token.
-    let client = read_client().await.expect("Failed to create read client");
+    // Issue #86: mutate known state and assert the counts actually move —
+    // this fails if the stats endpoint stops reflecting reality. Mutation
+    // needs an Admin token (create/delete underlying).
+    let client = admin_client().await.expect("Failed to create admin client");
+    let symbol = unique_symbol("STATS");
 
-    let stats = client
-        .get_global_stats()
-        .await
-        .expect("Failed to get stats");
+    // Phase 1: act, capturing outcomes (capture-then-assert per issue #85).
+    let before = client.get_global_stats().await;
+    let created = client.create_underlying(&symbol).await;
+    let during = client.get_global_stats().await;
 
-    // Stats should return valid counts (usize is always >= 0). The server is
-    // provisioned with BTC/ETH/GOLD, so there is at least one underlying.
-    assert!(stats.underlying_count >= 3);
-    let _ = stats.total_expirations;
-    let _ = stats.total_strikes;
-    let _ = stats.total_orders;
+    // Phase 2: cleanup unconditionally.
+    let _ = client.delete_underlying(&symbol).await;
+    let after = client.get_global_stats().await;
+
+    // Phase 3: assert.
+    let before = before.expect("stats before");
+    created.expect("create underlying");
+    let during = during.expect("stats during");
+    let after = after.expect("stats after");
+    assert_eq!(
+        during.underlying_count,
+        before.underlying_count + 1,
+        "creating an underlying must raise the count by one"
+    );
+    assert_eq!(
+        after.underlying_count, before.underlying_count,
+        "deleting it must restore the count"
+    );
 }
