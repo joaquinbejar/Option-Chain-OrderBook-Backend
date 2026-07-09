@@ -39,47 +39,47 @@ pub struct RateLimitErrorResponse {
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     /// Underlying not found.
-    #[error("Underlying not found: {0}")]
+    #[error("underlying not found: {0}")]
     UnderlyingNotFound(String),
 
     /// Expiration not found.
-    #[error("Expiration not found: {0}")]
+    #[error("expiration not found: {0}")]
     ExpirationNotFound(String),
 
     /// Strike not found.
-    #[error("Strike not found: {0}")]
+    #[error("strike not found: {0}")]
     StrikeNotFound(u64),
 
     /// Invalid request.
-    #[error("Invalid request: {0}")]
+    #[error("invalid request: {0}")]
     InvalidRequest(String),
 
     /// Internal server error.
-    #[error("Internal server error: {0}")]
+    #[error("internal server error: {0}")]
     Internal(String),
 
     /// OrderBook error.
-    #[error("OrderBook error: {0}")]
+    #[error("orderbook error: {0}")]
     OrderBook(String),
 
     /// Database error.
-    #[error("Database error: {0}")]
+    #[error("database error: {0}")]
     Database(String),
 
     /// Resource not found.
-    #[error("Not found: {0}")]
+    #[error("not found: {0}")]
     NotFound(String),
 
     /// Authentication failed (missing, malformed, or expired token).
-    #[error("Unauthorized: {0}")]
+    #[error("unauthorized: {0}")]
     Unauthorized(String),
 
     /// The authenticated caller lacks the required permission.
-    #[error("Forbidden: {0}")]
+    #[error("forbidden: {0}")]
     Forbidden(String),
 
     /// Rate limit exceeded.
-    #[error("Rate limit exceeded")]
+    #[error("rate limit exceeded")]
     RateLimitExceeded {
         /// Maximum requests allowed.
         limit: u32,

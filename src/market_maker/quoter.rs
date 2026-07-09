@@ -3,6 +3,29 @@
 use crate::market_maker::OptionPricer;
 use optionstratlib::{ExpirationDate, OptionStyle};
 
+/// Basis-points denominator: 1 basis point = 1/10_000, so a bps value is applied
+/// to a price as `price * bps / BPS_DENOMINATOR`.
+const BPS_DENOMINATOR: f64 = 10_000.0;
+
+/// Fraction of the half-spread used as the maximum directional price skew.
+///
+/// The signed skew shift applied to both legs is `half_spread_cents *
+/// directional_skew * SKEW_PRICE_WEIGHT`, so at full skew (`±1.0`) the parallel
+/// shift is at most half the half-spread — it re-centers the quote without ever
+/// crossing the theoretical value.
+const SKEW_PRICE_WEIGHT: f64 = 0.5;
+
+/// Weight controlling how much directional skew shrinks the size on the side the
+/// maker is less willing to trade: that side's size is scaled by
+/// `1 - directional_skew.abs() * SKEW_SIZE_WEIGHT`, i.e. down to 70% at full skew.
+const SKEW_SIZE_WEIGHT: f64 = 0.3;
+
+/// Default base spread in basis points (1%) for [`Quoter::default`].
+const DEFAULT_BASE_SPREAD_BPS: u64 = 100;
+
+/// Default base quote size for [`Quoter::default`].
+const DEFAULT_BASE_SIZE: u64 = 10;
+
 /// Quote parameters for a single option.
 #[derive(Debug, Clone)]
 pub struct QuoteParams {
@@ -112,7 +135,7 @@ impl Quoter {
         // Calculate spread based on theo value and base spread
         let half_spread_bps = (self.base_spread_bps as f64 * input.spread_multiplier / 2.0) as u64;
         let half_spread_cents =
-            ((theo_cents as f64 * half_spread_bps as f64) / 10000.0).max(1.0) as u64;
+            ((theo_cents as f64 * half_spread_bps as f64) / BPS_DENOMINATOR).max(1.0) as u64;
 
         // Apply directional skew as a symmetric, same-signed PARALLEL shift of
         // both bid and ask (not a spread-widening). For a call, a positive
@@ -128,7 +151,8 @@ impl Quoter {
         // final prices are computed in `i64` and then floored with the existing
         // bid floor (`.max(1)`) and ask floor (`.max(bid + 1)`), so a negative
         // adjustment can never underflow the `u128` price.
-        let skew_adjustment = (half_spread_cents as f64 * input.directional_skew * 0.5) as i64;
+        let skew_adjustment =
+            (half_spread_cents as f64 * input.directional_skew * SKEW_PRICE_WEIGHT) as i64;
 
         let (bid_adjustment, ask_adjustment) = match input.style {
             OptionStyle::Call => (skew_adjustment, skew_adjustment),
@@ -144,7 +168,7 @@ impl Quoter {
         let base_size = (self.base_size as f64 * input.size_scalar).max(1.0) as u64;
 
         // Adjust sizes based on skew (reduce size on the side we're less willing to trade)
-        let skew_size_factor = 1.0 - input.directional_skew.abs() * 0.3;
+        let skew_size_factor = 1.0 - input.directional_skew.abs() * SKEW_SIZE_WEIGHT;
         let (bid_size, ask_size) = if input.directional_skew > 0.0 {
             // Bullish: more willing to buy, less to sell
             (base_size, (base_size as f64 * skew_size_factor) as u64)
@@ -189,7 +213,11 @@ impl Quoter {
 
 impl Default for Quoter {
     fn default() -> Self {
-        Self::new(OptionPricer::default(), 100, 10) // 1% spread, size 10
+        Self::new(
+            OptionPricer::default(),
+            DEFAULT_BASE_SPREAD_BPS,
+            DEFAULT_BASE_SIZE,
+        )
     }
 }
 

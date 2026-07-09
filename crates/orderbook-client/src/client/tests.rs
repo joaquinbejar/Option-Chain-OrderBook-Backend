@@ -117,3 +117,20 @@ fn test_option_path_url_building() {
     assert_eq!(path.strike, 15000);
     assert_eq!(path.style, "call");
 }
+
+#[test]
+fn test_encode_segment_percent_encodes_reserved_characters() {
+    // Ordinary segments pass through unchanged.
+    assert_eq!(encode_segment("AAPL"), "AAPL");
+    assert_eq!(encode_segment("20240315"), "20240315");
+    assert_eq!(encode_segment("call"), "call");
+
+    // Reserved / delimiter characters are percent-encoded so a caller-supplied
+    // value cannot break out of its path segment or inject a new one.
+    assert_eq!(encode_segment("a/b"), "a%2Fb");
+    assert_eq!(encode_segment("a b"), "a%20b");
+    assert_eq!(encode_segment("a?b"), "a%3Fb");
+    assert_eq!(encode_segment("a#b"), "a%23b");
+    // A traversal attempt stays a single, harmless segment.
+    assert!(!encode_segment("../admin").contains('/'));
+}

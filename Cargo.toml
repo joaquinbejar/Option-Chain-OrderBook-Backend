@@ -105,7 +105,6 @@ dashmap = "6.2"
 futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
-url = "2.5"
 serde_urlencoded = "0.7"
 
 # Authentication (JWT signed with an x509 key pair).

@@ -26,6 +26,3 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 
 # Error handling
 thiserror = { workspace = true }
-
-# URL handling
-url = { workspace = true }

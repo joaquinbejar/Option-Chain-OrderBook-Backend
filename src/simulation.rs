@@ -35,6 +35,23 @@ const WALK_STEPS: usize = 43_200;
 /// transient failure recovers on the next retry instead of freezing forever.
 const DORMANT_RETRY_TICKS: u32 = 600;
 
+/// Mean-reversion speed (Ornstein-Uhlenbeck pull toward the mean) for the
+/// `MeanReverting` walk. Higher values revert faster toward the seeded mean.
+const MEAN_REVERSION_SPEED: f64 = 0.5;
+
+/// Jump intensity (expected jumps per unit time) for the `JumpDiffusion` walk.
+const JUMP_INTENSITY: f64 = 0.1;
+
+/// Per-jump volatility (jump-size standard deviation) for the `JumpDiffusion`
+/// walk.
+const JUMP_VOLATILITY: f64 = 0.05;
+
+/// Capacity of the bounded price-update broadcast channel.
+///
+/// A slow WebSocket subscriber that falls this many messages behind is lagged
+/// (its oldest messages are dropped) rather than stalling the price producer.
+const PRICE_BROADCAST_CAPACITY: usize = 1024;
+
 /// Error returned when a price path cannot be generated.
 ///
 /// Each variant carries enough context for the caller to log a structured
@@ -113,19 +130,21 @@ fn generate_price_path(
         WalkTypeConfig::MeanReverting => WalkType::MeanReverting {
             dt: convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day),
             volatility: vol,
-            // 0.5 is a compile-time literal that is always a valid Positive.
-            speed: Positive::new(0.5).expect("0.5 is a valid positive constant"),
+            // A compile-time literal that is always a valid Positive.
+            speed: Positive::new(MEAN_REVERSION_SPEED)
+                .expect("MEAN_REVERSION_SPEED is a valid positive constant"),
             mean: initial,
         },
         WalkTypeConfig::JumpDiffusion => WalkType::JumpDiffusion {
             dt: convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day),
             drift: drift_dec,
             volatility: vol,
-            // 0.1 is a compile-time literal that is always a valid Positive.
-            intensity: Positive::new(0.1).expect("0.1 is a valid positive constant"),
+            // Compile-time literals that are always valid Positives.
+            intensity: Positive::new(JUMP_INTENSITY)
+                .expect("JUMP_INTENSITY is a valid positive constant"),
             jump_mean: dec!(0.0),
-            // 0.05 is a compile-time literal that is always a valid Positive.
-            jump_volatility: Positive::new(0.05).expect("0.05 is a valid positive constant"),
+            jump_volatility: Positive::new(JUMP_VOLATILITY)
+                .expect("JUMP_VOLATILITY is a valid positive constant"),
         },
     };
 
@@ -298,7 +317,7 @@ impl PriceSimulator {
             }
         }
 
-        let (price_tx, _) = broadcast::channel(1024);
+        let (price_tx, _) = broadcast::channel(PRICE_BROADCAST_CAPACITY);
 
         Self {
             prices: Arc::new(RwLock::new(initial_prices)),

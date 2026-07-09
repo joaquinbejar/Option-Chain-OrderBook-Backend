@@ -486,9 +486,23 @@ impl ClientCommand {
 }
 
 /// WebSocket client for receiving real-time updates.
+///
+/// Owns the background read and write tasks; dropping the client aborts both so
+/// they exit immediately rather than lingering until the connection closes.
 pub struct WsClient {
     rx: mpsc::Receiver<WsMessage>,
     tx: mpsc::Sender<ClientCommand>,
+    read_task: tokio::task::JoinHandle<()>,
+    write_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WsClient {
+    fn drop(&mut self) {
+        // Explicit shutdown path: abort both background tasks so a dropped client
+        // does not leak the read/write loops. Aborting a finished task is a no-op.
+        self.read_task.abort();
+        self.write_task.abort();
+    }
 }
 
 impl WsClient {
@@ -510,7 +524,7 @@ impl WsClient {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCommand>(100);
 
         // Spawn task to read messages
-        tokio::spawn(async move {
+        let read_task = tokio::spawn(async move {
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
@@ -528,7 +542,7 @@ impl WsClient {
         });
 
         // Spawn task to send commands
-        tokio::spawn(async move {
+        let write_task = tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 if let Ok(json) = serde_json::to_string(&cmd)
                     && write.send(Message::Text(json.into())).await.is_err()
@@ -541,6 +555,8 @@ impl WsClient {
         Ok(Self {
             rx: msg_rx,
             tx: cmd_tx,
+            read_task,
+            write_task,
         })
     }
 

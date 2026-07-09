@@ -10,8 +10,8 @@
 
 use orderbook_client::{
     AddOrderRequest, BulkCancelRequest, BulkOrderItem, BulkOrderRequest, BulkOrderStatus,
-    CancelAllQuery, Error, ModifyOrderRequest, ModifyOrderStatus, OptionPath, OrderListQuery,
-    OrderSide, OrderStatus,
+    CancelAllQuery, Error, ModifyOrderRequest, ModifyOrderStatus, OptionPath, OptionStyle,
+    OrderListQuery, OrderSide, OrderStatus,
 };
 use orderbook_tests::{
     TEST_EXPIRATION, TEST_STRIKE, admin_client, cleanup_underlying, setup_underlying,
@@ -145,7 +145,7 @@ async fn test_bulk_submit_partial() {
                     underlying: underlying.clone(),
                     expiration: formatted.clone(),
                     strike: TEST_STRIKE,
-                    style: "call".to_string(),
+                    style: OptionStyle::Call,
                     side: OrderSide::Buy,
                     price: 1300,
                     quantity: 5,
@@ -154,7 +154,7 @@ async fn test_bulk_submit_partial() {
                     underlying: underlying.clone(),
                     expiration: formatted.clone(),
                     strike: 99_999_999, // never created
-                    style: "call".to_string(),
+                    style: OptionStyle::Call,
                     side: OrderSide::Buy,
                     price: 10,
                     quantity: 1,
@@ -193,7 +193,7 @@ async fn test_bulk_submit_atomic_rollback() {
                     underlying: underlying.clone(),
                     expiration: formatted.clone(),
                     strike: TEST_STRIKE,
-                    style: "call".to_string(),
+                    style: OptionStyle::Call,
                     side: OrderSide::Buy,
                     price: 1300,
                     quantity: 2,
@@ -202,7 +202,7 @@ async fn test_bulk_submit_atomic_rollback() {
                     underlying: underlying.clone(),
                     expiration: formatted.clone(),
                     strike: 99_999_999,
-                    style: "call".to_string(),
+                    style: OptionStyle::Call,
                     side: OrderSide::Buy,
                     price: 10,
                     quantity: 1,

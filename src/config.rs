@@ -423,8 +423,15 @@ pub struct AssetConfig {
 impl AssetConfig {
     /// Generates strike prices centered around the initial price.
     ///
+    /// Strikes are generated as `center + offset` for symmetric offsets and
+    /// floored at `strike_spacing` so they stay strictly positive. Because that
+    /// floor can collapse several low offsets onto the same value, consecutive
+    /// duplicate strikes are skipped — the generation is monotonically
+    /// non-decreasing, so the returned vector is strictly ascending and may
+    /// therefore be shorter than `num_strikes`.
+    ///
     /// # Returns
-    /// Vector of strike prices in cents.
+    /// Vector of distinct, ascending strike prices in cents.
     #[must_use]
     pub fn generate_strikes(&self) -> Vec<u64> {
         let center = self.initial_price;
@@ -439,6 +446,10 @@ impl AssetConfig {
             // rather than truncated into a corrupt value (inputs are already
             // validated by `Config::validate`, so this is a defensive guard).
             match dollars_to_cents(strike) {
+                // Skip a strike that collapsed onto the clamp floor (and so
+                // duplicates the previous value): generation is non-decreasing,
+                // so a duplicate can only equal the immediately preceding strike.
+                Some(cents) if strikes.last() == Some(&cents) => {}
                 Some(cents) => strikes.push(cents),
                 None => tracing::warn!(
                     symbol = %self.symbol,
@@ -659,6 +670,31 @@ strike_spacing = 1000.0
         assert_eq!(strikes.len(), 5);
         // Strikes should be centered around 100: 80, 90, 100, 110, 120
         assert_eq!(strikes, vec![8000, 9000, 10000, 11000, 12000]);
+    }
+
+    #[test]
+    fn test_generate_strikes_dedups_clamp_floor_collapse() {
+        // A center close to zero relative to the spacing forces several low
+        // offsets to clamp onto the `strike_spacing` floor. Those collapsed
+        // duplicates must be skipped so the result stays strictly ascending and
+        // never emits the same strike twice.
+        let asset = AssetConfig {
+            symbol: "LOW".to_string(),
+            name: "Low center".to_string(),
+            initial_price: 15.0,
+            volatility: 0.2,
+            drift: 0.0,
+            expirations: vec!["20251231".to_string()],
+            num_strikes: 5,
+            strike_spacing: 10.0,
+        };
+
+        // Raw offsets: -20,-10,0,10,20 -> 15+offset = -5,5,15,25,35 -> floored at
+        // 10 -> 10,10,15,25,35. After dedup: 10,15,25,35 (in cents).
+        let strikes = asset.generate_strikes();
+        assert_eq!(strikes, vec![1000, 1500, 2500, 3500]);
+        // Strictly ascending, no duplicates.
+        assert!(strikes.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

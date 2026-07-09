@@ -19,7 +19,26 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
+
+/// Maximum number of distinct symbols a single WebSocket connection may track in
+/// one subscription set (orderbook or trades).
+///
+/// Bounds per-connection memory against an unbounded-subscribe DoS (issue #88):
+/// once a set holds this many entries, a further subscribe for a NEW symbol in
+/// that set is rejected with a [`WsMessage::Error`]; re-subscribing an
+/// already-tracked symbol stays a no-op success. Each connection keeps two sets
+/// (orderbook + trades), so total tracked symbols are bounded by
+/// `2 * MAX_SUBSCRIPTIONS_PER_CONNECTION`.
+const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 256;
+
+/// Returns true if `symbol` may be added to a per-connection subscription `set`:
+/// either it is already tracked (a harmless re-subscribe) or the set is still
+/// below [`MAX_SUBSCRIPTIONS_PER_CONNECTION`].
+#[must_use]
+fn can_add_subscription(set: &HashSet<String>, symbol: &str) -> bool {
+    set.contains(symbol) || set.len() < MAX_SUBSCRIPTIONS_PER_CONNECTION
+}
 
 /// WebSocket message types sent to clients.
 #[derive(Debug, Clone, Serialize)]
@@ -459,7 +478,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
         while let Some(msg) = receiver.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    debug!("Received WebSocket message: {}", text);
+                    // Never log the full raw client payload above TRACE (it can
+                    // carry arbitrary, possibly sensitive, values); DEBUG records
+                    // only the length, TRACE the content.
+                    debug!(len = text.len(), "received websocket text message");
+                    trace!(payload = %text, "websocket text payload");
                     // Handle client commands
                     handle_client_message(
                         &text,
@@ -894,6 +917,23 @@ async fn handle_orderbook_subscribe(
         return;
     }
 
+    // Enforce the per-connection subscription cap before tracking a new symbol.
+    let at_cap = {
+        let set = subscribed_symbols.read().await;
+        !can_add_subscription(&set, symbol)
+    };
+    if at_cap {
+        let error_msg = WsMessage::Error {
+            message: format!(
+                "orderbook subscription limit reached ({MAX_SUBSCRIPTIONS_PER_CONNECTION}); unsubscribe before adding more"
+            ),
+        };
+        if let Ok(json) = serde_json::to_string(&error_msg) {
+            let _ = sender.lock().await.send(Message::Text(json.into())).await;
+        }
+        return;
+    }
+
     // Add to subscribed symbols
     subscribed_symbols.write().await.insert(symbol.clone());
 
@@ -978,6 +1018,23 @@ async fn handle_trades_subscribe(
             message: format!(
                 "Invalid symbol format: {}. Expected: UNDERLYING-EXPIRATION-STRIKE-STYLE",
                 symbol
+            ),
+        };
+        if let Ok(json) = serde_json::to_string(&error_msg) {
+            let _ = sender.lock().await.send(Message::Text(json.into())).await;
+        }
+        return;
+    }
+
+    // Enforce the per-connection subscription cap before tracking a new symbol.
+    let at_cap = {
+        let set = subscribed_trades.read().await;
+        !can_add_subscription(&set, symbol)
+    };
+    if at_cap {
+        let error_msg = WsMessage::Error {
+            message: format!(
+                "trades subscription limit reached ({MAX_SUBSCRIPTIONS_PER_CONNECTION}); unsubscribe before adding more"
             ),
         };
         if let Ok(json) = serde_json::to_string(&error_msg) {
@@ -1140,6 +1197,18 @@ async fn process_channel_subscription(
                         status: "error: invalid symbol format".to_string(),
                     };
                 }
+                let at_cap = {
+                    let set = subscribed_symbols.read().await;
+                    !can_add_subscription(&set, symbol)
+                };
+                if at_cap {
+                    return SubscriptionResult {
+                        channel: sub.channel.clone(),
+                        symbol: Some(symbol.clone()),
+                        underlying: None,
+                        status: "error: subscription limit reached".to_string(),
+                    };
+                }
                 subscribed_symbols.write().await.insert(symbol.clone());
                 SubscriptionResult {
                     channel: sub.channel.clone(),
@@ -1150,6 +1219,18 @@ async fn process_channel_subscription(
             } else if let Some(underlying) = &sub.underlying {
                 // Wildcard subscription by underlying
                 let filter = format!("{}:*", underlying);
+                let at_cap = {
+                    let set = subscribed_symbols.read().await;
+                    !can_add_subscription(&set, &filter)
+                };
+                if at_cap {
+                    return SubscriptionResult {
+                        channel: sub.channel.clone(),
+                        symbol: None,
+                        underlying: Some(underlying.clone()),
+                        status: "error: subscription limit reached".to_string(),
+                    };
+                }
                 subscribed_symbols.write().await.insert(filter.clone());
                 SubscriptionResult {
                     channel: sub.channel.clone(),
@@ -1177,6 +1258,18 @@ async fn process_channel_subscription(
                         status: "error: invalid symbol format".to_string(),
                     };
                 }
+                let at_cap = {
+                    let set = subscribed_trades.read().await;
+                    !can_add_subscription(&set, symbol)
+                };
+                if at_cap {
+                    return SubscriptionResult {
+                        channel: sub.channel.clone(),
+                        symbol: Some(symbol.clone()),
+                        underlying: None,
+                        status: "error: subscription limit reached".to_string(),
+                    };
+                }
                 subscribed_trades.write().await.insert(symbol.clone());
                 SubscriptionResult {
                     channel: sub.channel.clone(),
@@ -1186,6 +1279,18 @@ async fn process_channel_subscription(
                 }
             } else if let Some(underlying) = &sub.underlying {
                 let filter = format!("{}:*", underlying);
+                let at_cap = {
+                    let set = subscribed_trades.read().await;
+                    !can_add_subscription(&set, &filter)
+                };
+                if at_cap {
+                    return SubscriptionResult {
+                        channel: sub.channel.clone(),
+                        symbol: None,
+                        underlying: Some(underlying.clone()),
+                        status: "error: subscription limit reached".to_string(),
+                    };
+                }
                 subscribed_trades.write().await.insert(filter.clone());
                 SubscriptionResult {
                     channel: sub.channel.clone(),
@@ -1790,6 +1895,33 @@ mod tests {
         assert!(!subscription_matches(&subscribed, "MSFT"));
         // The wildcard entry itself is not an instrument symbol.
         assert!(!subscription_matches(&subscribed, "MSFT:*-junk"));
+    }
+
+    #[test]
+    fn test_can_add_subscription_respects_cap() {
+        // Issue #88: a per-connection subscription set is bounded. Below the cap,
+        // any symbol may be added; at the cap, only an already-tracked symbol
+        // (a re-subscribe) is allowed — a brand-new one is rejected.
+        let mut set: HashSet<String> = HashSet::new();
+        for i in 0..MAX_SUBSCRIPTIONS_PER_CONNECTION {
+            assert!(
+                can_add_subscription(&set, &format!("SYM-{i}")),
+                "adding within the cap is allowed"
+            );
+            set.insert(format!("SYM-{i}"));
+        }
+        assert_eq!(set.len(), MAX_SUBSCRIPTIONS_PER_CONNECTION);
+
+        // At the cap, a new symbol is rejected...
+        assert!(
+            !can_add_subscription(&set, "SYM-new"),
+            "a new symbol at the cap is rejected"
+        );
+        // ...but re-subscribing an already-tracked symbol stays allowed.
+        assert!(
+            can_add_subscription(&set, "SYM-0"),
+            "re-subscribing an existing symbol is always allowed"
+        );
     }
 
     /// End-to-end wiring of issue #64: a by-underlying batch subscription

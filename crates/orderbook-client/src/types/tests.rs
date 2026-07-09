@@ -581,7 +581,7 @@ fn test_bulk_order_request_serialization() {
                 underlying: "AAPL".to_string(),
                 expiration: "20240315".to_string(),
                 strike: 15000,
-                style: "call".to_string(),
+                style: OptionStyle::Call,
                 side: OrderSide::Buy,
                 price: 10000,
                 quantity: 100,
@@ -590,7 +590,7 @@ fn test_bulk_order_request_serialization() {
                 underlying: "AAPL".to_string(),
                 expiration: "20240315".to_string(),
                 strike: 15000,
-                style: "put".to_string(),
+                style: OptionStyle::Put,
                 side: OrderSide::Sell,
                 price: 5000,
                 quantity: 50,
@@ -603,6 +603,11 @@ fn test_bulk_order_request_serialization() {
     assert!(json.contains("\"orders\":["));
     assert!(json.contains("\"underlying\":\"AAPL\""));
     assert!(json.contains("\"atomic\":true"));
+    // The typed style/side enums serialize to their lowercase wire form.
+    assert!(json.contains("\"style\":\"call\""));
+    assert!(json.contains("\"style\":\"put\""));
+    assert!(json.contains("\"side\":\"buy\""));
+    assert!(json.contains("\"side\":\"sell\""));
 }
 
 // ============================================================================
