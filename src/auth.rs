@@ -113,6 +113,19 @@ impl Claims {
     }
 }
 
+/// Outcome of a rate-limit check: the admission decision plus the sliding
+/// window state needed to build accurate `X-RateLimit-*` headers (issue #62).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitDecision {
+    /// Whether the request was admitted (and its timestamp recorded).
+    pub allowed: bool,
+    /// Requests left in the window after this decision (0 when denied).
+    pub remaining: u32,
+    /// Unix time (seconds, rounded up) when the oldest in-window request ages
+    /// out — the earliest moment a further request could be admitted.
+    pub reset_secs: u64,
+}
+
 /// Rate limiter using a sliding-window algorithm, keyed by an arbitrary string
 /// (the JWT `sub`, or a synthetic IP-based key for the unauthenticated token
 /// endpoint).
@@ -134,11 +147,21 @@ impl RateLimiter {
     /// Records a request for `key` and returns true if it is within `limit`
     /// requests over the sliding 60-second window.
     ///
+    /// Convenience wrapper over [`check_and_record_status`](Self::check_and_record_status)
+    /// for callers that only need the admission decision.
+    pub fn check_and_record(&self, key: &str, limit: u32) -> bool {
+        self.check_and_record_status(key, limit).allowed
+    }
+
+    /// Records a request for `key` and returns the full [`RateLimitDecision`]:
+    /// admission plus the real window state (`remaining`, `reset_secs`) for
+    /// accurate `X-RateLimit-*` headers (issue #62).
+    ///
     /// Existing keys take a lock-free fast path. A brand-new key is admitted only
     /// while the map is under [`MAX_TRACKED_KEYS`]; at the cap a sweep of
     /// fully-expired entries is attempted first, and if the map is still full the
     /// request is rejected so the map can never grow without bound.
-    pub fn check_and_record(&self, key: &str, limit: u32) -> bool {
+    pub fn check_and_record_status(&self, key: &str, limit: u32) -> RateLimitDecision {
         let now = now_millis();
         let window_start = now.saturating_sub(RATE_LIMIT_WINDOW_MS);
 
@@ -157,7 +180,13 @@ impl RateLimiter {
                     evicted,
                     "rate-limit window map at capacity; rejecting request for a new key"
                 );
-                return false;
+                // No bucket exists for this key; the soonest anything can
+                // change is one full window from now.
+                return RateLimitDecision {
+                    allowed: false,
+                    remaining: 0,
+                    reset_secs: now.saturating_add(RATE_LIMIT_WINDOW_MS).div_ceil(1000),
+                };
             }
         }
 
@@ -165,14 +194,18 @@ impl RateLimiter {
         Self::prune_and_record(entry.value_mut(), now, window_start, limit)
     }
 
-    /// Drops timestamps older than `window_start` from `window`, then records
-    /// `now` if doing so keeps the count within `limit`.
+    /// Drops timestamps older than `window_start` from `window`, records `now`
+    /// if doing so keeps the count within `limit`, and reports the resulting
+    /// window state.
+    ///
+    /// `remaining` counts this request when it was admitted; `reset_secs` is
+    /// when the oldest surviving timestamp ages out of the window.
     fn prune_and_record(
         window: &mut VecDeque<u64>,
         now: u64,
         window_start: u64,
         limit: u32,
-    ) -> bool {
+    ) -> RateLimitDecision {
         while let Some(&front) = window.front() {
             if front < window_start {
                 window.pop_front();
@@ -181,11 +214,22 @@ impl RateLimiter {
             }
         }
 
-        if window.len() < limit as usize {
+        let allowed = window.len() < limit as usize;
+        if allowed {
             window.push_back(now);
-            true
-        } else {
-            false
+        }
+
+        let count = u32::try_from(window.len()).unwrap_or(u32::MAX);
+        let remaining = limit.saturating_sub(count);
+        let reset_ms = window.front().map_or_else(
+            || now.saturating_add(RATE_LIMIT_WINDOW_MS),
+            |&front| front.saturating_add(RATE_LIMIT_WINDOW_MS),
+        );
+
+        RateLimitDecision {
+            allowed,
+            remaining,
+            reset_secs: reset_ms.div_ceil(1000),
         }
     }
 
@@ -418,6 +462,12 @@ impl JwtAuth {
         self.rate_limiter.check_and_record(key, limit)
     }
 
+    /// Rate-limit check returning the full [`RateLimitDecision`] (admission +
+    /// real window state) so callers can emit accurate `X-RateLimit-*` headers.
+    pub fn check_rate_limit_status(&self, key: &str, limit: u32) -> RateLimitDecision {
+        self.rate_limiter.check_and_record_status(key, limit)
+    }
+
     /// Reaps fully-expired rate-limit buckets, returning the number removed.
     ///
     /// Intended to be called periodically by a background sweep task so idle
@@ -548,6 +598,63 @@ mod tests {
         assert!(!limiter.check_and_record("sub-1", 10));
         // A different subject has its own window.
         assert!(limiter.check_and_record("sub-2", 10));
+    }
+
+    /// Issue #62: the decision must expose the REAL window state — remaining
+    /// decreases with each consecutive request, hits 0 exactly at the limit,
+    /// stays 0 on denial, and reset tracks the oldest in-window timestamp.
+    #[test]
+    fn test_rate_limit_decision_tracks_window_state() {
+        let limiter = RateLimiter::new();
+        let limit = 5u32;
+        let start_secs = now_millis().div_ceil(1000);
+
+        for i in 1..=limit {
+            let decision = limiter.check_and_record_status("status", limit);
+            assert!(decision.allowed, "request {i} within the limit is admitted");
+            assert_eq!(
+                decision.remaining,
+                limit - i,
+                "remaining counts down with each admitted request"
+            );
+            // Reset is anchored on the FIRST in-window request, not now+60:
+            // it never moves later as more requests arrive.
+            assert!(
+                decision.reset_secs >= start_secs + RATE_LIMIT_WINDOW_MS / 1000,
+                "reset reflects the window expiry of the oldest request"
+            );
+            assert!(
+                decision.reset_secs <= now_millis().div_ceil(1000) + RATE_LIMIT_WINDOW_MS / 1000,
+                "reset never exceeds one full window from now"
+            );
+        }
+
+        // Denied request: remaining stays 0 and reset stays anchored to the
+        // oldest request — consistent with what a 429 must report.
+        let denied = limiter.check_and_record_status("status", limit);
+        assert!(!denied.allowed);
+        assert_eq!(denied.remaining, 0);
+        assert!(denied.reset_secs >= start_secs + RATE_LIMIT_WINDOW_MS / 1000);
+    }
+
+    /// The reset moves forward once the oldest request ages out of the window
+    /// (simulated by seeding an old timestamp directly).
+    #[test]
+    fn test_rate_limit_decision_reset_advances_as_window_slides() {
+        let limiter = RateLimiter::new();
+        let old = now_millis().saturating_sub(RATE_LIMIT_WINDOW_MS / 2);
+        {
+            let mut entry = limiter.windows.entry("slide".to_string()).or_default();
+            entry.value_mut().push_back(old);
+        }
+
+        let decision = limiter.check_and_record_status("slide", 10);
+        assert!(decision.allowed);
+        assert_eq!(decision.remaining, 8, "old + new request both in window");
+        // Reset is when the SEEDED (oldest) request expires: ~half a window
+        // from now, not a full window.
+        let expected = old.saturating_add(RATE_LIMIT_WINDOW_MS).div_ceil(1000);
+        assert_eq!(decision.reset_secs, expected);
     }
 
     #[test]
