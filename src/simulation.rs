@@ -252,7 +252,10 @@ impl PriceSimulator {
 
             // Generate price path for this asset. A misconfigured asset (e.g. a
             // non-positive or out-of-range initial price/volatility) is logged and
-            // skipped rather than panicking the whole simulation at startup.
+            // skipped rather than panicking the whole simulation at startup. A
+            // walker failure, by contrast, may be transient: the asset is
+            // registered dormant so the back-off retry can recover it later
+            // instead of disabling its simulation forever.
             match generate_price_path(
                 asset.initial_price,
                 asset.volatility,
@@ -267,6 +270,21 @@ impl PriceSimulator {
                             current_index: 0,
                             prices,
                             dormant_ticks_remaining: 0,
+                        },
+                    );
+                }
+                Err(e @ SimulationError::WalkGeneration { .. }) => {
+                    warn!(
+                        symbol = %asset.symbol,
+                        error = %e,
+                        "initial walk generation failed; walk dormant, will retry after back-off"
+                    );
+                    simulations.insert(
+                        asset.symbol.clone(),
+                        AssetSimulation {
+                            current_index: 0,
+                            prices: Vec::new(),
+                            dormant_ticks_remaining: DORMANT_RETRY_TICKS,
                         },
                     );
                 }
@@ -820,6 +838,47 @@ mod tests {
             sim.dormant_ticks_remaining > 0,
             "walk must remain dormant while regeneration keeps failing"
         );
+    }
+
+    /// An asset registered dormant at startup (a transient walker failure in
+    /// `new()`, per the review on PR #124) MUST recover through the same
+    /// back-off retry as a runtime failure: once the counter runs out the
+    /// regeneration is retried from the seeded price and the walk wakes up —
+    /// the asset is never disabled forever.
+    #[tokio::test]
+    async fn test_startup_dormant_walk_recovers_after_backoff() {
+        let assets = vec![test_asset()];
+        let simulator = PriceSimulator::new(assets.clone(), SimulationConfig::default());
+
+        // Simulate the startup walker-failure registration: an empty path,
+        // dormant for the final back-off tick.
+        {
+            let mut sims = simulator.simulations.write();
+            sims.insert(
+                "TEST".to_string(),
+                AssetSimulation {
+                    current_index: 0,
+                    prices: Vec::new(),
+                    dormant_ticks_remaining: 1,
+                },
+            );
+        }
+
+        let price = tokio::time::timeout(
+            Duration::from_secs(5),
+            simulator.get_next_price("TEST", &assets[0]),
+        )
+        .await
+        .expect("startup-dormant retry completed within the timeout");
+        assert!(price > 0, "recovered walk must yield a positive price");
+
+        let sims = simulator.simulations.read();
+        let sim = sims.get("TEST").expect("simulation still registered");
+        assert_eq!(
+            sim.dormant_ticks_remaining, 0,
+            "a successful startup retry must clear the dormant back-off"
+        );
+        assert!(sim.prices.len() >= 2, "walk must have been filled on retry");
     }
 
     /// A dormant walk MUST recover once the back-off elapses and the inputs are
