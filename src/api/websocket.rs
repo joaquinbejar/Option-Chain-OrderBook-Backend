@@ -524,9 +524,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                 delta = delta_rx.recv() => {
                     match delta {
                         Ok(delta_event) => {
-                            // Only send if client is subscribed to this symbol
+                            // Only send if the client is subscribed to this symbol,
+                            // exactly or via an "<underlying>:*" wildcard (issue #64).
                             let subscribed = subscribed_symbols_clone.read().await;
-                            if subscribed.contains(&delta_event.symbol) {
+                            if subscription_matches(&subscribed, &delta_event.symbol) {
                                 let msg = WsMessage::OrderbookDelta {
                                     symbol: delta_event.symbol,
                                     sequence: delta_event.sequence,
@@ -550,9 +551,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                 trade = trade_rx.recv() => {
                     match trade {
                         Ok(trade_event) => {
-                            // Only send if client is subscribed to this symbol's trades
+                            // Only send if the client is subscribed to this symbol's
+                            // trades, exactly or via an "<underlying>:*" wildcard
+                            // (issue #64).
                             let subscribed = subscribed_trades_clone.read().await;
-                            if subscribed.contains(&trade_event.symbol) {
+                            if subscription_matches(&subscribed, &trade_event.symbol) {
                                 let msg = WsMessage::Trade {
                                     trade_id: trade_event.trade_id,
                                     symbol: trade_event.symbol,
@@ -610,6 +613,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
     }
 
     info!("WebSocket connection closed");
+}
+
+/// Returns true when the subscription set covers `symbol` — either an exact
+/// entry, or a `"<underlying>:*"` wildcard (stored by the by-underlying batch
+/// subscription) whose underlying equals the symbol's leading
+/// `UNDERLYING-...` segment (issue #64).
+fn subscription_matches(subscribed: &HashSet<String>, symbol: &str) -> bool {
+    if subscribed.contains(symbol) {
+        return true;
+    }
+    match symbol.split_once('-') {
+        Some((underlying, _)) => subscribed.contains(&format!("{underlying}:*")),
+        None => false,
+    }
 }
 
 /// Convert market maker event to WebSocket message.
@@ -1742,6 +1759,68 @@ mod tests {
         assert_eq!(sub.channel, SubscriptionChannel::Trades);
         assert_eq!(sub.underlying, Some("AAPL".to_string()));
         assert_eq!(sub.symbol, None);
+    }
+
+    /// Issue #64: the delivery filter must honor `"<underlying>:*"` wildcard
+    /// entries against full `UNDERLYING-EXPIRATION-STRIKE-STYLE` symbols, in
+    /// addition to exact matches — and never cross-match other underlyings.
+    #[test]
+    fn test_subscription_matches_exact_and_wildcard() {
+        let mut subscribed: HashSet<String> = HashSet::new();
+        subscribed.insert("AAPL-20240329-150-C".to_string());
+        subscribed.insert("MSFT:*".to_string());
+
+        // Exact match still works.
+        assert!(subscription_matches(&subscribed, "AAPL-20240329-150-C"));
+        // Same underlying, different instrument, no wildcard: no match.
+        assert!(!subscription_matches(&subscribed, "AAPL-20240329-155-C"));
+
+        // Wildcard matches every instrument of its underlying...
+        assert!(subscription_matches(&subscribed, "MSFT-20240329-300-C"));
+        assert!(subscription_matches(&subscribed, "MSFT-20251231-999-P"));
+        // ...but never another underlying.
+        assert!(!subscription_matches(&subscribed, "GOOG-20240329-100-C"));
+        // A dashless symbol cannot match a wildcard.
+        assert!(!subscription_matches(&subscribed, "MSFT"));
+        // The wildcard entry itself is not an instrument symbol.
+        assert!(!subscription_matches(&subscribed, "MSFT:*-junk"));
+    }
+
+    /// End-to-end wiring of issue #64: a by-underlying batch subscription
+    /// stores the wildcard entry that `subscription_matches` then honors for
+    /// a concrete instrument of that underlying.
+    #[tokio::test]
+    async fn test_wildcard_subscription_stores_filter_that_matches_delivery() {
+        let state = Arc::new(crate::state::AppState::new());
+        let subscribed_symbols = Arc::new(tokio::sync::RwLock::new(HashSet::new()));
+        let subscribed_trades = Arc::new(tokio::sync::RwLock::new(HashSet::new()));
+
+        let sub = ChannelSubscription {
+            channel: SubscriptionChannel::Orderbook,
+            symbol: None,
+            underlying: Some("BTC".to_string()),
+            expiration: None,
+            depth: None,
+        };
+        let result = process_channel_subscription(
+            &state,
+            &subscribed_symbols,
+            &subscribed_trades,
+            &sub,
+            true,
+        )
+        .await;
+        assert_eq!(result.status, "ok");
+
+        let symbols = subscribed_symbols.read().await;
+        assert!(
+            subscription_matches(&symbols, "BTC-20251231-100000-C"),
+            "a delta for any BTC instrument must be delivered to the wildcard subscriber"
+        );
+        assert!(
+            !subscription_matches(&symbols, "ETH-20251231-5000-C"),
+            "another underlying must not be delivered"
+        );
     }
 
     #[test]
