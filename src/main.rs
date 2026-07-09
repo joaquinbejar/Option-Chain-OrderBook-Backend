@@ -28,13 +28,23 @@ use option_chain_orderbook_backend::api::controls::{
     KillSwitchResponse, LatestPriceResponse, SystemControlResponse, UpdateParametersResponse,
 };
 use option_chain_orderbook_backend::db::{InsertPriceRequest, UpdateParametersRequest};
+use option_chain_orderbook_backend::error::{ErrorResponse, RateLimitErrorResponse};
 use option_chain_orderbook_backend::models::{
-    AddOrderRequest, AddOrderResponse, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
-    BulkOrderResultItem, BulkOrderStatus, CancelOrderResponse, CreateSnapshotResponse,
-    DeleteUnderlyingResponse, ExpirationSummary, ExpirationsListResponse, GlobalStatsResponse,
-    HealthResponse, OrderBookSnapshotResponse, OrderbookSnapshotInfo, QuoteResponse,
-    RestoreSnapshotResponse, SnapshotSummary, SnapshotsListResponse, StrikeSummary,
-    StrikesListResponse, TokenRequest, TokenResponse, UnderlyingSummary, UnderlyingsListResponse,
+    ATMTermStructurePoint, AddOrderRequest, AddOrderResponse, BulkCancelRequest,
+    BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
+    BulkOrderResultItem, BulkOrderStatus, CancelAllResponse, CancelOrderResponse, ChainStrikeRow,
+    CreateSnapshotResponse, DeleteUnderlyingResponse, DepthMetrics, EnrichedSnapshotResponse,
+    ExecutionInfo, ExecutionSummary, ExecutionsListResponse, ExpirationSummary,
+    ExpirationsListResponse, FillInfo, GlobalStatsResponse, GreeksData, GreeksResponse,
+    HealthResponse, ImpactMetrics, LastTradeResponse, MarketImpactMetrics, MarketOrderRequest,
+    MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse,
+    ModifyOrderStatus, OhlcBar, OhlcInterval, OhlcResponse, OptionChainResponse, OptionQuoteData,
+    OrderBookSnapshotResponse, OrderFillInfo, OrderListResponse, OrderSide, OrderStatus,
+    OrderStatusResponse, OrderTimeInForce, OrderbookMetricsResponse, OrderbookSnapshotInfo,
+    PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo, PriceMetrics,
+    QuoteResponse, RestoreSnapshotResponse, SnapshotStats, SnapshotSummary, SnapshotsListResponse,
+    SpreadMetrics, StrikeIV, StrikeSummary, StrikesListResponse, TokenRequest, TokenResponse,
+    UnderlyingSummary, UnderlyingsListResponse, VolatilitySurfaceResponse,
 };
 
 /// Interval between background sweeps of expired rate-limit window buckets
@@ -97,11 +107,28 @@ impl utoipa::Modify for SecurityAddon {
         option_chain_orderbook_backend::api::handlers::list_strikes,
         option_chain_orderbook_backend::api::handlers::create_strike,
         option_chain_orderbook_backend::api::handlers::get_strike,
+        option_chain_orderbook_backend::api::handlers::get_option_chain,
+        option_chain_orderbook_backend::api::handlers::get_volatility_surface,
         option_chain_orderbook_backend::api::handlers::get_option_book,
         option_chain_orderbook_backend::api::handlers::add_order,
+        option_chain_orderbook_backend::api::handlers::submit_market_order,
         option_chain_orderbook_backend::api::handlers::cancel_order,
+        option_chain_orderbook_backend::api::handlers::modify_order,
         option_chain_orderbook_backend::api::handlers::get_option_quote,
+        option_chain_orderbook_backend::api::handlers::get_option_greeks,
+        option_chain_orderbook_backend::api::handlers::get_option_snapshot,
+        option_chain_orderbook_backend::api::handlers::get_last_trade,
+        option_chain_orderbook_backend::api::handlers::get_ohlc,
+        option_chain_orderbook_backend::api::handlers::get_orderbook_metrics,
+        option_chain_orderbook_backend::api::handlers::list_orders,
+        option_chain_orderbook_backend::api::handlers::get_order_status,
         option_chain_orderbook_backend::api::handlers::bulk_submit_orders,
+        option_chain_orderbook_backend::api::handlers::bulk_cancel_orders,
+        option_chain_orderbook_backend::api::handlers::cancel_all_orders,
+        option_chain_orderbook_backend::api::handlers::list_positions,
+        option_chain_orderbook_backend::api::handlers::get_position,
+        option_chain_orderbook_backend::api::handlers::list_executions,
+        option_chain_orderbook_backend::api::handlers::get_execution,
         option_chain_orderbook_backend::api::handlers::create_snapshot,
         option_chain_orderbook_backend::api::handlers::list_snapshots,
         option_chain_orderbook_backend::api::handlers::get_snapshot,
@@ -134,12 +161,56 @@ impl utoipa::Modify for SecurityAddon {
             QuoteResponse,
             AddOrderRequest,
             AddOrderResponse,
+            MarketOrderRequest,
+            MarketOrderResponse,
+            MarketOrderStatus,
+            FillInfo,
+            OrderSide,
+            ModifyOrderRequest,
+            ModifyOrderResponse,
+            ModifyOrderStatus,
             BulkOrderRequest,
             BulkOrderItem,
             BulkOrderResponse,
             BulkOrderResultItem,
             BulkOrderStatus,
+            BulkCancelRequest,
+            BulkCancelResponse,
+            BulkCancelResultItem,
+            CancelAllResponse,
             CancelOrderResponse,
+            OrderStatusResponse,
+            OrderListResponse,
+            OrderFillInfo,
+            OrderStatus,
+            OrderTimeInForce,
+            PositionResponse,
+            PositionsListResponse,
+            PositionSummary,
+            EnrichedSnapshotResponse,
+            PriceLevelInfo,
+            SnapshotStats,
+            LastTradeResponse,
+            OhlcResponse,
+            OhlcBar,
+            OhlcInterval,
+            OptionChainResponse,
+            ChainStrikeRow,
+            OptionQuoteData,
+            GreeksResponse,
+            GreeksData,
+            VolatilitySurfaceResponse,
+            StrikeIV,
+            ATMTermStructurePoint,
+            OrderbookMetricsResponse,
+            SpreadMetrics,
+            DepthMetrics,
+            PriceMetrics,
+            ImpactMetrics,
+            MarketImpactMetrics,
+            ExecutionsListResponse,
+            ExecutionInfo,
+            ExecutionSummary,
             SystemControlResponse,
             KillSwitchResponse,
             UpdateParametersResponse,
@@ -155,6 +226,8 @@ impl utoipa::Modify for SecurityAddon {
             SnapshotSummary,
             OrderbookSnapshotInfo,
             RestoreSnapshotResponse,
+            ErrorResponse,
+            RateLimitErrorResponse,
         )
     ),
     tags(
@@ -168,11 +241,20 @@ impl utoipa::Modify for SecurityAddon {
         (name = "Expirations", description = "Expiration date management"),
         (name = "Strikes", description = "Strike price management"),
         (name = "Options", description = "Option order book management"),
+        (name = "Chain", description = "Option chain matrix"),
+        (name = "Volatility", description = "Implied volatility surface"),
+        (name = "Greeks", description = "Option Greeks"),
+        (name = "Metrics", description = "Order book metrics and market impact"),
+        (name = "Orders", description = "Order status, listing, and bulk operations"),
+        (name = "Positions", description = "Position and inventory tracking"),
+        (name = "Executions", description = "Execution reports"),
         (name = "Admin", description = "Administrative endpoints (orderbook snapshots)"),
     ),
+    // `info.version` is intentionally omitted so utoipa defaults it to the crate
+    // version (`CARGO_PKG_VERSION` from Cargo.toml); see the `tests` module below,
+    // which asserts the generated document tracks that version.
     info(
         title = "Option Chain OrderBook API",
-        version = "0.4.0",
         description = "REST API for managing option chain order books with market maker support",
         license(name = "MIT"),
         contact(name = "Joaquin Bejar", email = "jb@taunais.com")
@@ -567,4 +649,67 @@ fn run_mint_token(args: &[String]) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout();
     writeln!(stdout, "{token}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiDoc;
+    use std::collections::BTreeSet;
+    use utoipa::OpenApi;
+
+    /// The generated OpenAPI `info.version` must track the crate version so the
+    /// published contract and the binary never drift. utoipa defaults
+    /// `info.version` to `CARGO_PKG_VERSION` (from `Cargo.toml`) when it is not
+    /// overridden in `info(...)`, which is why the `version` field is omitted
+    /// there.
+    #[test]
+    fn openapi_version_tracks_cargo_pkg_version() {
+        let doc = ApiDoc::openapi();
+        assert_eq!(
+            doc.info.version,
+            env!("CARGO_PKG_VERSION"),
+            "OpenAPI info.version drifted from the Cargo.toml crate version"
+        );
+    }
+
+    /// Every route registered in `create_router` must appear as a path in the
+    /// generated OpenAPI document. This locks the doc against route drift: adding
+    /// a `.route(...)` whose handler is not wired into `ApiDoc` fails here.
+    ///
+    /// The check reads `api/routes.rs` at compile time and extracts every
+    /// `"`-delimited string literal that looks like a route path (`/api/v1/...`,
+    /// `/health`, or `/ws`). Route paths use axum's `{param}` placeholder syntax,
+    /// which is identical to utoipa's path keys, so the comparison is exact.
+    ///
+    /// The Swagger UI mount (`/swagger-ui`) and the OpenAPI JSON endpoint
+    /// (`/api-docs/openapi.json`) are intentionally NOT covered: they are merged
+    /// in `main.rs` via `SwaggerUi`, not registered in `create_router`, so they
+    /// never appear in `routes.rs` and are not part of the documented surface.
+    #[test]
+    fn every_route_is_documented() {
+        let routes_src = include_str!("api/routes.rs");
+        let doc = ApiDoc::openapi();
+        let documented: BTreeSet<&str> = doc.paths.paths.keys().map(String::as_str).collect();
+
+        // String literals are delimited by double quotes and no route path
+        // contains an escaped quote, so the odd-indexed `split('"')` segments are
+        // exactly the contents of the string literals in the file.
+        let mut missing: Vec<&str> = Vec::new();
+        for (idx, segment) in routes_src.split('"').enumerate() {
+            // Even indices are the text between/around string literals.
+            if idx % 2 == 0 {
+                continue;
+            }
+            let is_route =
+                segment.starts_with("/api/v1/") || segment == "/health" || segment == "/ws";
+            if is_route && !documented.contains(segment) {
+                missing.push(segment);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "routes registered in create_router but absent from the OpenAPI document: {missing:?}"
+        );
+    }
 }

@@ -1,7 +1,7 @@
 //! Control and price API handlers.
 
 use crate::db::{InsertPriceRequest, UpdateParametersRequest};
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorResponse};
 use crate::market_maker::{
     DIRECTIONAL_SKEW_MAX, DIRECTIONAL_SKEW_MIN, SIZE_SCALAR_MAX, SIZE_SCALAR_MIN,
     SPREAD_MULTIPLIER_MAX, SPREAD_MULTIPLIER_MIN, validate_control_value,
@@ -206,7 +206,7 @@ pub async fn enable_quoting(State(state): State<Arc<AppState>>) -> Json<KillSwit
     request_body = UpdateParametersRequest,
     responses(
         (status = 200, description = "Parameters updated", body = UpdateParametersResponse),
-        (status = 400, description = "Invalid parameter value")
+        (status = 400, description = "Invalid parameter value", body = ErrorResponse)
     ),
     tag = "Controls"
 )]
@@ -403,7 +403,7 @@ fn cents_to_i64(field: &str, cents: u64) -> Result<i64, ApiError> {
     request_body = InsertPriceRequest,
     responses(
         (status = 200, description = "Price inserted", body = InsertPriceResponse),
-        (status = 400, description = "Invalid request")
+        (status = 400, description = "Invalid request", body = ErrorResponse)
     ),
     tag = "Prices"
 )]
@@ -473,7 +473,7 @@ pub async fn insert_price(
     ),
     responses(
         (status = 200, description = "Latest price", body = LatestPriceResponse),
-        (status = 404, description = "Symbol not found")
+        (status = 404, description = "Symbol not found", body = ErrorResponse)
     ),
     tag = "Prices"
 )]

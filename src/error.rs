@@ -4,12 +4,13 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 #[cfg(test)]
 mod tests;
 
 /// API error response body.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ErrorResponse {
     /// Error message.
     pub error: String,
@@ -18,7 +19,7 @@ pub struct ErrorResponse {
 }
 
 /// Rate limit error response body.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RateLimitErrorResponse {
     /// Error message.
     pub error: String,

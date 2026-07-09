@@ -1,6 +1,6 @@
 //! API request handlers.
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorResponse, RateLimitErrorResponse};
 use crate::models::{
     ATMTermStructurePoint, AddOrderRequest, AddOrderResponse, ApiTimeInForce, BulkCancelRequest,
     BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
@@ -214,10 +214,10 @@ pub async fn health_check() -> Json<HealthResponse> {
     request_body = TokenRequest,
     responses(
         (status = 200, description = "Token issued", body = TokenResponse),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Invalid bootstrap secret"),
-        (status = 403, description = "Token issuance disabled"),
-        (status = 429, description = "Rate limit exceeded")
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid bootstrap secret", body = ErrorResponse),
+        (status = 403, description = "Token issuance disabled", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse)
     ),
     tag = "Authentication"
 )]
@@ -288,7 +288,7 @@ pub async fn issue_token(
     ),
     responses(
         (status = 200, description = "List of executions", body = ExecutionsListResponse),
-        (status = 500, description = "Aggregation overflow")
+        (status = 500, description = "Aggregation overflow", body = ErrorResponse)
     ),
     tag = "Executions"
 )]
@@ -401,7 +401,7 @@ pub async fn list_executions(
     ),
     responses(
         (status = 200, description = "Execution details", body = ExecutionInfo),
-        (status = 404, description = "Execution not found")
+        (status = 404, description = "Execution not found", body = ErrorResponse)
     ),
     tag = "Executions"
 )]
@@ -576,7 +576,7 @@ pub async fn list_snapshots(State(state): State<Arc<AppState>>) -> Json<Snapshot
     ),
     responses(
         (status = 200, description = "Snapshot details", body = Vec<OrderbookSnapshotInfo>),
-        (status = 404, description = "Snapshot not found")
+        (status = 404, description = "Snapshot not found", body = ErrorResponse)
     ),
     tag = "Admin"
 )]
@@ -605,7 +605,7 @@ pub async fn get_snapshot(
     ),
     responses(
         (status = 200, description = "Snapshot restored", body = RestoreSnapshotResponse),
-        (status = 404, description = "Snapshot not found")
+        (status = 404, description = "Snapshot not found", body = ErrorResponse)
     ),
     tag = "Admin"
 )]
@@ -800,7 +800,7 @@ pub async fn create_underlying(
     ),
     responses(
         (status = 200, description = "Underlying details", body = UnderlyingSummary),
-        (status = 404, description = "Underlying not found")
+        (status = 404, description = "Underlying not found", body = ErrorResponse)
     ),
     tag = "Underlyings"
 )]
@@ -830,7 +830,7 @@ pub async fn get_underlying(
     ),
     responses(
         (status = 200, description = "Underlying deleted", body = DeleteUnderlyingResponse),
-        (status = 404, description = "Underlying not found")
+        (status = 404, description = "Underlying not found", body = ErrorResponse)
     ),
     tag = "Underlyings"
 )]
@@ -861,7 +861,7 @@ pub async fn delete_underlying(
     ),
     responses(
         (status = 200, description = "List of expirations", body = ExpirationsListResponse),
-        (status = 404, description = "Underlying not found")
+        (status = 404, description = "Underlying not found", body = ErrorResponse)
     ),
     tag = "Expirations"
 )]
@@ -922,7 +922,7 @@ pub async fn create_expiration(
     ),
     responses(
         (status = 200, description = "Expiration details", body = ExpirationSummary),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Expirations"
 )]
@@ -963,7 +963,7 @@ pub async fn get_expiration(
     ),
     responses(
         (status = 200, description = "List of strikes", body = StrikesListResponse),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Strikes"
 )]
@@ -1003,7 +1003,7 @@ pub async fn list_strikes(
     ),
     responses(
         (status = 200, description = "Option chain matrix", body = OptionChainResponse),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Chain"
 )]
@@ -1152,7 +1152,7 @@ fn build_option_quote_data(
     ),
     responses(
         (status = 200, description = "Volatility surface data (IVs derived from order-book mids via optionstratlib; omitted where not derivable)", body = VolatilitySurfaceResponse),
-        (status = 404, description = "Underlying not found")
+        (status = 404, description = "Underlying not found", body = ErrorResponse)
     ),
     tag = "Volatility"
 )]
@@ -1491,7 +1491,7 @@ pub async fn create_strike(
     ),
     responses(
         (status = 200, description = "Strike details", body = StrikeSummary),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Strikes"
 )]
@@ -1540,7 +1540,7 @@ pub async fn get_strike(
     ),
     responses(
         (status = 200, description = "Option order book snapshot", body = OrderBookSnapshotResponse),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Options"
 )]
@@ -1593,8 +1593,8 @@ pub async fn get_option_book(
     request_body = AddOrderRequest,
     responses(
         (status = 200, description = "Order added", body = AddOrderResponse),
-        (status = 400, description = "Invalid request"),
-        (status = 404, description = "Not found")
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Options"
 )]
@@ -1796,7 +1796,7 @@ pub async fn add_order(
     ),
     responses(
         (status = 200, description = "Order canceled", body = CancelOrderResponse),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Options"
 )]
@@ -1887,8 +1887,8 @@ pub async fn cancel_order(
     request_body = ModifyOrderRequest,
     responses(
         (status = 200, description = "Order modification result", body = ModifyOrderResponse),
-        (status = 400, description = "Invalid request"),
-        (status = 404, description = "Order not found")
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Order not found", body = ErrorResponse)
     ),
     tag = "Options"
 )]
@@ -2070,7 +2070,7 @@ pub async fn modify_order(
     ),
     responses(
         (status = 200, description = "Option quote", body = QuoteResponse),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Options"
 )]
@@ -2120,7 +2120,7 @@ pub async fn get_option_quote(
     ),
     responses(
         (status = 200, description = "Greeks for the option", body = GreeksResponse),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Greeks"
 )]
@@ -2267,7 +2267,7 @@ pub async fn get_option_greeks(
     ),
     responses(
         (status = 200, description = "Enriched order book snapshot", body = EnrichedSnapshotResponse),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Options"
 )]
@@ -2380,7 +2380,7 @@ pub async fn get_option_snapshot(
     ),
     responses(
         (status = 200, description = "Orderbook metrics", body = OrderbookMetricsResponse),
-        (status = 404, description = "Resource not found")
+        (status = 404, description = "Resource not found", body = ErrorResponse)
     ),
     tag = "Metrics"
 )]
@@ -2511,8 +2511,8 @@ pub async fn get_orderbook_metrics(
     request_body = MarketOrderRequest,
     responses(
         (status = 200, description = "Market order executed", body = MarketOrderResponse),
-        (status = 400, description = "Invalid request or insufficient liquidity"),
-        (status = 404, description = "Not found")
+        (status = 400, description = "Invalid request or insufficient liquidity", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Options"
 )]
@@ -2625,7 +2625,7 @@ pub async fn submit_market_order(
     ),
     responses(
         (status = 200, description = "Last trade information", body = LastTradeResponse),
-        (status = 404, description = "No trades found for this option")
+        (status = 404, description = "No trades found for this option", body = ErrorResponse)
     ),
     tag = "Options"
 )]
@@ -2675,8 +2675,8 @@ pub async fn get_last_trade(
     ),
     responses(
         (status = 200, description = "OHLC historical data", body = OhlcResponse),
-        (status = 400, description = "Invalid interval"),
-        (status = 404, description = "Not found")
+        (status = 400, description = "Invalid interval", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Options"
 )]
@@ -2729,7 +2729,7 @@ pub async fn get_ohlc(
     ),
     responses(
         (status = 200, description = "Order status", body = OrderStatusResponse),
-        (status = 404, description = "Order not found")
+        (status = 404, description = "Order not found", body = ErrorResponse)
     ),
     tag = "Orders"
 )]
@@ -2759,7 +2759,7 @@ pub async fn get_order_status(
     ),
     responses(
         (status = 200, description = "List of orders", body = OrderListResponse),
-        (status = 400, description = "Invalid query parameters")
+        (status = 400, description = "Invalid query parameters", body = ErrorResponse)
     ),
     tag = "Orders"
 )]
@@ -3310,7 +3310,7 @@ fn rollback_atomic_bulk(
     request_body = BulkOrderRequest,
     responses(
         (status = 200, description = "Bulk order submission results", body = BulkOrderResponse),
-        (status = 400, description = "Invalid request")
+        (status = 400, description = "Invalid request", body = ErrorResponse)
     ),
     tag = "Orders"
 )]
@@ -3386,7 +3386,7 @@ pub async fn bulk_submit_orders(
     request_body = BulkCancelRequest,
     responses(
         (status = 200, description = "Bulk cancellation results", body = BulkCancelResponse),
-        (status = 400, description = "Invalid request")
+        (status = 400, description = "Invalid request", body = ErrorResponse)
     ),
     tag = "Orders"
 )]
@@ -3510,7 +3510,7 @@ pub async fn bulk_cancel_orders(
     ),
     responses(
         (status = 200, description = "Cancel all results", body = CancelAllResponse),
-        (status = 400, description = "Invalid query parameters")
+        (status = 400, description = "Invalid query parameters", body = ErrorResponse)
     ),
     tag = "Orders"
 )]
@@ -3658,7 +3658,7 @@ pub async fn cancel_all_orders(
     ),
     responses(
         (status = 200, description = "Position details", body = PositionResponse),
-        (status = 404, description = "Position not found")
+        (status = 404, description = "Position not found", body = ErrorResponse)
     ),
     tag = "Positions"
 )]
