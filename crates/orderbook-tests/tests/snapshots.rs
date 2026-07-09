@@ -4,17 +4,15 @@
 //! server's retention cap (16) evicts the oldest ones, and the create
 //! response reports serialization failures separately from saved books.
 
-use orderbook_client::{Error, Permission};
-use orderbook_tests::create_authenticated_client;
+use orderbook_client::Error;
+use orderbook_tests::admin_client;
 
 /// Mirrors `AppState::MAX_RETAINED_SNAPSHOTS` on the server.
 const MAX_RETAINED_SNAPSHOTS: usize = 16;
 
 #[tokio::test]
 async fn test_snapshots_are_bounded_and_oldest_evicted() {
-    let client = create_authenticated_client(vec![Permission::Admin])
-        .await
-        .expect("Failed to create admin client");
+    let client = admin_client().await.expect("Failed to create admin client");
 
     // Create enough snapshots to exceed the retention cap.
     let mut created_ids: Vec<String> = Vec::new();

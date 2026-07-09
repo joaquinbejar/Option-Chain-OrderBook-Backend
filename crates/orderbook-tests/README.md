@@ -1,86 +1,150 @@
 # orderbook-tests
 
-Integration tests for the Option Chain OrderBook API.
+Integration tests for the Option Chain OrderBook API. They run against a
+**running** server over HTTP/WS using the typed `orderbook-client` SDK.
 
 ## Prerequisites
 
-The API server must be running before executing these tests.
+The API server must be running, with JWT auth configured, before executing these
+tests. Every endpoint except `/health` and `POST /api/v1/auth/token` requires a
+Bearer token, which the tests mint using the operator bootstrap secret.
+
+Start a local dev server:
+
+```bash
+ALLOW_DEV_KEY=1 AUTH_BOOTSTRAP_SECRET=test-bootstrap-secret cargo run
+```
 
 ## Configuration
 
-Set the `API_BASE_URL` environment variable to point to your API server:
+| Variable                | Default                  | Purpose                                   |
+| ----------------------- | ------------------------ | ----------------------------------------- |
+| `API_BASE_URL`          | `http://localhost:8080`  | Base URL of the running server.           |
+| `AUTH_BOOTSTRAP_SECRET` | `test-bootstrap-secret`  | Operator secret used to mint test tokens. |
+
+## Running
 
 ```bash
-export API_BASE_URL=http://localhost:8080
-```
-
-Default: `http://localhost:8080`
-
-## Running Tests
-
-### Start the API server first
-
-```bash
-# From the project root
-cargo run --release
-```
-
-### Run integration tests
-
-```bash
-# Run all integration tests
+# Whole suite
 cargo test -p orderbook-tests
 
-# Run specific test file
-cargo test -p orderbook-tests --test health
-cargo test -p orderbook-tests --test orderbook
-cargo test -p orderbook-tests --test websocket
-cargo test -p orderbook-tests --test market_maker
+# A single suite
+cargo test -p orderbook-tests --test orders
+cargo test -p orderbook-tests --test market_data
 
-# Run with output
+# With output
 cargo test -p orderbook-tests -- --nocapture
 ```
 
-### Using Docker
+Using Docker Compose:
 
 ```bash
-# Start API and run tests
 docker compose --profile test up
 ```
 
-## Test Coverage
+## Test isolation, auth, and rate limits
 
-### Health Tests (`tests/health.rs`)
-- Health check endpoint
-- Global statistics endpoint
+- **Unique symbols.** Each test creates underlyings with a unique, timestamped
+  prefix (`unique_symbol`) and deletes them best-effort at the end.
+- **Shared cached tokens.** Issuing a token is itself rate-limited per client IP
+  (10 / 60s), while each token's subject is limited to 100 requests / 60s. The
+  helpers in `src/lib.rs` mint a small, cross-process-cached set of tokens (a
+  pool of `Admin` subjects plus one `Read` subject) and reuse them across every
+  test binary, keeping both limits satisfied for a single suite run. Running the
+  *entire* suite several times within the same 60-second window can still trip
+  the server's per-subject limiter — this is the server protection working as
+  intended; allow the window to lapse (or run a subset) between rapid re-runs.
+- **Expiration handling (server bug #110).** A numeric expiration segment such as
+  `20251231` is parsed as a *number of days*, so a user-created expiration is
+  stored under a server-formatted canonical string (e.g. `+574720704`). Order
+  **placement** resolves the book by parsing the sent value, while the **read /
+  modify / cancel / bulk** paths resolve it by the formatted string. The
+  `setup_underlying` helper returns that formatted expiration; tests place with
+  `TEST_EXPIRATION` and read/modify/cancel with the formatted value.
+- **Global controls.** Tests that mutate global market-maker parameters or the
+  kill switch restore the initial values before returning; the config-provisioned
+  `BTC`/`ETH`/`GOLD` books' controls are never left mutated.
 
-### Orderbook Tests (`tests/orderbook.rs`)
-- Create and list underlyings
-- Create expirations and strikes
-- Add and cancel orders
-- Get option quotes
-- Market order execution
-- Market order with no liquidity
-- Put option operations
+## Test coverage
 
-### WebSocket Tests (`tests/websocket.rs`)
-- WebSocket connection
-- Subscribe/unsubscribe commands
-- Heartbeat handling
+### `tests/health.rs`
+- `test_health_check` — `/health` (unauthenticated) returns `healthy`.
+- `test_global_stats` — `/api/v1/stats` with a Read token.
 
-### Market Maker Tests (`tests/market_maker.rs`)
-- Get controls
-- Kill switch and enable
-- Update parameters
-- List instruments
-- Toggle instrument
-- Insert and get prices
-- Get all prices
-- Price not found error
+### `tests/auth.rs`
+- `test_authorized_read_succeeds` — Read token reaches a read endpoint.
+- `test_missing_token_is_unauthorized` — no token → 401.
+- `test_invalid_token_is_unauthorized` — malformed token → 401.
+- `test_insufficient_permission_is_forbidden` — Read token on controls → 403.
+- `test_admin_token_reaches_controls` — Admin token reaches controls.
+- `test_readonly_token_cannot_control_over_ws` — Read token `kill` over WS → error.
 
-## Test Isolation
+### `tests/orderbook.rs`
+- `test_create_and_list_underlyings` — create / list / get / delete underlying.
+- `test_create_expiration_and_strike` — create expiration + strike, list both.
+- `test_add_and_cancel_order` — add a limit order, see it in the book, cancel it.
+- `test_get_option_quote` — best bid/ask from resting orders.
+- `test_market_order_execution` — market order crosses resting liquidity.
+- `test_market_order_no_liquidity` — market order with an empty book errors.
+- `test_put_option_operations` — put-side add + book read.
 
-Each test uses unique symbols generated with timestamps to avoid conflicts when running tests in parallel.
+### `tests/orders.rs`
+- `test_order_status_and_list` — `get_order_status` (flat) + `list_orders` filter.
+- `test_modify_order` — cancel-and-replace modify; book reflects new price/size.
+- `test_bulk_submit_partial` — non-atomic bulk: one accepted, one rejected.
+- `test_bulk_submit_atomic_rollback` — atomic bulk rolls back on a failure.
+- `test_bulk_cancel` — bulk cancel of known + unknown ids.
+- `test_cancel_all` — cancel-all filtered by underlying.
+
+### `tests/market_data.rs`
+- `test_enriched_snapshot` — enriched snapshot with `depth` = `10` and `full`.
+- `test_orderbook_metrics` — spread / depth / price metrics.
+- `test_ohlc_from_fills` — OHLC bar OHLC/volume/trade-count from a fill.
+- `test_last_trade` — last trade after a crossing fill.
+- `test_option_chain` — chain row bid/ask.
+- `test_volatility_surface` — surface shape (IVs may be null).
+- `test_strike_and_expiration_details` — `get_expiration` + `get_strike`.
+- `test_greeks_on_priced_underlying` — greeks against the priced `BTC` book.
+
+### `tests/financial.rs`
+- `test_priced_position_pnl` — position mark, unrealized PnL, notional, summary.
+- `test_executions_list_and_get` — executions list + summary and fetch by id.
+
+### `tests/positions.rs`
+- `test_unpriced_position_omits_mark_fields` — unpriced position omits mark fields
+  (issue #59).
+
+### `tests/market_maker.rs`
+- `test_get_controls` — control status ranges.
+- `test_kill_switch_and_enable` — kill / enable master switch (state restored).
+- `test_update_parameters` — parameter round-trip (issue #82; values restored).
+- `test_list_instruments` — a created underlying appears as an instrument.
+- `test_toggle_instrument` — per-instrument quoting toggle.
+- `test_insert_and_get_price` — insert an underlying price, read it back.
+- `test_get_all_prices` — a price appears in the all-prices list.
+- `test_price_not_found` — unknown symbol → 404.
+
+### `tests/websocket.rs`
+- `test_websocket_connection` — authenticated `/ws` upgrade + first message.
+- `test_websocket_subscribe` — subscribe / unsubscribe commands.
+- `test_websocket_heartbeat` — connection stays alive for a message.
+
+### `tests/snapshots.rs`
+- `test_snapshots_are_bounded_and_oldest_evicted` — snapshot retention cap
+  (issue #58).
+
+### `tests/errors.rs`
+- `test_unknown_underlying_is_not_found` — 404 `Error::NotFound`.
+- `test_unknown_expiration_and_strike_are_not_found` — the expiration + strike 404s.
+- `test_unknown_order_status_is_not_found` — unknown order status → 404.
+- `test_modify_unknown_order_is_not_found` — modify unknown order → 404.
+- `test_cancel_unknown_order_reports_failure` — cancel unknown order → 200
+  `success = false` (idempotent delete, not a 404).
+- `test_malformed_expiration_is_bad_request` — `banana` / `-5` expirations → 400.
+- `test_out_of_range_control_parameters_are_bad_request` — `size_scalar` 1.5,
+  `spread_multiplier` 100.0, `directional_skew` 2.0 → 400.
+- `test_unauthenticated_order_is_unauthorized` — unauthenticated placement → 401.
+- `test_read_token_cannot_place_order` — Read token placement → 403.
 
 ## License
 

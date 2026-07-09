@@ -532,8 +532,12 @@ fn test_order_status_serialization() {
         "\"canceled\""
     );
     assert_eq!(
-        serde_json::to_string(&OrderStatus::Expired).unwrap(),
-        "\"expired\""
+        serde_json::to_string(&OrderStatus::Partial).unwrap(),
+        "\"partial\""
+    );
+    assert_eq!(
+        serde_json::to_string(&OrderStatus::Pending).unwrap(),
+        "\"pending\""
     );
 }
 
@@ -574,23 +578,31 @@ fn test_bulk_order_request_serialization() {
     let request = BulkOrderRequest {
         orders: vec![
             BulkOrderItem {
-                symbol: "AAPL-20240315-150C".to_string(),
+                underlying: "AAPL".to_string(),
+                expiration: "20240315".to_string(),
+                strike: 15000,
+                style: "call".to_string(),
                 side: OrderSide::Buy,
                 price: 10000,
                 quantity: 100,
             },
             BulkOrderItem {
-                symbol: "AAPL-20240315-150P".to_string(),
+                underlying: "AAPL".to_string(),
+                expiration: "20240315".to_string(),
+                strike: 15000,
+                style: "put".to_string(),
                 side: OrderSide::Sell,
                 price: 5000,
                 quantity: 50,
             },
         ],
+        atomic: true,
     };
 
     let json = serde_json::to_string(&request).unwrap();
     assert!(json.contains("\"orders\":["));
-    assert!(json.contains("\"symbol\":\"AAPL-20240315-150C\""));
+    assert!(json.contains("\"underlying\":\"AAPL\""));
+    assert!(json.contains("\"atomic\":true"));
 }
 
 // ============================================================================
@@ -620,7 +632,7 @@ fn test_greeks_data_serialization() {
 #[test]
 fn test_ohlc_bar_serialization() {
     let bar = OhlcBar {
-        timestamp_ms: 1704067200000,
+        timestamp: 1704067200,
         open: 10000,
         high: 10500,
         low: 9800,
@@ -657,13 +669,12 @@ fn test_ohlc_query_default() {
 #[test]
 fn test_spread_metrics_serialization() {
     let metrics = SpreadMetrics {
-        spread_absolute: Some(100),
+        current: Some(100),
         spread_bps: Some(50.0),
-        spread_percent: Some(0.5),
     };
 
     let json = serde_json::to_string(&metrics).unwrap();
-    assert!(json.contains("\"spread_absolute\":100"));
+    assert!(json.contains("\"current\":100"));
     assert!(json.contains("\"spread_bps\":50.0"));
 }
 
@@ -686,11 +697,12 @@ fn test_volatility_surface_response_serialization() {
 
     let response = VolatilitySurfaceResponse {
         underlying: "AAPL".to_string(),
-        underlying_price: Some(150.0),
+        spot_price: Some(15000),
+        timestamp_ms: 1704067200000,
         expirations: vec!["20240315".to_string()],
         strikes: vec![15000],
         surface,
-        timestamp_ms: 1704067200000,
+        atm_term_structure: vec![],
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -706,7 +718,8 @@ fn test_option_chain_response_serialization() {
     let response = OptionChainResponse {
         underlying: "AAPL".to_string(),
         expiration: "20240315".to_string(),
-        underlying_price: Some(150.0),
+        spot_price: Some(15000),
+        atm_strike: Some(15000),
         chain: vec![ChainStrikeRow {
             strike: 15000,
             call: OptionQuoteData {
@@ -714,25 +727,26 @@ fn test_option_chain_response_serialization() {
                 ask: Some(1100),
                 bid_size: 100,
                 ask_size: 150,
-                last: Some(1050),
+                last_trade: Some(1050),
                 volume: 5000,
                 open_interest: 10000,
                 iv: Some(0.25),
                 delta: Some(0.5),
+                ..Default::default()
             },
             put: OptionQuoteData {
                 bid: Some(500),
                 ask: Some(600),
                 bid_size: 80,
                 ask_size: 120,
-                last: Some(550),
+                last_trade: Some(550),
                 volume: 3000,
                 open_interest: 8000,
                 iv: Some(0.27),
                 delta: Some(-0.5),
+                ..Default::default()
             },
         }],
-        timestamp_ms: 1704067200000,
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -764,7 +778,7 @@ fn test_executions_query_default() {
 fn test_order_list_query_default() {
     let query = OrderListQuery::default();
 
-    assert!(query.symbol.is_none());
+    assert!(query.underlying.is_none());
     assert!(query.side.is_none());
     assert!(query.status.is_none());
     assert_eq!(query.offset, 0);
@@ -778,8 +792,10 @@ fn test_order_list_query_default() {
 fn test_cancel_all_query_default() {
     let query = CancelAllQuery::default();
 
-    assert!(query.symbol.is_none());
+    assert!(query.underlying.is_none());
+    assert!(query.expiration.is_none());
     assert!(query.side.is_none());
+    assert!(query.style.is_none());
 }
 
 // ============================================================================
