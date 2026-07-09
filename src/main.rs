@@ -31,10 +31,10 @@ use option_chain_orderbook_backend::db::{InsertPriceRequest, UpdateParametersReq
 use option_chain_orderbook_backend::models::{
     AddOrderRequest, AddOrderResponse, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
     BulkOrderResultItem, BulkOrderStatus, CancelOrderResponse, CreateSnapshotResponse,
-    ExpirationSummary, ExpirationsListResponse, GlobalStatsResponse, HealthResponse,
-    OrderBookSnapshotResponse, OrderbookSnapshotInfo, QuoteResponse, RestoreSnapshotResponse,
-    SnapshotSummary, SnapshotsListResponse, StrikeSummary, StrikesListResponse, TokenRequest,
-    TokenResponse, UnderlyingSummary, UnderlyingsListResponse,
+    DeleteUnderlyingResponse, ExpirationSummary, ExpirationsListResponse, GlobalStatsResponse,
+    HealthResponse, OrderBookSnapshotResponse, OrderbookSnapshotInfo, QuoteResponse,
+    RestoreSnapshotResponse, SnapshotSummary, SnapshotsListResponse, StrikeSummary,
+    StrikesListResponse, TokenRequest, TokenResponse, UnderlyingSummary, UnderlyingsListResponse,
 };
 
 /// Interval between background sweeps of expired rate-limit window buckets
@@ -125,6 +125,7 @@ impl utoipa::Modify for SecurityAddon {
             GlobalStatsResponse,
             UnderlyingsListResponse,
             UnderlyingSummary,
+            DeleteUnderlyingResponse,
             ExpirationsListResponse,
             ExpirationSummary,
             StrikesListResponse,

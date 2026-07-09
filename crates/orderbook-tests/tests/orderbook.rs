@@ -31,11 +31,13 @@ async fn test_create_and_list_underlyings() {
         .expect("Failed to get underlying");
     assert_eq!(fetched.symbol, symbol);
 
-    // Clean up
-    client
+    // Clean up — the delete returns a typed confirmation (issue #60).
+    let deleted = client
         .delete_underlying(&symbol)
         .await
         .expect("Failed to delete underlying");
+    assert!(deleted.success);
+    assert!(deleted.message.contains(&symbol));
 }
 
 #[tokio::test]

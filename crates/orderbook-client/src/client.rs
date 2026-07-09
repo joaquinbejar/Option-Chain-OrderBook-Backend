@@ -152,10 +152,10 @@ impl OrderbookClient {
     ///
     /// # Errors
     /// Returns error if the request fails.
-    pub async fn delete_underlying(&self, symbol: &str) -> Result<(), Error> {
+    pub async fn delete_underlying(&self, symbol: &str) -> Result<DeleteUnderlyingResponse, Error> {
         let url = format!("{}/api/v1/underlyings/{}", self.base_url, symbol);
         let resp = self.client.delete(&url).send().await?;
-        self.handle_empty_response(resp).await
+        self.handle_response(resp).await
     }
 
     // ========================================================================
@@ -874,23 +874,6 @@ impl OrderbookClient {
 
         if status.is_success() {
             Ok(resp.json().await?)
-        } else if status.as_u16() == 404 {
-            let text = resp.text().await.unwrap_or_default();
-            Err(Error::NotFound(text))
-        } else {
-            let text = resp.text().await.unwrap_or_default();
-            Err(Error::Api {
-                status: status.as_u16(),
-                message: text,
-            })
-        }
-    }
-
-    async fn handle_empty_response(&self, resp: reqwest::Response) -> Result<(), Error> {
-        let status = resp.status();
-
-        if status.is_success() {
-            Ok(())
         } else if status.as_u16() == 404 {
             let text = resp.text().await.unwrap_or_default();
             Err(Error::NotFound(text))

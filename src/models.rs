@@ -183,6 +183,15 @@ pub struct UnderlyingSummary {
     pub total_order_count: usize,
 }
 
+/// Response for deleting an underlying.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeleteUnderlyingResponse {
+    /// Whether the underlying was deleted.
+    pub success: bool,
+    /// Human-readable confirmation message.
+    pub message: String,
+}
+
 /// Expiration summary.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ExpirationSummary {
