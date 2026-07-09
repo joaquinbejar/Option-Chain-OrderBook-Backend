@@ -1,13 +1,14 @@
 //! API middleware: JWT authentication, per-route permission enforcement, and
 //! sliding-window rate limiting keyed by the JWT `sub`.
 
+use crate::auth::RateLimitDecision;
 use crate::error::ApiError;
 use crate::models::Permission;
 use crate::state::AppState;
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
-    http::{Method, Request, header::AUTHORIZATION},
+    http::{HeaderValue, Method, Request, header::AUTHORIZATION},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -20,9 +21,6 @@ const DEFAULT_RATE_LIMIT: u32 = 100;
 
 /// Tighter rate limit (per client IP) for the unauthenticated token endpoint.
 const TOKEN_ISSUE_RATE_LIMIT: u32 = 10;
-
-/// Rate-limit window length in seconds (used for the `reset` / `Retry-After`).
-const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 /// Health-check path (exempt from authentication).
 const HEALTH_PATH: &str = "/health";
@@ -66,10 +64,15 @@ pub async fn auth_middleware(
     // address (never a spoofable client header unless a proxy is trusted).
     if method == Method::POST && path == TOKEN_PATH {
         let key = token_rate_limit_key(&request, state.trust_proxy);
-        if !state.auth.check_rate_limit(&key, TOKEN_ISSUE_RATE_LIMIT) {
-            return rate_limited_response(TOKEN_ISSUE_RATE_LIMIT);
+        let decision = state
+            .auth
+            .check_rate_limit_status(&key, TOKEN_ISSUE_RATE_LIMIT);
+        if !decision.allowed {
+            return rate_limited_response(TOKEN_ISSUE_RATE_LIMIT, decision);
         }
-        return next.run(request).await;
+        let mut response = next.run(request).await;
+        add_rate_limit_headers(&mut response, TOKEN_ISSUE_RATE_LIMIT, decision);
+        return response;
     }
 
     // Extract and verify the token.
@@ -82,8 +85,11 @@ pub async fn auth_middleware(
     };
 
     // Rate limit by subject.
-    if !state.auth.check_rate_limit(&claims.sub, DEFAULT_RATE_LIMIT) {
-        return rate_limited_response(DEFAULT_RATE_LIMIT);
+    let decision = state
+        .auth
+        .check_rate_limit_status(&claims.sub, DEFAULT_RATE_LIMIT);
+    if !decision.allowed {
+        return rate_limited_response(DEFAULT_RATE_LIMIT, decision);
     }
 
     // Enforce the per-route required permission.
@@ -96,7 +102,7 @@ pub async fn auth_middleware(
     request.extensions_mut().insert(claims);
 
     let mut response = next.run(request).await;
-    add_rate_limit_headers(&mut response, DEFAULT_RATE_LIMIT);
+    add_rate_limit_headers(&mut response, DEFAULT_RATE_LIMIT, decision);
     response
 }
 
@@ -157,36 +163,31 @@ fn extract_token(request: &Request<Body>) -> Option<String> {
     None
 }
 
-/// Builds a `429 Too Many Requests` response with rate-limit headers.
-fn rate_limited_response(limit: u32) -> Response {
+/// Builds a `429 Too Many Requests` response carrying the limiter's real
+/// window state (issue #62): `remaining` from the decision (always 0 when
+/// denied) and `reset` = the actual expiry of the oldest in-window request.
+fn rate_limited_response(limit: u32, decision: RateLimitDecision) -> Response {
     let now = now_secs();
-    let reset = now.checked_add(RATE_LIMIT_WINDOW_SECS).unwrap_or(now);
     ApiError::RateLimitExceeded {
         limit,
-        remaining: 0,
-        reset,
-        retry_after: RATE_LIMIT_WINDOW_SECS,
+        remaining: decision.remaining,
+        reset: decision.reset_secs,
+        retry_after: decision.reset_secs.saturating_sub(now),
     }
     .into_response()
 }
 
-/// Adds best-effort `X-RateLimit-*` headers to a successful response.
-fn add_rate_limit_headers(response: &mut Response, limit: u32) {
-    let now = now_secs();
-    let reset = now.checked_add(RATE_LIMIT_WINDOW_SECS).unwrap_or(now);
-    // Best-effort estimate; guarded subtraction (no saturating/wrapping on the
-    // rate-limit value, per the project rules).
-    let remaining = if limit > 0 { limit - 1 } else { 0 };
+/// Adds `X-RateLimit-*` headers reflecting the limiter's real window state
+/// (issue #62). Header values are built with the infallible integer
+/// `HeaderValue` conversions — no stringify-then-parse (issue #63).
+fn add_rate_limit_headers(response: &mut Response, limit: u32, decision: RateLimitDecision) {
     let headers = response.headers_mut();
-    if let Ok(value) = limit.to_string().parse() {
-        headers.insert("X-RateLimit-Limit", value);
-    }
-    if let Ok(value) = remaining.to_string().parse() {
-        headers.insert("X-RateLimit-Remaining", value);
-    }
-    if let Ok(value) = reset.to_string().parse() {
-        headers.insert("X-RateLimit-Reset", value);
-    }
+    headers.insert("X-RateLimit-Limit", HeaderValue::from(limit));
+    headers.insert(
+        "X-RateLimit-Remaining",
+        HeaderValue::from(decision.remaining),
+    );
+    headers.insert("X-RateLimit-Reset", HeaderValue::from(decision.reset_secs));
 }
 
 /// Derives the rate-limit bucket key for the unauthenticated token endpoint.
@@ -470,5 +471,63 @@ mod tests {
     #[test]
     fn test_default_rate_limit_constant() {
         assert_eq!(DEFAULT_RATE_LIMIT, 100);
+    }
+
+    /// Issue #62: success-path headers carry the decision's REAL window state,
+    /// not `limit - 1` / `now + 60`.
+    #[test]
+    fn test_add_rate_limit_headers_uses_decision_values() {
+        let decision = RateLimitDecision {
+            allowed: true,
+            remaining: 42,
+            reset_secs: 1_752_000_123,
+        };
+        let mut response = Response::new(Body::empty());
+        add_rate_limit_headers(&mut response, DEFAULT_RATE_LIMIT, decision);
+
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("X-RateLimit-Limit"),
+            Some(&HeaderValue::from(DEFAULT_RATE_LIMIT))
+        );
+        assert_eq!(
+            headers.get("X-RateLimit-Remaining"),
+            Some(&HeaderValue::from(42u32))
+        );
+        assert_eq!(
+            headers.get("X-RateLimit-Reset"),
+            Some(&HeaderValue::from(1_752_000_123u64))
+        );
+    }
+
+    /// Issue #62: the 429 response reports the same decision values (remaining
+    /// 0, real reset) so success and denial are consistent.
+    #[test]
+    fn test_rate_limited_response_uses_decision_values() {
+        let reset_secs = now_secs() + 37;
+        let decision = RateLimitDecision {
+            allowed: false,
+            remaining: 0,
+            reset_secs,
+        };
+        let response = rate_limited_response(DEFAULT_RATE_LIMIT, decision);
+
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("X-RateLimit-Remaining"),
+            Some(&HeaderValue::from_static("0"))
+        );
+        assert_eq!(
+            headers.get("X-RateLimit-Reset"),
+            Some(&HeaderValue::from(reset_secs))
+        );
+        // Retry-After is derived from the real reset, not a fixed 60.
+        let retry_after: u64 = headers
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("Retry-After header present and numeric");
+        assert!(retry_after <= 37, "retry-after derives from the real reset");
     }
 }
