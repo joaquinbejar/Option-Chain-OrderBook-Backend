@@ -120,7 +120,8 @@ pub enum MarketMakerEvent {
         quantity: u64,
         /// Fill price in cents.
         price: u128,
-        /// Edge captured in cents.
+        /// Edge captured in cents PER CONTRACT, against the quote-time
+        /// theoretical value (total capture = `edge × quantity`).
         edge: i64,
     },
     /// Configuration changed.
@@ -143,8 +144,28 @@ pub enum MarketMakerEvent {
     },
 }
 
-/// Active order information: (symbol, expiration, strike, style).
-type ActiveOrderInfo = (String, String, u64, OptionStyle);
+/// A market-maker order resting on a book, tracked for cancel-on-requote and
+/// fill detection (issue #69).
+#[derive(Debug, Clone)]
+struct ActiveOrderInfo {
+    /// Underlying symbol.
+    symbol: String,
+    /// Expiration string (the book key, as used for book lookup on cancel).
+    expiration: String,
+    /// Canonical `UNDERLYING-YYYYMMDD-STRIKE-STYLE` identifier as used across
+    /// the REST surface, carried on fill events.
+    instrument: String,
+    /// Strike price in cents.
+    strike: u64,
+    /// Call or Put.
+    style: OptionStyle,
+    /// True for the bid leg, false for the ask leg.
+    is_buy: bool,
+    /// Theoretical value in cents at quote time, for edge computation.
+    theo_cents: u64,
+    /// Remaining resting quantity.
+    quantity: u64,
+}
 
 /// The market maker engine coordinates all quoting activity.
 pub struct MarketMakerEngine {
@@ -357,7 +378,7 @@ impl MarketMakerEngine {
             .active_orders
             .read()
             .iter()
-            .filter(|(_, (s, _, _, _))| s == symbol)
+            .filter(|(_, order)| order.symbol == symbol)
             .map(|(id, _)| *id)
             .collect();
 
@@ -372,18 +393,124 @@ impl MarketMakerEngine {
     fn cancel_order(&self, order_id: OrderId) {
         let order_info = self.active_orders.write().remove(&order_id);
 
-        if let Some((symbol, exp_str, strike, style)) = order_info
-            && let Ok(underlying_book) = self.manager.get(&symbol)
+        if let Some(order) = order_info
+            && let Ok(underlying_book) = self.manager.get(&order.symbol)
         {
             // Parse expiration and cancel order
-            if let Ok(expiration) = self.parse_expiration(&exp_str)
+            if let Ok(expiration) = self.parse_expiration(&order.expiration)
                 && let Ok(exp_book) = underlying_book.get_expiration(&expiration)
-                && let Ok(strike_book) = exp_book.get_strike(strike)
+                && let Ok(strike_book) = exp_book.get_strike(order.strike)
             {
-                let option_book = strike_book.get(style);
+                let option_book = strike_book.get(order.style);
                 let _ = option_book.cancel_order(order_id);
             }
         }
+    }
+
+    /// Notifies the engine that one of its resting quotes was (partially)
+    /// filled (issue #69).
+    ///
+    /// If `order_id` is a tracked market-maker order, the captured edge is
+    /// computed against the quote-time theoretical value via
+    /// [`Quoter::calculate_edge`], the tracked quantity is reduced (the order
+    /// is removed once fully filled), and a
+    /// [`MarketMakerEvent::OrderFilled`] is broadcast. Order ids that do not
+    /// belong to the market maker are ignored, so callers can report every
+    /// fill's maker id without pre-filtering.
+    pub fn on_order_filled(&self, order_id: OrderId, fill_price_cents: u128, quantity: u64) {
+        if quantity == 0 {
+            return;
+        }
+
+        // Cheap read-gate: most fills are user-vs-user, so never take the
+        // write lock for ids the engine does not own. (Benign TOCTOU: an
+        // order removed between this check and the write below is skipped.)
+        if !self.active_orders.read().contains_key(&order_id) {
+            return;
+        }
+
+        // Update under one short write lock; no lock held across the
+        // broadcast below. A full fill moves the removed value out (no
+        // clone); a partial fill clones and keeps the decremented remainder.
+        // The reported quantity is clamped to the tracked resting size so an
+        // upstream over-fill can never inflate the event.
+        let (order, reported_qty) = {
+            let mut orders = self.active_orders.write();
+            let Some(remaining) = orders.get(&order_id).map(|o| o.quantity) else {
+                return;
+            };
+            let reported = quantity.min(remaining);
+            if quantity >= remaining {
+                match orders.remove(&order_id) {
+                    Some(order) => (order, reported),
+                    None => return,
+                }
+            } else {
+                match orders.get_mut(&order_id) {
+                    Some(order) => {
+                        // Guarded: quantity < remaining here.
+                        order.quantity -= quantity;
+                        (order.clone(), reported)
+                    }
+                    None => return,
+                }
+            }
+        };
+
+        // The market-data DTOs carry prices as u64 cents; a fill price beyond
+        // that range is structurally impossible — log and skip rather than
+        // truncating money.
+        let fill_u64 = match u64::try_from(fill_price_cents) {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(
+                    symbol = %order.symbol,
+                    price = fill_price_cents,
+                    "market-maker fill price exceeds u64 cents range; skipping fill event"
+                );
+                return;
+            }
+        };
+
+        let edge = Quoter::calculate_edge(fill_u64, order.theo_cents, order.is_buy);
+        let side = if order.is_buy { "buy" } else { "sell" };
+
+        let _ = self.event_tx.send(MarketMakerEvent::OrderFilled {
+            order_id: order_id.to_string(),
+            symbol: order.symbol,
+            instrument: order.instrument,
+            side: side.to_string(),
+            quantity: reported_qty,
+            price: fill_price_cents,
+            edge,
+        });
+    }
+
+    /// Test-only: registers a tracked market-maker order directly (bypassing
+    /// the book) so the `record_fills` → `on_order_filled` seam can be
+    /// exercised without a matching engine.
+    #[cfg(test)]
+    pub(crate) fn track_order_for_test(
+        &self,
+        is_buy: bool,
+        theo_cents: u64,
+        quantity: u64,
+    ) -> OrderId {
+        let id = OrderId::new();
+        self.active_orders.write().insert(
+            id,
+            ActiveOrderInfo {
+                symbol: "BTC".to_string(),
+                expiration: "20351231".to_string(),
+                instrument: "BTC-20351231-100000-C".to_string(),
+                strike: 100_000,
+                style: OptionStyle::Call,
+                is_buy,
+                theo_cents,
+                quantity,
+            },
+        );
+        id
     }
 
     /// Requotes all instruments for a symbol.
@@ -442,6 +569,20 @@ impl MarketMakerEngine {
             Err(_) => return,
         };
 
+        // Canonical instrument identifier (UNDERLYING-YYYYMMDD-STRIKE-STYLE)
+        // as used across the REST surface, carried on fill events (issue #69).
+        // Falls back to the raw book key when the expiration carries no
+        // calendar date.
+        let exp_canonical = expiration
+            .get_date()
+            .map(|d| d.format("%Y%m%d").to_string())
+            .unwrap_or_else(|_| exp_str.to_string());
+        let style_char = match style {
+            OptionStyle::Call => "C",
+            OptionStyle::Put => "P",
+        };
+        let instrument = format!("{symbol}-{exp_canonical}-{strike}-{style_char}");
+
         let input = QuoteInput {
             spot_cents,
             strike_cents: strike,
@@ -490,8 +631,12 @@ impl MarketMakerEngine {
             let stale_ids: Vec<OrderId> = {
                 let orders = self.active_orders.read();
                 let mut ids = Vec::with_capacity(2);
-                for (id, (s, e, k, sty)) in orders.iter() {
-                    if s == symbol && e == exp_str && *k == strike && *sty == style {
+                for (id, order) in orders.iter() {
+                    if order.symbol == symbol
+                        && order.expiration == exp_str
+                        && order.strike == strike
+                        && order.style == style
+                    {
                         ids.push(*id);
                     }
                 }
@@ -531,7 +676,16 @@ impl MarketMakerEngine {
             {
                 self.active_orders.write().insert(
                     bid_id,
-                    (symbol.to_string(), exp_str.to_string(), strike, style),
+                    ActiveOrderInfo {
+                        symbol: symbol.to_string(),
+                        expiration: exp_str.to_string(),
+                        instrument: instrument.clone(),
+                        strike,
+                        style,
+                        is_buy: true,
+                        theo_cents: quote_params.theo_price,
+                        quantity: quote_params.bid_size,
+                    },
                 );
             }
 
@@ -548,7 +702,16 @@ impl MarketMakerEngine {
             {
                 self.active_orders.write().insert(
                     ask_id,
-                    (symbol.to_string(), exp_str.to_string(), strike, style),
+                    ActiveOrderInfo {
+                        symbol: symbol.to_string(),
+                        expiration: exp_str.to_string(),
+                        instrument: instrument.clone(),
+                        strike,
+                        style,
+                        is_buy: false,
+                        theo_cents: quote_params.theo_price,
+                        quantity: quote_params.ask_size,
+                    },
                 );
             }
 
@@ -669,9 +832,126 @@ mod tests {
             .active_orders
             .read()
             .iter()
-            .filter(|(_, (s, _, k, sty))| s == symbol && *k == strike && *sty == style)
+            .filter(|(_, order)| {
+                order.symbol == symbol && order.strike == strike && order.style == style
+            })
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Inserts a tracked market-maker order directly (bypassing the book) so
+    /// fill-notification behavior can be tested in isolation.
+    fn track_order(engine: &MarketMakerEngine, is_buy: bool, theo_cents: u64, qty: u64) -> OrderId {
+        engine.track_order_for_test(is_buy, theo_cents, qty)
+    }
+
+    /// Issue #69: a fill on a tracked maker order broadcasts OrderFilled with
+    /// the edge computed against the quote-time theo, and a full fill removes
+    /// the order from tracking.
+    #[test]
+    fn test_on_order_filled_broadcasts_edge_and_untracks() {
+        let engine = test_engine();
+        let mut events = engine.subscribe();
+
+        // A bid (buy) filled at 95 with theo 100 captures +5 edge.
+        let id = track_order(&engine, true, 100, 10);
+        engine.on_order_filled(id, 95, 10);
+
+        let event = events.try_recv().expect("OrderFilled must be broadcast");
+        match event {
+            MarketMakerEvent::OrderFilled {
+                order_id,
+                symbol,
+                instrument,
+                side,
+                quantity,
+                price,
+                edge,
+            } => {
+                assert_eq!(order_id, id.to_string());
+                assert_eq!(symbol, "BTC");
+                assert_eq!(instrument, "BTC-20351231-100000-C");
+                assert_eq!(side, "buy");
+                assert_eq!(quantity, 10);
+                assert_eq!(price, 95);
+                assert_eq!(edge, 5, "buy edge = theo - fill");
+            }
+            other => panic!("expected OrderFilled, got {other:?}"),
+        }
+
+        // Fully filled -> no longer tracked.
+        assert!(!engine.active_orders.read().contains_key(&id));
+    }
+
+    /// A sell fill above theo captures positive edge; a partial fill keeps the
+    /// order tracked with the remaining quantity.
+    #[test]
+    fn test_on_order_filled_partial_sell_keeps_remainder() {
+        let engine = test_engine();
+        let mut events = engine.subscribe();
+
+        // An ask (sell) filled at 110 with theo 105 captures +5 edge.
+        let id = track_order(&engine, false, 105, 10);
+        engine.on_order_filled(id, 110, 4);
+
+        match events.try_recv().expect("OrderFilled must be broadcast") {
+            MarketMakerEvent::OrderFilled {
+                side,
+                quantity,
+                edge,
+                ..
+            } => {
+                assert_eq!(side, "sell");
+                assert_eq!(quantity, 4);
+                assert_eq!(edge, 5, "sell edge = fill - theo");
+            }
+            other => panic!("expected OrderFilled, got {other:?}"),
+        }
+
+        // Partially filled -> still tracked with the remainder.
+        let orders = engine.active_orders.read();
+        let order = orders.get(&id).expect("partially filled order stays");
+        assert_eq!(order.quantity, 6);
+    }
+
+    /// Fills on unknown (non-market-maker) order ids are ignored: no event,
+    /// no tracking change.
+    #[test]
+    fn test_on_order_filled_ignores_unknown_orders() {
+        let engine = test_engine();
+        let mut events = engine.subscribe();
+
+        engine.on_order_filled(OrderId::new(), 100, 1);
+
+        assert!(
+            events.try_recv().is_err(),
+            "no event may be broadcast for a non-market-maker fill"
+        );
+    }
+
+    /// A zero-quantity notification is ignored, and an upstream over-fill can
+    /// never inflate the event: the reported quantity is clamped to the
+    /// tracked resting size.
+    #[test]
+    fn test_on_order_filled_guards_zero_and_overfill() {
+        let engine = test_engine();
+        let mut events = engine.subscribe();
+
+        let id = track_order(&engine, true, 100, 10);
+        engine.on_order_filled(id, 95, 0);
+        assert!(
+            events.try_recv().is_err(),
+            "a zero-quantity fill must not broadcast"
+        );
+
+        engine.on_order_filled(id, 95, 15);
+        match events.try_recv().expect("over-fill still broadcasts once") {
+            MarketMakerEvent::OrderFilled { quantity, .. } => {
+                assert_eq!(quantity, 10, "reported quantity clamps to the resting size");
+            }
+            other => panic!("expected OrderFilled, got {other:?}"),
+        }
+        assert!(!engine.active_orders.read().contains_key(&id));
     }
 
     #[test]

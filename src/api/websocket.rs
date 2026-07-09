@@ -44,14 +44,18 @@ pub enum WsMessage {
         /// Ask size.
         ask_size: u64,
     },
-    /// Order fill notification.
+    /// Market-maker order fill notification (issue #69).
+    ///
+    /// Broadcast to every connected client (market-maker events are not
+    /// gated by subscriptions) and delivered best-effort: a lagging client
+    /// may drop messages — REST `/api/v1/executions` is authoritative.
     #[serde(rename = "fill")]
     Fill {
         /// Order identifier.
         order_id: String,
         /// Underlying symbol.
         symbol: String,
-        /// Instrument identifier.
+        /// Canonical `UNDERLYING-YYYYMMDD-STRIKE-STYLE` instrument identifier.
         instrument: String,
         /// Order side (buy/sell).
         side: String,
@@ -59,7 +63,8 @@ pub enum WsMessage {
         quantity: u64,
         /// Fill price in cents.
         price: u128,
-        /// Edge captured in cents.
+        /// Edge captured in cents per contract, against the quote-time
+        /// theoretical value (total capture = `edge × quantity`).
         edge: i64,
     },
     /// Configuration change.
