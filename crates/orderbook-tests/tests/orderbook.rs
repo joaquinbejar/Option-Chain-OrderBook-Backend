@@ -216,8 +216,70 @@ async fn test_market_order_execution() {
     assert_eq!(result.status, MarketOrderStatus::Filled);
     assert_eq!(result.filled_quantity, 50);
     assert_eq!(result.remaining_quantity, 0);
-    assert!(result.average_price.is_some());
-    assert!(!result.fills.is_empty());
+    // Issue #87: assert the exact cents values, not mere presence — a fill at
+    // the wrong price must fail this test. One resting sell at 1500 means
+    // every fill and the average are exactly 1500.
+    assert_eq!(result.average_price, Some(1500.0));
+    assert_eq!(result.fills.len(), 1);
+    assert_eq!(result.fills[0].price, 1500);
+    assert_eq!(result.fills[0].quantity, 50);
+}
+
+/// Issue #87: a market order sweeping two price levels must report each fill
+/// at its level price and the exact quantity-weighted average.
+#[tokio::test]
+async fn test_market_order_weighted_average_across_levels() {
+    let client = admin_client().await.expect("admin client");
+    let (underlying, _formatted) = setup_underlying(&client, "AVG").await;
+    let place = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
+
+    // Phase 1: rest two sell levels, then take across both.
+    let rest_low = client
+        .add_order(
+            &place,
+            &AddOrderRequest {
+                side: OrderSide::Sell,
+                price: 1400,
+                quantity: 30,
+            },
+        )
+        .await;
+    let rest_high = client
+        .add_order(
+            &place,
+            &AddOrderRequest {
+                side: OrderSide::Sell,
+                price: 1500,
+                quantity: 30,
+            },
+        )
+        .await;
+    let result = client
+        .submit_market_order(
+            &place,
+            &MarketOrderRequest {
+                side: OrderSide::Buy,
+                quantity: 50,
+            },
+        )
+        .await;
+
+    // Phase 2: cleanup.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3: assert.
+    rest_low.expect("add 30 @ 1400");
+    rest_high.expect("add 30 @ 1500");
+    let result = result.expect("Failed to submit market order");
+    assert_eq!(result.status, MarketOrderStatus::Filled);
+    assert_eq!(result.filled_quantity, 50);
+    assert_eq!(result.remaining_quantity, 0);
+
+    // 30 @ 1400 + 20 @ 1500 => (30*1400 + 20*1500) / 50 = 1440 exactly.
+    assert_eq!(result.average_price, Some(1440.0));
+    let mut fills: Vec<(u128, u64)> = result.fills.iter().map(|f| (f.price, f.quantity)).collect();
+    fills.sort_unstable();
+    assert_eq!(fills, vec![(1400, 30), (1500, 20)]);
 }
 
 #[tokio::test]
