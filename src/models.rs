@@ -5,6 +5,7 @@ use utoipa::ToSchema;
 
 /// Order side for trading operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[repr(u8)]
 #[serde(rename_all = "lowercase")]
 pub enum OrderSide {
     /// Buy order.
@@ -18,6 +19,31 @@ impl std::fmt::Display for OrderSide {
         match self {
             Self::Buy => write!(f, "buy"),
             Self::Sell => write!(f, "sell"),
+        }
+    }
+}
+
+/// Option style (call or put) as carried on the wire.
+///
+/// A typed enum so an invalid value is rejected during deserialization with a
+/// `400` rather than being string-matched inside a handler. The wire form is
+/// lowercase (`"call"` / `"put"`), matching the option-style path segment used
+/// elsewhere in the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[repr(u8)]
+#[serde(rename_all = "lowercase")]
+pub enum OptionStyle {
+    /// Call option.
+    Call,
+    /// Put option.
+    Put,
+}
+
+impl std::fmt::Display for OptionStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Call => write!(f, "call"),
+            Self::Put => write!(f, "put"),
         }
     }
 }
@@ -46,6 +72,7 @@ impl std::fmt::Display for MarketOrderStatus {
 
 /// Time in force for limit order requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[repr(u8)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ApiTimeInForce {
     /// Good till canceled (default).
@@ -113,7 +140,7 @@ pub struct AddOrderRequest {
 }
 
 /// Response after adding an order.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddOrderResponse {
     /// The generated order ID.
     pub order_id: String,
@@ -128,7 +155,7 @@ pub struct AddOrderResponse {
 }
 
 /// Response for canceling an order.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CancelOrderResponse {
     /// Whether the order was successfully canceled.
     pub success: bool,
@@ -137,7 +164,7 @@ pub struct CancelOrderResponse {
 }
 
 /// Quote information.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct QuoteResponse {
     /// Best bid price.
     pub bid_price: Option<u128>,
@@ -271,7 +298,7 @@ pub struct MarketOrderRequest {
 }
 
 /// Information about a single fill in a market order execution.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct FillInfo {
     /// Execution price in smallest units.
     pub price: u128,
@@ -280,7 +307,7 @@ pub struct FillInfo {
 }
 
 /// Response after submitting a market order.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct MarketOrderResponse {
     /// The generated order ID.
     pub order_id: String,
@@ -290,7 +317,12 @@ pub struct MarketOrderResponse {
     pub filled_quantity: u64,
     /// Remaining quantity that was not filled.
     pub remaining_quantity: u64,
-    /// Average execution price (None if no fills).
+    /// Volume-weighted average execution price, in cents (`None` if no fills).
+    ///
+    /// Derived analytic float, intentionally exempt from the cents-as-integer
+    /// money rule (see the crate-level "Money and analytic values" note): it is a
+    /// computed average for display/analytics, not a settled monetary amount. The
+    /// settled per-fill prices in [`FillInfo`] remain integer cents.
     pub average_price: Option<f64>,
     /// List of individual fills.
     pub fills: Vec<FillInfo>,
@@ -351,6 +383,13 @@ pub struct PriceLevelInfo {
 }
 
 /// Statistics for an enriched snapshot.
+///
+/// The price-derived fields here (`mid_price`, `spread_bps`, `vwap_bid`,
+/// `vwap_ask`, `imbalance`) are derived analytic floats, intentionally exempt
+/// from the cents-as-integer money rule (see the crate-level "Money and analytic
+/// values" note): they are computed statistics for display/analytics, not
+/// settled monetary amounts. Raw resting prices are carried as integer cents in
+/// [`PriceLevelInfo`].
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SnapshotStats {
     /// Mid price (average of best bid and ask).
@@ -451,6 +490,7 @@ impl From<LastTradeInfo> for LastTradeResponse {
 
 /// Order status in the lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[repr(u8)]
 #[serde(rename_all = "lowercase")]
 pub enum OrderStatus {
     /// Order is pending (not yet in the book).
@@ -922,6 +962,7 @@ pub struct PositionQuery {
 
 /// OHLC bar interval for candlestick data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[repr(u8)]
 #[serde(rename_all = "lowercase")]
 pub enum OhlcInterval {
     /// 1 minute bars.
@@ -1153,10 +1194,10 @@ pub struct BulkOrderItem {
     pub expiration: String,
     /// Strike price.
     pub strike: u64,
-    /// Option style: "call" or "put".
-    pub style: String,
-    /// Order side: "buy" or "sell".
-    pub side: String,
+    /// Option style (call or put); invalid values are rejected with a 400.
+    pub style: OptionStyle,
+    /// Order side (buy or sell); invalid values are rejected with a 400.
+    pub side: OrderSide,
     /// Limit price.
     pub price: u128,
     /// Order quantity.
@@ -1184,7 +1225,7 @@ pub enum BulkOrderStatus {
 }
 
 /// Result for an individual order in a bulk submission.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BulkOrderResultItem {
     /// Index of the order in the request array.
     pub index: usize,
@@ -1198,7 +1239,7 @@ pub struct BulkOrderResultItem {
 }
 
 /// Response for bulk order submission.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BulkOrderResponse {
     /// Number of orders accepted by the book (placed or filled).
     ///
@@ -1224,7 +1265,10 @@ pub struct BulkOrderResponse {
     /// cleanly cancelled — most importantly when it had already (partially)
     /// filled, since a fill cannot be un-filled. Such orders remain live, are
     /// counted in `success_count`, and are reported with status `accepted`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `#[serde(default)]` so the field round-trips: it is omitted from the wire
+    /// when empty (`skip_serializing_if`) and deserializes back to an empty Vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rollback_warnings: Vec<String>,
 }
 
@@ -1472,6 +1516,7 @@ pub struct VolatilitySurfaceResponse {
 
 /// Permission levels carried by a JWT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[repr(u8)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
     /// Read-only access to market data.
@@ -1532,6 +1577,11 @@ pub struct DepthMetrics {
 }
 
 /// Price metrics for an orderbook.
+///
+/// Every field is a derived analytic float, intentionally exempt from the
+/// cents-as-integer money rule (see the crate-level "Money and analytic values"
+/// note): these are computed mid/micro/VWAP statistics for display/analytics,
+/// not settled monetary amounts.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PriceMetrics {
     /// Mid price (average of best bid and ask).
@@ -1545,6 +1595,11 @@ pub struct PriceMetrics {
 }
 
 /// Market impact metrics for a single side.
+///
+/// `avg_price` and `slippage_bps` are derived analytic floats, intentionally
+/// exempt from the cents-as-integer money rule (see the crate-level "Money and
+/// analytic values" note): they are computed impact estimates for
+/// display/analytics, not settled monetary amounts.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ImpactMetrics {
     /// Average execution price.
@@ -1818,4 +1873,153 @@ pub struct RestoreSnapshotResponse {
     pub orderbooks_failed: u64,
     /// Timestamp of the restore operation.
     pub timestamp_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire casing of every small contract enum is fixed (semver). These
+    /// assertions lock the JSON representation so a rename cannot slip through.
+    #[test]
+    fn test_enum_wire_casing_is_stable() {
+        assert_eq!(serde_json::to_string(&OrderSide::Buy).unwrap(), "\"buy\"");
+        assert_eq!(serde_json::to_string(&OrderSide::Sell).unwrap(), "\"sell\"");
+
+        assert_eq!(
+            serde_json::to_string(&OptionStyle::Call).unwrap(),
+            "\"call\""
+        );
+        assert_eq!(serde_json::to_string(&OptionStyle::Put).unwrap(), "\"put\"");
+
+        assert_eq!(
+            serde_json::to_string(&OrderStatus::Active).unwrap(),
+            "\"active\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OrderStatus::Canceled).unwrap(),
+            "\"canceled\""
+        );
+
+        assert_eq!(
+            serde_json::to_string(&Permission::Read).unwrap(),
+            "\"read\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Permission::Admin).unwrap(),
+            "\"admin\""
+        );
+
+        // Time-in-force is UPPERCASE on the wire.
+        assert_eq!(
+            serde_json::to_string(&ApiTimeInForce::Gtc).unwrap(),
+            "\"GTC\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApiTimeInForce::Gtd).unwrap(),
+            "\"GTD\""
+        );
+
+        // OHLC intervals use their explicit renames.
+        assert_eq!(
+            serde_json::to_string(&OhlcInterval::OneMinute).unwrap(),
+            "\"1m\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OhlcInterval::OneDay).unwrap(),
+            "\"1d\""
+        );
+    }
+
+    /// Every contract enum round-trips through JSON unchanged.
+    #[test]
+    fn test_enum_json_round_trip() {
+        for side in [OrderSide::Buy, OrderSide::Sell] {
+            let json = serde_json::to_string(&side).unwrap();
+            assert_eq!(serde_json::from_str::<OrderSide>(&json).unwrap(), side);
+        }
+        for style in [OptionStyle::Call, OptionStyle::Put] {
+            let json = serde_json::to_string(&style).unwrap();
+            assert_eq!(serde_json::from_str::<OptionStyle>(&json).unwrap(), style);
+        }
+        for tif in [
+            ApiTimeInForce::Gtc,
+            ApiTimeInForce::Ioc,
+            ApiTimeInForce::Fok,
+            ApiTimeInForce::Gtd,
+        ] {
+            let json = serde_json::to_string(&tif).unwrap();
+            assert_eq!(serde_json::from_str::<ApiTimeInForce>(&json).unwrap(), tif);
+        }
+    }
+
+    /// The response DTOs now derive `Deserialize`, so they survive a
+    /// serialize -> deserialize -> serialize round-trip byte-for-byte.
+    #[test]
+    fn test_response_dtos_round_trip() {
+        let quote = QuoteResponse {
+            bid_price: Some(1234),
+            bid_size: 5,
+            ask_price: None,
+            ask_size: 0,
+            timestamp_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&quote).unwrap();
+        let back: QuoteResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+
+        let market = MarketOrderResponse {
+            order_id: "ord-1".to_string(),
+            status: MarketOrderStatus::Partial,
+            filled_quantity: 3,
+            remaining_quantity: 2,
+            average_price: Some(101.5),
+            fills: vec![FillInfo {
+                price: 10150,
+                quantity: 3,
+            }],
+        };
+        let json = serde_json::to_string(&market).unwrap();
+        let back: MarketOrderResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+
+        let bulk = BulkOrderResponse {
+            success_count: 1,
+            failure_count: 0,
+            results: vec![BulkOrderResultItem {
+                index: 0,
+                order_id: Some("ord-2".to_string()),
+                status: BulkOrderStatus::Accepted,
+                error: None,
+            }],
+            rolled_back: false,
+            rollback_warnings: Vec::new(),
+        };
+        let json = serde_json::to_string(&bulk).unwrap();
+        let back: BulkOrderResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    /// The instrument symbol `UNDERLYING-EXPIRATION-STRIKE-STYLE` splits back
+    /// into its parts, and the style token round-trips through [`OptionStyle`].
+    #[test]
+    fn test_instrument_symbol_roundtrip() {
+        for (style, token) in [(OptionStyle::Call, "C"), (OptionStyle::Put, "P")] {
+            let symbol = format!("BTC-20251231-100000-{token}");
+            let parts: Vec<&str> = symbol.split('-').collect();
+            assert_eq!(parts.len(), 4);
+            assert_eq!(parts[0], "BTC");
+            assert_eq!(parts[1], "20251231");
+            assert_eq!(parts[2].parse::<u64>().unwrap(), 100_000);
+            let parsed_style = match parts[3] {
+                "C" => OptionStyle::Call,
+                "P" => OptionStyle::Put,
+                other => panic!("unexpected style token: {other}"),
+            };
+            assert_eq!(parsed_style, style);
+            // Re-formatting yields the original symbol.
+            let reformatted = format!("{}-{}-{}-{}", parts[0], parts[1], parts[2], token);
+            assert_eq!(reformatted, symbol);
+        }
+    }
 }

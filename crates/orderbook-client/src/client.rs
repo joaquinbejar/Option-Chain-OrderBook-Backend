@@ -9,6 +9,31 @@ use std::time::Duration;
 #[cfg(test)]
 mod tests;
 
+/// Percent-encodes a single dynamic path segment so a reserved character in a
+/// caller-supplied value (symbol, expiration, order id, …) cannot break out of
+/// its path segment or inject `/`, `?`, or `#` delimiters into the request URL.
+///
+/// Uses `reqwest::Url` (the re-exported `url` crate) path-segment encoding, so it
+/// needs no extra dependency. Every step is fallible-checked and never panics; on
+/// the structurally-impossible failure of the constant base URL it falls back to
+/// the raw segment.
+fn encode_segment(segment: &str) -> String {
+    match reqwest::Url::parse("http://segment.invalid/") {
+        Ok(mut url) => {
+            match url.path_segments_mut() {
+                // `PathSegmentsMut::push` percent-encodes using the PATH segment
+                // set; `pop_if_empty` removes the placeholder empty segment first.
+                Ok(mut path) => {
+                    path.pop_if_empty().push(segment);
+                }
+                Err(()) => return segment.to_string(),
+            }
+            url.path().trim_start_matches('/').to_string()
+        }
+        Err(_) => segment.to_string(),
+    }
+}
+
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -133,7 +158,11 @@ impl OrderbookClient {
     /// # Errors
     /// Returns error if the request fails.
     pub async fn create_underlying(&self, symbol: &str) -> Result<UnderlyingSummary, Error> {
-        let url = format!("{}/api/v1/underlyings/{}", self.base_url, symbol);
+        let url = format!(
+            "{}/api/v1/underlyings/{}",
+            self.base_url,
+            encode_segment(symbol)
+        );
         let resp = self.client.post(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -143,7 +172,11 @@ impl OrderbookClient {
     /// # Errors
     /// Returns error if the request fails.
     pub async fn get_underlying(&self, symbol: &str) -> Result<UnderlyingSummary, Error> {
-        let url = format!("{}/api/v1/underlyings/{}", self.base_url, symbol);
+        let url = format!(
+            "{}/api/v1/underlyings/{}",
+            self.base_url,
+            encode_segment(symbol)
+        );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -153,7 +186,11 @@ impl OrderbookClient {
     /// # Errors
     /// Returns error if the request fails.
     pub async fn delete_underlying(&self, symbol: &str) -> Result<DeleteUnderlyingResponse, Error> {
-        let url = format!("{}/api/v1/underlyings/{}", self.base_url, symbol);
+        let url = format!(
+            "{}/api/v1/underlyings/{}",
+            self.base_url,
+            encode_segment(symbol)
+        );
         let resp = self.client.delete(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -172,7 +209,8 @@ impl OrderbookClient {
     ) -> Result<ExpirationsListResponse, Error> {
         let url = format!(
             "{}/api/v1/underlyings/{}/expirations",
-            self.base_url, underlying
+            self.base_url,
+            encode_segment(underlying)
         );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
@@ -189,7 +227,9 @@ impl OrderbookClient {
     ) -> Result<ExpirationSummary, Error> {
         let url = format!(
             "{}/api/v1/underlyings/{}/expirations/{}",
-            self.base_url, underlying, expiration
+            self.base_url,
+            encode_segment(underlying),
+            encode_segment(expiration)
         );
         let resp = self.client.post(&url).send().await?;
         self.handle_response(resp).await
@@ -206,7 +246,9 @@ impl OrderbookClient {
     ) -> Result<ExpirationSummary, Error> {
         let url = format!(
             "{}/api/v1/underlyings/{}/expirations/{}",
-            self.base_url, underlying, expiration
+            self.base_url,
+            encode_segment(underlying),
+            encode_segment(expiration)
         );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
@@ -227,7 +269,9 @@ impl OrderbookClient {
     ) -> Result<StrikesListResponse, Error> {
         let url = format!(
             "{}/api/v1/underlyings/{}/expirations/{}/strikes",
-            self.base_url, underlying, expiration
+            self.base_url,
+            encode_segment(underlying),
+            encode_segment(expiration)
         );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
@@ -245,7 +289,10 @@ impl OrderbookClient {
     ) -> Result<StrikeSummary, Error> {
         let url = format!(
             "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}",
-            self.base_url, underlying, expiration, strike
+            self.base_url,
+            encode_segment(underlying),
+            encode_segment(expiration),
+            strike
         );
         let resp = self.client.post(&url).send().await?;
         self.handle_response(resp).await
@@ -263,7 +310,10 @@ impl OrderbookClient {
     ) -> Result<StrikeSummary, Error> {
         let url = format!(
             "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}",
-            self.base_url, underlying, expiration, strike
+            self.base_url,
+            encode_segment(underlying),
+            encode_segment(expiration),
+            strike
         );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
@@ -281,10 +331,7 @@ impl OrderbookClient {
         &self,
         path: &OptionPath,
     ) -> Result<OrderBookSnapshotResponse, Error> {
-        let url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style
-        );
+        let url = self.option_base(path);
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -294,10 +341,7 @@ impl OrderbookClient {
     /// # Errors
     /// Returns error if the request fails.
     pub async fn get_option_quote(&self, path: &OptionPath) -> Result<QuoteResponse, Error> {
-        let url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/quote",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style
-        );
+        let url = format!("{}/quote", self.option_base(path));
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -315,10 +359,7 @@ impl OrderbookClient {
         path: &OptionPath,
         request: &AddOrderRequest,
     ) -> Result<AddOrderResponse, Error> {
-        let url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/orders",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style
-        );
+        let url = format!("{}/orders", self.option_base(path));
         let resp = self.client.post(&url).json(request).send().await?;
         self.handle_response(resp).await
     }
@@ -332,10 +373,7 @@ impl OrderbookClient {
         path: &OptionPath,
         request: &MarketOrderRequest,
     ) -> Result<MarketOrderResponse, Error> {
-        let url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/orders/market",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style
-        );
+        let url = format!("{}/orders/market", self.option_base(path));
         let resp = self.client.post(&url).json(request).send().await?;
         self.handle_response(resp).await
     }
@@ -350,8 +388,9 @@ impl OrderbookClient {
         order_id: &str,
     ) -> Result<CancelOrderResponse, Error> {
         let url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/orders/{}",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style, order_id
+            "{}/orders/{}",
+            self.option_base(path),
+            encode_segment(order_id)
         );
         let resp = self.client.delete(&url).send().await?;
         self.handle_response(resp).await
@@ -370,10 +409,7 @@ impl OrderbookClient {
         path: &OptionPath,
         depth: Option<&str>,
     ) -> Result<EnrichedSnapshotResponse, Error> {
-        let mut url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/snapshot",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style
-        );
+        let mut url = format!("{}/snapshot", self.option_base(path));
         if let Some(d) = depth {
             url.push_str(&format!("?depth={}", d));
         }
@@ -445,7 +481,8 @@ impl OrderbookClient {
     pub async fn toggle_instrument(&self, symbol: &str) -> Result<InstrumentToggleResponse, Error> {
         let url = format!(
             "{}/api/v1/controls/instrument/{}/toggle",
-            self.base_url, symbol
+            self.base_url,
+            encode_segment(symbol)
         );
         let resp = self.client.post(&url).send().await?;
         self.handle_response(resp).await
@@ -473,7 +510,7 @@ impl OrderbookClient {
     /// # Errors
     /// Returns error if the request fails.
     pub async fn get_latest_price(&self, symbol: &str) -> Result<LatestPriceResponse, Error> {
-        let url = format!("{}/api/v1/prices/{}", self.base_url, symbol);
+        let url = format!("{}/api/v1/prices/{}", self.base_url, encode_segment(symbol));
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -533,7 +570,11 @@ impl OrderbookClient {
     /// # Errors
     /// Returns error if the request fails.
     pub async fn get_execution(&self, execution_id: &str) -> Result<ExecutionInfo, Error> {
-        let url = format!("{}/api/v1/executions/{}", self.base_url, execution_id);
+        let url = format!(
+            "{}/api/v1/executions/{}",
+            self.base_url,
+            encode_segment(execution_id)
+        );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -566,7 +607,11 @@ impl OrderbookClient {
     /// # Errors
     /// Returns error if the request fails.
     pub async fn get_position(&self, symbol: &str) -> Result<PositionResponse, Error> {
-        let url = format!("{}/api/v1/positions/{}", self.base_url, symbol);
+        let url = format!(
+            "{}/api/v1/positions/{}",
+            self.base_url,
+            encode_segment(symbol)
+        );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -603,7 +648,11 @@ impl OrderbookClient {
         &self,
         snapshot_id: &str,
     ) -> Result<Vec<OrderbookSnapshotInfo>, Error> {
-        let url = format!("{}/api/v1/admin/snapshots/{}", self.base_url, snapshot_id);
+        let url = format!(
+            "{}/api/v1/admin/snapshots/{}",
+            self.base_url,
+            encode_segment(snapshot_id)
+        );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -618,7 +667,8 @@ impl OrderbookClient {
     ) -> Result<RestoreSnapshotResponse, Error> {
         let url = format!(
             "{}/api/v1/admin/snapshots/{}/restore",
-            self.base_url, snapshot_id
+            self.base_url,
+            encode_segment(snapshot_id)
         );
         let resp = self.client.post(&url).send().await?;
         self.handle_response(resp).await
@@ -652,7 +702,11 @@ impl OrderbookClient {
     /// # Errors
     /// Returns error if the request fails.
     pub async fn get_order_status(&self, order_id: &str) -> Result<OrderStatusResponse, Error> {
-        let url = format!("{}/api/v1/orders/{}", self.base_url, order_id);
+        let url = format!(
+            "{}/api/v1/orders/{}",
+            self.base_url,
+            encode_segment(order_id)
+        );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -668,8 +722,9 @@ impl OrderbookClient {
         request: &ModifyOrderRequest,
     ) -> Result<ModifyOrderResponse, Error> {
         let url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/orders/{}",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style, order_id
+            "{}/orders/{}",
+            self.option_base(path),
+            encode_segment(order_id)
         );
         let resp = self.client.patch(&url).json(request).send().await?;
         self.handle_response(resp).await
@@ -729,10 +784,7 @@ impl OrderbookClient {
     /// # Errors
     /// Returns error if the request fails.
     pub async fn get_option_greeks(&self, path: &OptionPath) -> Result<GreeksResponse, Error> {
-        let url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/greeks",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style
-        );
+        let url = format!("{}/greeks", self.option_base(path));
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -746,10 +798,7 @@ impl OrderbookClient {
     /// # Errors
     /// Returns error if the request fails.
     pub async fn get_last_trade(&self, path: &OptionPath) -> Result<LastTradeResponse, Error> {
-        let url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/last-trade",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style
-        );
+        let url = format!("{}/last-trade", self.option_base(path));
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -767,10 +816,7 @@ impl OrderbookClient {
         path: &OptionPath,
         query: Option<&OhlcQuery>,
     ) -> Result<OhlcResponse, Error> {
-        let mut url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/ohlc",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style
-        );
+        let mut url = format!("{}/ohlc", self.option_base(path));
         if let Some(q) = query {
             let params = serde_urlencoded::to_string(q).unwrap_or_default();
             if !params.is_empty() {
@@ -793,10 +839,7 @@ impl OrderbookClient {
         &self,
         path: &OptionPath,
     ) -> Result<OrderbookMetricsResponse, Error> {
-        let url = format!(
-            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}/metrics",
-            self.base_url, path.underlying, path.expiration, path.strike, path.style
-        );
+        let url = format!("{}/metrics", self.option_base(path));
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
     }
@@ -815,7 +858,8 @@ impl OrderbookClient {
     ) -> Result<VolatilitySurfaceResponse, Error> {
         let url = format!(
             "{}/api/v1/underlyings/{}/volatility-surface",
-            self.base_url, underlying
+            self.base_url,
+            encode_segment(underlying)
         );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
@@ -836,7 +880,9 @@ impl OrderbookClient {
     ) -> Result<OptionChainResponse, Error> {
         let url = format!(
             "{}/api/v1/underlyings/{}/expirations/{}/chain",
-            self.base_url, underlying, expiration
+            self.base_url,
+            encode_segment(underlying),
+            encode_segment(expiration)
         );
         let resp = self.client.get(&url).send().await?;
         self.handle_response(resp).await
@@ -865,6 +911,19 @@ impl OrderbookClient {
     // ========================================================================
     // Internal Helpers
     // ========================================================================
+
+    /// Builds the `.../options/{style}` URL prefix for an option, percent-encoding
+    /// every dynamic segment so a reserved character cannot alter the path.
+    fn option_base(&self, path: &OptionPath) -> String {
+        format!(
+            "{}/api/v1/underlyings/{}/expirations/{}/strikes/{}/options/{}",
+            self.base_url,
+            encode_segment(&path.underlying),
+            encode_segment(&path.expiration),
+            path.strike,
+            encode_segment(&path.style),
+        )
+    }
 
     async fn handle_response<T: serde::de::DeserializeOwned>(
         &self,

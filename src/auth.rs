@@ -163,6 +163,11 @@ impl RateLimiter {
     /// request is rejected so the map can never grow without bound.
     pub fn check_and_record_status(&self, key: &str, limit: u32) -> RateLimitDecision {
         let now = now_millis();
+        // `now` is Unix time in milliseconds, so it is structurally far greater
+        // than `RATE_LIMIT_WINDOW_MS` (60_000) at any real wall-clock time; the
+        // subtraction cannot underflow. `saturating_sub` is a defensive floor at
+        // 0 for the degenerate pre-1970 clock only (which would make the whole
+        // window count as in-range) — not a silent wrap of a rate-limit counter.
         let window_start = now.saturating_sub(RATE_LIMIT_WINDOW_MS);
 
         // Fast path: the key already has a bucket. `get_mut` holds the shard lock
@@ -244,6 +249,9 @@ impl RateLimiter {
     /// hold any guard across an `.await`.
     pub fn sweep_expired(&self) -> usize {
         let now = now_millis();
+        // See `check_and_record_status`: `now` (Unix ms) is structurally >
+        // `RATE_LIMIT_WINDOW_MS`, so this floor at 0 is a defensive guard for a
+        // pre-1970 clock, not a wrap of a protocol counter.
         let window_start = now.saturating_sub(RATE_LIMIT_WINDOW_MS);
         let before = self.windows.len();
         self.windows.retain(|_key, window| {

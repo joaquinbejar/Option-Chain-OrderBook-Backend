@@ -49,19 +49,19 @@ fn test_rate_limit_error_response_serialization() {
 #[test]
 fn test_api_error_underlying_not_found_display() {
     let error = ApiError::UnderlyingNotFound("AAPL".to_string());
-    assert_eq!(format!("{}", error), "Underlying not found: AAPL");
+    assert_eq!(format!("{}", error), "underlying not found: AAPL");
 }
 
 #[test]
 fn test_api_error_expiration_not_found_display() {
     let error = ApiError::ExpirationNotFound("20240315".to_string());
-    assert_eq!(format!("{}", error), "Expiration not found: 20240315");
+    assert_eq!(format!("{}", error), "expiration not found: 20240315");
 }
 
 #[test]
 fn test_api_error_strike_not_found_display() {
     let error = ApiError::StrikeNotFound(15000);
-    assert_eq!(format!("{}", error), "Strike not found: 15000");
+    assert_eq!(format!("{}", error), "strike not found: 15000");
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn test_api_error_invalid_request_display() {
     let error = ApiError::InvalidRequest("Missing required field".to_string());
     assert_eq!(
         format!("{}", error),
-        "Invalid request: Missing required field"
+        "invalid request: Missing required field"
     );
 }
 
@@ -78,26 +78,26 @@ fn test_api_error_internal_display() {
     let error = ApiError::Internal("Database connection failed".to_string());
     assert_eq!(
         format!("{}", error),
-        "Internal server error: Database connection failed"
+        "internal server error: Database connection failed"
     );
 }
 
 #[test]
 fn test_api_error_orderbook_display() {
     let error = ApiError::OrderBook("Order not found".to_string());
-    assert_eq!(format!("{}", error), "OrderBook error: Order not found");
+    assert_eq!(format!("{}", error), "orderbook error: Order not found");
 }
 
 #[test]
 fn test_api_error_database_display() {
     let error = ApiError::Database("Connection timeout".to_string());
-    assert_eq!(format!("{}", error), "Database error: Connection timeout");
+    assert_eq!(format!("{}", error), "database error: Connection timeout");
 }
 
 #[test]
 fn test_api_error_not_found_display() {
     let error = ApiError::NotFound("Resource does not exist".to_string());
-    assert_eq!(format!("{}", error), "Not found: Resource does not exist");
+    assert_eq!(format!("{}", error), "not found: Resource does not exist");
 }
 
 #[test]
@@ -108,7 +108,7 @@ fn test_api_error_rate_limit_exceeded_display() {
         reset: 1704067260,
         retry_after: 60,
     };
-    assert_eq!(format!("{}", error), "Rate limit exceeded");
+    assert_eq!(format!("{}", error), "rate limit exceeded");
 }
 
 // ============================================================================
@@ -264,13 +264,13 @@ fn test_api_error_forbidden_into_response() {
 #[test]
 fn test_api_error_unauthorized_display() {
     let error = ApiError::Unauthorized("missing token".to_string());
-    assert_eq!(format!("{}", error), "Unauthorized: missing token");
+    assert_eq!(format!("{}", error), "unauthorized: missing token");
 }
 
 #[test]
 fn test_api_error_forbidden_display() {
     let error = ApiError::Forbidden("requires admin".to_string());
-    assert_eq!(format!("{}", error), "Forbidden: requires admin");
+    assert_eq!(format!("{}", error), "forbidden: requires admin");
 }
 
 #[test]

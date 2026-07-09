@@ -69,6 +69,20 @@ The API follows the hierarchical structure of the Option Chain OrderBook library
                                 └── /options/{style}   → OptionOrderBook
 ```
 
+### Money and analytic values
+
+Settled monetary amounts cross every DTO and DB boundary as integer **cents**
+(`u64` / `u128` / `i64`), never `f64`: raw order/fill/quote/strike prices are
+always cents. A small, explicit set of fields is exempt from this rule because
+they are **derived analytic floats** — computed statistics for display and
+analytics, not amounts that are ever settled or stored as money. These are
+documented on their DTOs: `MarketOrderResponse::average_price` (VWAP of the
+fills), and every price-derived field on `SnapshotStats`, `PriceMetrics`, and
+`ImpactMetrics` (mid / micro / VWAP prices, spread and slippage in basis
+points, imbalance). Greeks, implied volatility, and other option analytics are
+likewise `f64`. The underlying settled prices they are computed from remain
+integer cents.
+
 ### Module Structure
 
 | Module | Description |
@@ -243,8 +257,8 @@ cargo run
 # With custom host/port
 HOST=127.0.0.1 PORT=3000 cargo run
 
-# With configuration file
-cargo run -- --config config.toml
+# With a specific configuration file (defaults to ./config.toml)
+CONFIG_PATH=config.toml cargo run
 
 # Release build
 cargo build --release

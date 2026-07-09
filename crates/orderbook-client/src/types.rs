@@ -24,6 +24,26 @@ impl std::fmt::Display for OrderSide {
     }
 }
 
+/// Option style (call or put). Mirrors the server `OptionStyle`; serialized as
+/// lowercase (`"call"` / `"put"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OptionStyle {
+    /// Call option.
+    Call,
+    /// Put option.
+    Put,
+}
+
+impl std::fmt::Display for OptionStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Call => write!(f, "call"),
+            Self::Put => write!(f, "put"),
+        }
+    }
+}
+
 /// Market order execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -985,8 +1005,8 @@ pub struct BulkOrderItem {
     pub expiration: String,
     /// Strike price.
     pub strike: u64,
-    /// Option style: "call" or "put".
-    pub style: String,
+    /// Option style (call or put).
+    pub style: OptionStyle,
     /// Order side.
     pub side: OrderSide,
     /// Limit price in cents.

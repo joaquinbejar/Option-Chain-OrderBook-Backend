@@ -20,10 +20,6 @@ pub enum Error {
     #[error("WebSocket error: {0}")]
     WebSocket(#[from] Box<tokio_tungstenite::tungstenite::Error>),
 
-    /// Invalid URL.
-    #[error("Invalid URL: {0}")]
-    InvalidUrl(#[from] url::ParseError),
-
     /// API returned an error response.
     #[error("API error ({status}): {message}")]
     Api {

@@ -39,12 +39,13 @@ use option_chain_orderbook_backend::models::{
     HealthResponse, ImpactMetrics, LastTradeResponse, MarketImpactMetrics, MarketOrderRequest,
     MarketOrderResponse, MarketOrderStatus, ModifyOrderRequest, ModifyOrderResponse,
     ModifyOrderStatus, OhlcBar, OhlcInterval, OhlcResponse, OptionChainResponse, OptionQuoteData,
-    OrderBookSnapshotResponse, OrderFillInfo, OrderListResponse, OrderSide, OrderStatus,
-    OrderStatusResponse, OrderTimeInForce, OrderbookMetricsResponse, OrderbookSnapshotInfo,
-    PositionResponse, PositionSummary, PositionsListResponse, PriceLevelInfo, PriceMetrics,
-    QuoteResponse, RestoreSnapshotResponse, SnapshotStats, SnapshotSummary, SnapshotsListResponse,
-    SpreadMetrics, StrikeIV, StrikeSummary, StrikesListResponse, TokenRequest, TokenResponse,
-    UnderlyingSummary, UnderlyingsListResponse, VolatilitySurfaceResponse,
+    OptionStyle, OrderBookSnapshotResponse, OrderFillInfo, OrderListResponse, OrderSide,
+    OrderStatus, OrderStatusResponse, OrderTimeInForce, OrderbookMetricsResponse,
+    OrderbookSnapshotInfo, PositionResponse, PositionSummary, PositionsListResponse,
+    PriceLevelInfo, PriceMetrics, QuoteResponse, RestoreSnapshotResponse, SnapshotStats,
+    SnapshotSummary, SnapshotsListResponse, SpreadMetrics, StrikeIV, StrikeSummary,
+    StrikesListResponse, TokenRequest, TokenResponse, UnderlyingSummary, UnderlyingsListResponse,
+    VolatilitySurfaceResponse,
 };
 
 /// Interval between background sweeps of expired rate-limit window buckets
@@ -166,6 +167,7 @@ impl utoipa::Modify for SecurityAddon {
             MarketOrderStatus,
             FillInfo,
             OrderSide,
+            OptionStyle,
             ModifyOrderRequest,
             ModifyOrderResponse,
             ModifyOrderStatus,

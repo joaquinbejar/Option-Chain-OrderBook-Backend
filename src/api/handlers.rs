@@ -117,10 +117,12 @@ fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
     {
         use chrono::{NaiveDate, Utc};
         if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
-            // 16:00:00 is a compile-time literal time-of-day that is always valid.
-            let datetime = date
-                .and_hms_opt(16, 0, 0)
-                .expect("16:00:00 is a valid time-of-day constant");
+            // 16:00:00 is a compile-time literal time-of-day that is always valid;
+            // surface the structurally-unreachable `None` as a typed error rather
+            // than an `.expect()`, so no panic path exists on inbound request data.
+            let datetime = date.and_hms_opt(16, 0, 0).ok_or_else(|| {
+                ApiError::Internal("failed to construct expiration time-of-day".to_string())
+            })?;
             let utc_datetime = chrono::DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc);
             return Ok(ExpirationDate::DateTime(utc_datetime));
         }
@@ -777,6 +779,7 @@ pub async fn list_underlyings(State(state): State<Arc<AppState>>) -> Json<Underl
     ),
     tag = "Underlyings"
 )]
+#[tracing::instrument(skip_all, fields(underlying = %underlying))]
 pub async fn create_underlying(
     State(state): State<Arc<AppState>>,
     Path(underlying): Path<String>,
@@ -834,6 +837,7 @@ pub async fn get_underlying(
     ),
     tag = "Underlyings"
 )]
+#[tracing::instrument(skip_all, fields(underlying = %underlying))]
 pub async fn delete_underlying(
     State(state): State<Arc<AppState>>,
     Path(underlying): Path<String>,
@@ -1544,6 +1548,10 @@ pub async fn get_strike(
     ),
     tag = "Options"
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style)
+)]
 pub async fn get_option_book(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
@@ -1597,6 +1605,10 @@ pub async fn get_option_book(
         (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Options"
+)]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style)
 )]
 pub async fn add_order(
     State(state): State<Arc<AppState>>,
@@ -1800,6 +1812,10 @@ pub async fn add_order(
     ),
     tag = "Options"
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style, order_id = %order_id_str)
+)]
 pub async fn cancel_order(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str, strike, style, order_id_str)): Path<(
@@ -1892,6 +1908,10 @@ pub async fn cancel_order(
     ),
     tag = "Options"
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style, order_id = %order_id_str)
+)]
 pub async fn modify_order(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str, strike, style, order_id_str)): Path<(
@@ -1949,6 +1969,21 @@ pub async fn modify_order(
     // Determine new values
     let new_price = body.price.unwrap_or(current_price.as_u128());
     let new_quantity = body.quantity.unwrap_or(current_quantity.as_u64());
+
+    // Validate the resolved values BEFORE touching the book. modify is a
+    // cancel-and-replace, so it destroys the resting order first; rejecting a
+    // zero price or quantity here (400) preserves the existing order instead of
+    // cancelling it and then failing to place an invalid replacement.
+    if new_price == 0 {
+        return Err(ApiError::InvalidRequest(
+            "new price must be greater than zero".to_string(),
+        ));
+    }
+    if new_quantity == 0 {
+        return Err(ApiError::InvalidRequest(
+            "new quantity must be greater than zero".to_string(),
+        ));
+    }
 
     // Cancel the existing order
     let canceled = option_book
@@ -2074,6 +2109,10 @@ pub async fn modify_order(
     ),
     tag = "Options"
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style)
+)]
 pub async fn get_option_quote(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
@@ -2124,6 +2163,10 @@ pub async fn get_option_quote(
     ),
     tag = "Greeks"
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style)
+)]
 pub async fn get_option_greeks(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
@@ -2143,9 +2186,15 @@ pub async fn get_option_greeks(
     let expiration = find_expiration_by_str(&underlying_book, &exp_str)
         .ok_or_else(|| ApiError::ExpirationNotFound(exp_str.clone()))?;
 
-    let _exp_book = underlying_book
+    let exp_book = underlying_book
         .get_expiration(&expiration)
         .map_err(|_| ApiError::ExpirationNotFound(exp_str.clone()))?;
+
+    // Verify the strike actually exists: a request for a non-existent strike must
+    // return 404, not a greeks payload synthesized from the raw path values.
+    let _strike_book = exp_book
+        .get_strike(strike)
+        .map_err(|_| ApiError::StrikeNotFound(strike))?;
 
     // Build symbol
     let style_char = match option_style {
@@ -2165,12 +2214,20 @@ pub async fn get_option_greeks(
     let iv = 0.30;
     let risk_free_rate = 0.05;
 
-    // Calculate time to expiry in years
+    // Calculate time to expiry in days, floored at 1: an at/expired option (the
+    // config-provisioned books can carry a past date) would otherwise give zero
+    // time-to-expiry, which `optionstratlib` rejects. Greeks are then computed
+    // against this clamped, days-based expiration so a valid book always yields a
+    // finite result and only a genuine numerical failure surfaces as an error.
     let now = chrono::Utc::now();
     let expiry_date = expiration
         .get_date()
         .map_err(|_| ApiError::InvalidRequest("Failed to parse expiration date".to_string()))?;
-    let _days_to_expiry = (expiry_date - now).num_days().max(1) as f64;
+    let days_to_expiry = (expiry_date - now).num_days().max(1) as f64;
+    let greeks_expiration = ExpirationDate::Days(
+        Positive::new(days_to_expiry)
+            .map_err(|_| ApiError::InvalidRequest("invalid time to expiry".to_string()))?,
+    );
 
     // Create Options struct for Greeks calculation
     let option_type = match option_style {
@@ -2203,7 +2260,7 @@ pub async fn get_option_greeks(
         side,
         underlying.clone(),
         strike_pos,
-        expiration,
+        greeks_expiration,
         iv_pos,
         quantity_pos,
         spot_pos,
@@ -2213,31 +2270,30 @@ pub async fn get_option_greeks(
         None, // exotic_params
     );
 
-    // Calculate Greeks
-    let greeks_result = option.greeks();
+    // Calculate Greeks. On a pricing failure return a typed 500 (and log a WARN)
+    // rather than silently returning a zero-filled greeks payload, which would
+    // look like a legitimate all-zero result to the caller.
+    use rust_decimal::prelude::ToPrimitive;
+    let greek = option.greeks().map_err(|e| {
+        tracing::warn!(symbol = %symbol, error = ?e, "greeks computation failed");
+        ApiError::Internal("failed to compute greeks".to_string())
+    })?;
     let theoretical_value = option.calculate_price_black_scholes().unwrap_or_default();
 
-    let greeks_data = match greeks_result {
-        Ok(greek) => {
-            use rust_decimal::prelude::ToPrimitive;
-            GreeksData {
-                delta: greek.delta.to_f64().unwrap_or(0.0),
-                gamma: greek.gamma.to_f64().unwrap_or(0.0),
-                theta: greek.theta.to_f64().unwrap_or(0.0),
-                vega: greek.vega.to_f64().unwrap_or(0.0),
-                rho: greek.rho.to_f64().unwrap_or(0.0),
-                vanna: Some(greek.vanna.to_f64().unwrap_or(0.0)),
-                vomma: Some(greek.vomma.to_f64().unwrap_or(0.0)),
-                charm: Some(greek.charm.to_f64().unwrap_or(0.0)),
-                color: Some(greek.color.to_f64().unwrap_or(0.0)),
-            }
-        }
-        Err(_) => GreeksData::default(),
+    let greeks_data = GreeksData {
+        delta: greek.delta.to_f64().unwrap_or(0.0),
+        gamma: greek.gamma.to_f64().unwrap_or(0.0),
+        theta: greek.theta.to_f64().unwrap_or(0.0),
+        vega: greek.vega.to_f64().unwrap_or(0.0),
+        rho: greek.rho.to_f64().unwrap_or(0.0),
+        vanna: Some(greek.vanna.to_f64().unwrap_or(0.0)),
+        vomma: Some(greek.vomma.to_f64().unwrap_or(0.0)),
+        charm: Some(greek.charm.to_f64().unwrap_or(0.0)),
+        color: Some(greek.color.to_f64().unwrap_or(0.0)),
     };
 
     let timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
 
-    use rust_decimal::prelude::ToPrimitive;
     Ok(Json(GreeksResponse {
         symbol,
         greeks: greeks_data,
@@ -2270,6 +2326,10 @@ pub async fn get_option_greeks(
         (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Options"
+)]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style)
 )]
 pub async fn get_option_snapshot(
     State(state): State<Arc<AppState>>,
@@ -2383,6 +2443,10 @@ pub async fn get_option_snapshot(
         (status = 404, description = "Resource not found", body = ErrorResponse)
     ),
     tag = "Metrics"
+)]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style)
 )]
 pub async fn get_orderbook_metrics(
     State(state): State<Arc<AppState>>,
@@ -2516,6 +2580,10 @@ pub async fn get_orderbook_metrics(
     ),
     tag = "Options"
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style)
+)]
 pub async fn submit_market_order(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
@@ -2629,6 +2697,10 @@ pub async fn submit_market_order(
     ),
     tag = "Options"
 )]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style)
+)]
 pub async fn get_last_trade(
     State(state): State<Arc<AppState>>,
     Path((underlying, exp_str, strike, style)): Path<(String, String, u64, String)>,
@@ -2679,6 +2751,10 @@ pub async fn get_last_trade(
         (status = 404, description = "Not found", body = ErrorResponse)
     ),
     tag = "Options"
+)]
+#[tracing::instrument(
+    skip_all,
+    fields(underlying = %underlying, expiration = %exp_str, strike = strike, style = %style)
 )]
 pub async fn get_ohlc(
     State(state): State<Arc<AppState>>,
@@ -2875,19 +2951,14 @@ fn submit_single_order(
     state: &Arc<AppState>,
     item: &BulkOrderItem,
 ) -> Result<AcceptedBulkOrder, String> {
-    // Parse option style
-    let option_style = match item.style.to_lowercase().as_str() {
-        "call" => OptionStyle::Call,
-        "put" => OptionStyle::Put,
-        _ => return Err(format!("Invalid option style: {}", item.style)),
+    // Translate the typed DTO enums to the upstream newtypes. Invalid style/side
+    // values are already rejected during request deserialization (400), so no
+    // handler-side string matching is needed here.
+    let option_style = match item.style {
+        crate::models::OptionStyle::Call => OptionStyle::Call,
+        crate::models::OptionStyle::Put => OptionStyle::Put,
     };
-
-    // Parse side
-    let side = match item.side.to_lowercase().as_str() {
-        "buy" => Side::Buy,
-        "sell" => Side::Sell,
-        _ => return Err(format!("Invalid side: {}", item.side)),
-    };
+    let side = order_side_to_side(item.side);
 
     // Get or create underlying
     let underlying_book = state.manager.get_or_create(&item.underlying);
@@ -2984,7 +3055,7 @@ fn submit_single_order(
         underlying: item.underlying.clone(),
         expiration: item.expiration.clone(),
         strike: item.strike,
-        style: item.style.clone(),
+        style: item.style.to_string(),
         side: order_side,
         price: item.price,
         original_quantity: item.quantity,
@@ -3021,10 +3092,9 @@ fn cancel_bulk_item_order(
     item: &BulkOrderItem,
     order_id: OrderId,
 ) -> Result<bool, String> {
-    let option_style = match item.style.to_lowercase().as_str() {
-        "call" => OptionStyle::Call,
-        "put" => OptionStyle::Put,
-        _ => return Err(format!("invalid option style: {}", item.style)),
+    let option_style = match item.style {
+        crate::models::OptionStyle::Call => OptionStyle::Call,
+        crate::models::OptionStyle::Put => OptionStyle::Put,
     };
 
     let underlying_book = state
@@ -5553,8 +5623,8 @@ mod tests {
             underlying: underlying.to_string(),
             expiration: exp.clone(),
             strike,
-            style: "call".to_string(),
-            side: "buy".to_string(),
+            style: crate::models::OptionStyle::Call,
+            side: OrderSide::Buy,
             price: 150,
             quantity: 10,
         };
@@ -7294,8 +7364,8 @@ mod tests {
             underlying: underlying.to_string(),
             expiration: exp.to_string(),
             strike,
-            style: "call".to_string(),
-            side: "buy".to_string(),
+            style: crate::models::OptionStyle::Call,
+            side: OrderSide::Buy,
             price: 100,
             quantity: 10,
         }
@@ -7480,8 +7550,8 @@ mod tests {
             underlying: underlying.to_string(),
             expiration: exp.clone(),
             strike,
-            style: "call".to_string(),
-            side: "buy".to_string(),
+            style: crate::models::OptionStyle::Call,
+            side: OrderSide::Buy,
             price: 150,
             quantity: 10,
         };

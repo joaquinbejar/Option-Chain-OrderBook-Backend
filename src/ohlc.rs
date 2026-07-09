@@ -10,6 +10,17 @@ use std::collections::BTreeMap;
 /// Key for storing OHLC bars: (symbol, interval).
 type BarKey = (String, OhlcInterval);
 
+/// Maximum number of bars retained per `(symbol, interval)` series.
+///
+/// Bounds in-memory OHLC storage against an unbounded trade stream: once a
+/// series exceeds this many bars, the oldest bars are evicted in
+/// [`OhlcAggregator::update_bar`] (issue #88, mirroring the #58 eviction
+/// pattern). The store keeps the NEWEST [`MAX_BARS_PER_SERIES`] bars per series.
+/// At the 1-minute interval this is ~34 hours of history; at 1-day it is over
+/// five years — comfortably beyond any charting window the API serves (the
+/// `get_bars` `limit` is applied on top of the retained set).
+const MAX_BARS_PER_SERIES: usize = 2_048;
+
 /// OHLC aggregator that collects trades and produces candlestick bars.
 ///
 /// Bars are stored in memory, keyed by symbol and interval.
@@ -67,12 +78,22 @@ impl OhlcAggregator {
         let bar_timestamp = interval.floor_timestamp(timestamp_secs);
         let key = (symbol.to_string(), interval);
 
-        self.bars
-            .entry(key)
-            .or_default()
+        let mut series = self.bars.entry(key).or_default();
+        series
             .entry(bar_timestamp)
             .and_modify(|bar| bar.update(price, quantity))
             .or_insert_with(|| OhlcBar::new(bar_timestamp, price, quantity));
+
+        // Enforce the per-series retention cap: drop the oldest bars beyond
+        // MAX_BARS_PER_SERIES so an unbounded trade stream cannot grow a single
+        // series without limit. The BTreeMap is keyed by timestamp, so
+        // `pop_first` removes the oldest bar. Updating an existing (in-range) bar
+        // never grows the map, so at most one bar is evicted per new bar.
+        while series.len() > MAX_BARS_PER_SERIES {
+            if series.pop_first().is_none() {
+                break;
+            }
+        }
     }
 
     /// Gets OHLC bars for a symbol and interval within a time range.
@@ -118,15 +139,22 @@ impl OhlcAggregator {
         let to_ts = to.unwrap_or(u64::MAX);
         let range = bars_map.range(from_ts..=to_ts);
 
+        // The result is at most `limit` bars and never more than the series holds;
+        // pre-size to that known upper bound to avoid reallocation while filling.
+        let capacity = limit.min(bars_map.len());
+
         if to.is_none() {
             // Open-ended: take the newest `limit` bars from the end of the range,
             // then restore ascending (oldest-first) order for the returned Vec.
-            let mut bars: Vec<OhlcBar> = range.rev().take(limit).map(|(_, bar)| *bar).collect();
+            let mut bars: Vec<OhlcBar> = Vec::with_capacity(capacity);
+            bars.extend(range.rev().take(limit).map(|(_, bar)| *bar));
             bars.reverse();
             bars
         } else {
             // Explicit end: the window ends at `to`; keep the oldest `limit` bars.
-            range.take(limit).map(|(_, bar)| *bar).collect()
+            let mut bars: Vec<OhlcBar> = Vec::with_capacity(capacity);
+            bars.extend(range.take(limit).map(|(_, bar)| *bar));
+            bars
         }
     }
 
@@ -377,6 +405,50 @@ mod tests {
         assert_eq!(bars[0].timestamp, base_secs, "oldest first");
         assert_eq!(bars[4].timestamp, base_secs + 4 * 60, "newest last");
         assert!(bars.windows(2).all(|w| w[0].timestamp < w[1].timestamp));
+    }
+
+    #[test]
+    fn test_update_bar_evicts_oldest_beyond_cap() {
+        // Issue #88: a per-(symbol, interval) series is bounded by
+        // MAX_BARS_PER_SERIES; the oldest bars are evicted so the store keeps the
+        // NEWEST cap bars and cannot grow without limit.
+        let aggregator = OhlcAggregator::new();
+        let symbol = "CAP-TEST";
+        let base_ts_ms: u64 = 1_704_067_200_000; // minute boundary
+        let total = (MAX_BARS_PER_SERIES + 50) as u64;
+
+        // One trade per distinct minute -> one new 1m bar per trade.
+        for i in 0..total {
+            aggregator.record_trade(symbol, base_ts_ms + i * 60_000, 500 + i as u128, 1);
+        }
+
+        assert_eq!(
+            aggregator.bar_count(symbol, OhlcInterval::OneMinute),
+            MAX_BARS_PER_SERIES,
+            "1m series is bounded by the retention cap"
+        );
+
+        // The retained window is the NEWEST cap bars: the oldest surviving bar is
+        // `total - cap` minutes after the base; the latest bar is still present.
+        let base_secs = base_ts_ms / 1000;
+        let bars = aggregator.get_bars(
+            symbol,
+            OhlcInterval::OneMinute,
+            None,
+            None,
+            MAX_BARS_PER_SERIES,
+        );
+        assert_eq!(bars.len(), MAX_BARS_PER_SERIES);
+        let expected_oldest = base_secs + (total - MAX_BARS_PER_SERIES as u64) * 60;
+        assert_eq!(
+            bars[0].timestamp, expected_oldest,
+            "oldest bars beyond the cap are evicted"
+        );
+        assert_eq!(
+            bars[bars.len() - 1].timestamp,
+            base_secs + (total - 1) * 60,
+            "the newest bar is retained"
+        );
     }
 
     #[test]

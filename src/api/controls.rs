@@ -287,6 +287,7 @@ pub async fn update_parameters(
     ),
     tag = "Controls"
 )]
+#[tracing::instrument(skip_all, fields(symbol = %symbol))]
 pub async fn toggle_instrument(
     State(state): State<Arc<AppState>>,
     Path(symbol): Path<String>,
@@ -410,6 +411,7 @@ fn cents_to_i64(field: &str, cents: u64) -> Result<i64, ApiError> {
     ),
     tag = "Prices"
 )]
+#[tracing::instrument(skip_all, fields(symbol = %body.symbol))]
 pub async fn insert_price(
     State(state): State<Arc<AppState>>,
     Json(body): Json<InsertPriceRequest>,
@@ -439,9 +441,14 @@ pub async fn insert_price(
         "price inserted"
     );
 
-    // ...then persist the same validated values so memory and DB agree.
+    // ...then persist the same validated values as a best-effort durability
+    // record. The in-memory market maker is authoritative for live prices (the DB
+    // is optional and the server runs fully in-memory when `DATABASE_URL` is
+    // unset), so a persistence failure is logged as a WARN and does NOT fail the
+    // request — otherwise a transient DB error would reject an insert whose
+    // in-memory effect already succeeded, diverging the response from reality.
     if let Some(ref db) = state.db {
-        sqlx::query(
+        let write = sqlx::query(
             r#"
             INSERT INTO underlying_prices (symbol, price_cents, bid_cents, ask_cents, volume, timestamp, source)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -455,8 +462,15 @@ pub async fn insert_price(
         .bind(timestamp)
         .bind(&body.source)
         .execute(db.pool())
-        .await
-        .map_err(|e| ApiError::Database(e.to_string()))?;
+        .await;
+
+        if let Err(e) = write {
+            tracing::warn!(
+                symbol = %body.symbol,
+                error = %e,
+                "failed to persist inserted price; in-memory update is authoritative and was kept"
+            );
+        }
     }
 
     Ok(Json(InsertPriceResponse {
@@ -480,6 +494,7 @@ pub async fn insert_price(
     ),
     tag = "Prices"
 )]
+#[tracing::instrument(skip_all, fields(symbol = %symbol))]
 pub async fn get_latest_price(
     State(state): State<Arc<AppState>>,
     Path(symbol): Path<String>,
