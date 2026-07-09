@@ -333,9 +333,10 @@ fn test_update_parameters_request_serialization() {
     };
 
     let json = serde_json::to_string(&request).unwrap();
-    assert!(json.contains("\"spreadMultiplier\":1.5"));
-    assert!(json.contains("\"sizeScalar\":2.0"));
-    assert!(!json.contains("directionalSkew"));
+    // snake_case on the wire, matching the rest of the API surface (issue #81).
+    assert!(json.contains("\"spread_multiplier\":1.5"));
+    assert!(json.contains("\"size_scalar\":2.0"));
+    assert!(!json.contains("directional_skew"));
 }
 
 // ============================================================================
