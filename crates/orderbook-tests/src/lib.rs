@@ -263,6 +263,34 @@ pub async fn admin_client() -> Result<OrderbookClient, Error> {
     client_with_token(obtain_token_slot(vec![Permission::Admin], slot).await?)
 }
 
+/// Serializes tests that touch GLOBAL market-maker control state.
+///
+/// The control endpoints (`/api/v1/controls/*`) act on process-global server
+/// state: the master kill switch and the shared quoting parameters
+/// (`spread_multiplier` / `size_scalar` / `directional_skew`). Within a single
+/// test binary `cargo test` runs the test functions concurrently on a thread
+/// pool, so two control tests can otherwise interleave a read between another
+/// test's write and its restore, or clobber each other's restore. Every test
+/// that mutates (or reads-under-mutation) global controls acquires this lock for
+/// the WHOLE test body:
+///
+/// ```ignore
+/// let _guard = control_lock().lock().await;
+/// ```
+///
+/// This is an IN-PROCESS async lock, so it only serializes tests *within one
+/// test binary*. That is sufficient because `cargo test` runs the test binaries
+/// themselves sequentially by default (it parallelizes test functions inside a
+/// binary, not the binaries against one another), so no two binaries exercise the
+/// control endpoints at the same time. If that default ever changes (e.g.
+/// `cargo nextest` running binaries in parallel), this lock would need to become
+/// a cross-process guard (e.g. a file lock on the target server).
+#[must_use]
+pub fn control_lock() -> &'static tokio::sync::Mutex<()> {
+    static CONTROL_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    CONTROL_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Generates a unique test symbol to avoid conflicts between tests.
 #[must_use]
 pub fn unique_symbol(prefix: &str) -> String {

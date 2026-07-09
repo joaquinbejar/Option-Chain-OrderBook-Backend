@@ -63,7 +63,62 @@ docker compose --profile test up
   `TEST_EXPIRATION` and read/modify/cancel with the formatted value.
 - **Global controls.** Tests that mutate global market-maker parameters or the
   kill switch restore the initial values before returning; the config-provisioned
-  `BTC`/`ETH`/`GOLD` books' controls are never left mutated.
+  `BTC`/`ETH`/`GOLD` books' controls are never left mutated. See
+  [Isolation & cleanup](#isolation--cleanup) for the mechanics.
+
+## Isolation & cleanup
+
+Two conventions keep the suite deterministic against a shared, stateful server —
+both are enforced by the tests themselves, not by the test runner.
+
+### The control lock
+
+The `/api/v1/controls/*` endpoints act on **process-global** server state (the
+master kill switch and the shared quoting parameters). Within a single test
+binary `cargo test` runs the test functions concurrently on a thread pool, so two
+control tests could otherwise interleave a read between another test's write and
+its restore, or clobber each other's restore.
+
+Every test that mutates (or reads under mutation of) global controls acquires the
+shared `control_lock()` — a process-wide `tokio::sync::Mutex<()>` defined in
+`src/lib.rs` — for the whole test body:
+
+```rust
+let _guard = control_lock().lock().await;
+```
+
+This is an **in-process** lock, so it only serializes tests *within one test
+binary*. That is sufficient because `cargo test` runs the test binaries
+themselves sequentially by default (it parallelizes test functions inside a
+binary, not the binaries against one another), so no two binaries touch the
+control endpoints at the same time. If that default ever changes (e.g.
+`cargo nextest` running binaries in parallel), the lock would need to become a
+cross-process guard.
+
+### Capture-then-assert (panic-safe cleanup/restore)
+
+Every test that (a) creates an underlying or (b) mutates global controls must
+still delete the underlying / restore the state **even if an assertion fails
+mid-test**. A panicking `assert!` would otherwise skip a trailing cleanup call and
+leak state into the next test.
+
+Because there is no dependency-free way to run cleanup on a future's panic
+(`catch_unwind` needs `UnwindSafe` futures and would add a dependency), the tests
+use the **capture-then-assert** pattern instead:
+
+1. **Phase 1 — act.** Perform every request, capturing each outcome into a plain
+   variable (a `Result`), with *no assertions interleaved*. Requests that depend
+   on an earlier one thread the value through `Option`/`Result` (e.g. a cancel
+   only runs if the placement returned an id).
+2. **Phase 2 — clean up.** Run `cleanup_underlying(...)` and/or the control
+   restore. These are best-effort and never assert.
+3. **Phase 3 — assert.** Unwrap the captured values and assert on them.
+
+Because cleanup runs before any assertion, a failed assertion in phase 3 still
+leaves the server clean. Restores use the endpoints' absolute-set semantics
+(`enable_quoting` / `kill_switch` set the master state outright; a parameter POST
+sets the values outright), so a single unconditional call restores the initial
+state even if a phase-1 mutation failed part-way.
 
 ## Test coverage
 

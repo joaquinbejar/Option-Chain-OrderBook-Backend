@@ -5,14 +5,20 @@
 //! the `last-trade` and `ohlc` stores are keyed by the raw request path, so those
 //! use [`TEST_EXPIRATION`] (see the crate docs for bug #110). Greeks require a
 //! priced underlying, so they run against the config-provisioned `BTC` book.
+//!
+//! Each test that creates an underlying uses the capture-then-assert pattern:
+//! all requests (including the liquidity-setup helpers, which return a `Result`)
+//! run first, then [`cleanup_underlying`], and only THEN the assertions — so a
+//! failed assertion never leaks a test underlying.
 
-use orderbook_client::{AddOrderRequest, OhlcQuery, OptionPath, OrderSide, OrderbookClient};
+use orderbook_client::{AddOrderRequest, Error, OhlcQuery, OptionPath, OrderSide, OrderbookClient};
 use orderbook_tests::{
     TEST_EXPIRATION, TEST_STRIKE, admin_client, cleanup_underlying, read_client, setup_underlying,
 };
 
-/// Rests a bid at 1400 and an ask at 1600 (both size 10) on the book.
-async fn rest_two_sided(client: &OrderbookClient, underlying: &str) {
+/// Rests a bid at 1400 and an ask at 1600 (both size 10) on the book. Returns the
+/// setup outcome so the caller can defer the assertion until after cleanup.
+async fn rest_two_sided(client: &OrderbookClient, underlying: &str) -> Result<(), Error> {
     let place = OptionPath::call(underlying, TEST_EXPIRATION, TEST_STRIKE);
     client
         .add_order(
@@ -23,8 +29,7 @@ async fn rest_two_sided(client: &OrderbookClient, underlying: &str) {
                 quantity: 10,
             },
         )
-        .await
-        .expect("rest bid");
+        .await?;
     client
         .add_order(
             &place,
@@ -34,12 +39,19 @@ async fn rest_two_sided(client: &OrderbookClient, underlying: &str) {
                 quantity: 10,
             },
         )
-        .await
-        .expect("rest ask");
+        .await?;
+    Ok(())
 }
 
 /// Crosses a resting sell with a buy, producing one trade of `quantity` @ `price`.
-async fn cross_once(client: &OrderbookClient, underlying: &str, price: u128, quantity: u64) {
+/// Returns the setup outcome so the caller can defer the assertion until after
+/// cleanup.
+async fn cross_once(
+    client: &OrderbookClient,
+    underlying: &str,
+    price: u128,
+    quantity: u64,
+) -> Result<(), Error> {
     let place = OptionPath::call(underlying, TEST_EXPIRATION, TEST_STRIKE);
     client
         .add_order(
@@ -50,8 +62,7 @@ async fn cross_once(client: &OrderbookClient, underlying: &str, price: u128, qua
                 quantity,
             },
         )
-        .await
-        .expect("resting sell");
+        .await?;
     client
         .add_order(
             &place,
@@ -61,22 +72,27 @@ async fn cross_once(client: &OrderbookClient, underlying: &str, price: u128, qua
                 quantity,
             },
         )
-        .await
-        .expect("crossing buy");
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]
 async fn test_enriched_snapshot() {
     let client = admin_client().await.expect("admin client");
     let (underlying, formatted) = setup_underlying(&client, "SNP").await;
-    rest_two_sided(&client, &underlying).await;
-
     let read = OptionPath::call(&underlying, &formatted, TEST_STRIKE);
-    let snapshot = client
-        .get_option_snapshot(&read, Some("10"))
-        .await
-        .expect("enriched snapshot");
 
+    // Phase 1: rest liquidity, then read the snapshot at depth 10 and "full".
+    let setup = rest_two_sided(&client, &underlying).await;
+    let snapshot = client.get_option_snapshot(&read, Some("10")).await;
+    let full = client.get_option_snapshot(&read, Some("full")).await;
+
+    // Phase 2: cleanup.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3: assert.
+    setup.expect("rest two sided");
+    let snapshot = snapshot.expect("enriched snapshot");
     assert!(snapshot.symbol.contains(&underlying));
     assert_eq!(snapshot.bids.len(), 1);
     assert_eq!(snapshot.asks.len(), 1);
@@ -85,44 +101,42 @@ async fn test_enriched_snapshot() {
     assert_eq!(snapshot.stats.mid_price, Some(1500.0));
 
     // "full" depth returns the same single level per side.
-    let full = client
-        .get_option_snapshot(&read, Some("full"))
-        .await
-        .expect("full snapshot");
+    let full = full.expect("full snapshot");
     assert_eq!(full.bids.len(), 1);
     assert_eq!(full.asks.len(), 1);
-
-    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
 async fn test_orderbook_metrics() {
     let client = admin_client().await.expect("admin client");
     let (underlying, formatted) = setup_underlying(&client, "MET").await;
-    rest_two_sided(&client, &underlying).await;
-
     let read = OptionPath::call(&underlying, &formatted, TEST_STRIKE);
-    let metrics = client
-        .get_orderbook_metrics(&read)
-        .await
-        .expect("orderbook metrics");
 
+    // Phase 1.
+    let setup = rest_two_sided(&client, &underlying).await;
+    let metrics = client.get_orderbook_metrics(&read).await;
+
+    // Phase 2.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3.
+    setup.expect("rest two sided");
+    let metrics = metrics.expect("orderbook metrics");
     assert!(metrics.symbol.contains(&underlying));
     assert_eq!(metrics.spread.current, Some(200));
     assert_eq!(metrics.depth.bid_depth_total, 10);
     assert_eq!(metrics.depth.ask_depth_total, 10);
     assert_eq!(metrics.prices.mid_price, Some(1500.0));
-
-    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
 async fn test_ohlc_from_fills() {
     let client = admin_client().await.expect("admin client");
     let (underlying, _formatted) = setup_underlying(&client, "OHL").await;
-    cross_once(&client, &underlying, 1500, 40).await;
 
-    // OHLC is keyed by the raw request-path expiration.
+    // Phase 1: cross once, then read OHLC (keyed by the raw request-path
+    // expiration).
+    let setup = cross_once(&client, &underlying, 1500, 40).await;
     let read = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
     let ohlc = client
         .get_ohlc(
@@ -132,9 +146,14 @@ async fn test_ohlc_from_fills() {
                 ..Default::default()
             }),
         )
-        .await
-        .expect("ohlc");
+        .await;
 
+    // Phase 2.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3.
+    setup.expect("cross once");
+    let ohlc = ohlc.expect("ohlc");
     assert_eq!(ohlc.interval, "1m");
     assert!(
         !ohlc.bars.is_empty(),
@@ -147,40 +166,47 @@ async fn test_ohlc_from_fills() {
     assert_eq!(bar.close, 1500);
     assert_eq!(bar.volume, 40);
     assert_eq!(bar.trade_count, 1);
-
-    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
 async fn test_last_trade() {
     let client = admin_client().await.expect("admin client");
     let (underlying, _formatted) = setup_underlying(&client, "LTR").await;
-    cross_once(&client, &underlying, 1550, 25).await;
 
-    // last-trade is keyed by the raw request-path expiration.
+    // Phase 1: cross once, then read the last trade (keyed by the raw request-path
+    // expiration).
+    let setup = cross_once(&client, &underlying, 1550, 25).await;
     let read = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
-    let trade = client.get_last_trade(&read).await.expect("last trade");
+    let trade = client.get_last_trade(&read).await;
 
+    // Phase 2.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3.
+    setup.expect("cross once");
+    let trade = trade.expect("last trade");
     assert!(trade.symbol.contains(&underlying));
     assert_eq!(trade.price, 1550);
     assert_eq!(trade.quantity, 25);
     assert_eq!(trade.side, OrderSide::Buy);
     assert!(!trade.trade_id.is_empty());
-
-    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
 async fn test_option_chain() {
     let client = admin_client().await.expect("admin client");
     let (underlying, formatted) = setup_underlying(&client, "CHN").await;
-    rest_two_sided(&client, &underlying).await;
 
-    let chain = client
-        .get_option_chain(&underlying, &formatted)
-        .await
-        .expect("option chain");
+    // Phase 1.
+    let setup = rest_two_sided(&client, &underlying).await;
+    let chain = client.get_option_chain(&underlying, &formatted).await;
 
+    // Phase 2.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3.
+    setup.expect("rest two sided");
+    let chain = chain.expect("option chain");
     assert_eq!(chain.underlying, underlying);
     let row = chain
         .chain
@@ -189,8 +215,6 @@ async fn test_option_chain() {
         .expect("strike row present");
     assert_eq!(row.call.bid, Some(1400));
     assert_eq!(row.call.ask, Some(1600));
-
-    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
@@ -198,18 +222,18 @@ async fn test_volatility_surface() {
     let client = admin_client().await.expect("admin client");
     let (underlying, formatted) = setup_underlying(&client, "VOL").await;
 
-    let surface = client
-        .get_volatility_surface(&underlying)
-        .await
-        .expect("volatility surface");
+    // Phase 1.
+    let surface = client.get_volatility_surface(&underlying).await;
 
-    // Shape only — IVs may be null on a book with no priced quotes.
+    // Phase 2.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3 — shape only; IVs may be null on a book with no priced quotes.
+    let surface = surface.expect("volatility surface");
     assert_eq!(surface.underlying, underlying);
     assert!(surface.expirations.contains(&formatted));
     assert!(surface.strikes.contains(&TEST_STRIKE));
     assert!(surface.surface.contains_key(&formatted));
-
-    cleanup_underlying(&client, &underlying).await;
 }
 
 #[tokio::test]
@@ -217,25 +241,28 @@ async fn test_strike_and_expiration_details() {
     let client = admin_client().await.expect("admin client");
     let (underlying, formatted) = setup_underlying(&client, "DET").await;
 
-    let expiration = client
-        .get_expiration(&underlying, &formatted)
-        .await
-        .expect("get expiration");
-    assert!(expiration.strike_count >= 1);
-
+    // Phase 1.
+    let expiration = client.get_expiration(&underlying, &formatted).await;
     let strike = client
         .get_strike(&underlying, &formatted, TEST_STRIKE)
-        .await
-        .expect("get strike");
-    assert_eq!(strike.strike, TEST_STRIKE);
+        .await;
 
+    // Phase 2.
     cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3.
+    let expiration = expiration.expect("get expiration");
+    assert!(expiration.strike_count >= 1);
+
+    let strike = strike.expect("get strike");
+    assert_eq!(strike.strike, TEST_STRIKE);
 }
 
 #[tokio::test]
 async fn test_greeks_on_priced_underlying() {
     // Greeks require a spot price; use the config-provisioned BTC book, whose
-    // DateTime expiration resolves by its canonical string directly.
+    // DateTime expiration resolves by its canonical string directly. No underlying
+    // is created here, so there is nothing to clean up.
     let client = read_client().await.expect("read client");
 
     let expiration = client
