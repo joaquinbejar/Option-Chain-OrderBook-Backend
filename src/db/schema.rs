@@ -127,15 +127,64 @@ pub struct InsertPriceRequest {
 }
 
 /// Request to update market maker parameters.
+///
+/// Field names are snake_case on the wire, matching every other DTO on the
+/// public surface (issue #81 — previously these three fields were camelCase
+/// while the matching responses were snake_case).
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct UpdateParametersRequest {
     /// Spread multiplier (optional).
-    #[serde(rename = "spreadMultiplier")]
     pub spread_multiplier: Option<f64>,
     /// Size scalar (optional).
-    #[serde(rename = "sizeScalar")]
     pub size_scalar: Option<f64>,
     /// Directional skew (optional).
-    #[serde(rename = "directionalSkew")]
     pub directional_skew: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #81: the control/price DTOs share one casing convention —
+    /// snake_case — so a client can read a response and write the same field
+    /// names back. The request round-trips through JSON with snake_case keys.
+    #[test]
+    fn test_update_parameters_request_snake_case_round_trip() {
+        let request = UpdateParametersRequest {
+            spread_multiplier: Some(1.5),
+            size_scalar: Some(0.5),
+            directional_skew: Some(-0.2),
+        };
+
+        let value = serde_json::to_value(&request).expect("serializes");
+        assert!(value.get("spread_multiplier").is_some());
+        assert!(value.get("size_scalar").is_some());
+        assert!(value.get("directional_skew").is_some());
+        assert!(
+            value.get("spreadMultiplier").is_none(),
+            "camelCase must be gone from the wire"
+        );
+
+        let back: UpdateParametersRequest = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(back.spread_multiplier, Some(1.5));
+        assert_eq!(back.size_scalar, Some(0.5));
+        assert_eq!(back.directional_skew, Some(-0.2));
+    }
+
+    /// InsertPriceRequest was already snake_case; lock it in.
+    #[test]
+    fn test_insert_price_request_snake_case() {
+        let request = InsertPriceRequest {
+            symbol: "BTC".to_string(),
+            price: 100.5,
+            bid: None,
+            ask: None,
+            volume: None,
+            source: Some("test".to_string()),
+        };
+        let value = serde_json::to_value(&request).expect("serializes");
+        assert!(value.get("symbol").is_some());
+        assert!(value.get("price").is_some());
+        assert!(value.get("source").is_some());
+    }
 }

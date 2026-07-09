@@ -342,13 +342,13 @@ pub struct KillSwitchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateParametersRequest {
     /// Spread multiplier (optional).
-    #[serde(rename = "spreadMultiplier", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub spread_multiplier: Option<f64>,
     /// Size scalar (optional).
-    #[serde(rename = "sizeScalar", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub size_scalar: Option<f64>,
     /// Directional skew (optional).
-    #[serde(rename = "directionalSkew", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub directional_skew: Option<f64>,
 }
 

@@ -313,7 +313,7 @@ curl -X POST http://localhost:8080/api/v1/controls/enable
 # Update parameters
 curl -X POST http://localhost:8080/api/v1/controls/parameters \
   -H "Content-Type: application/json" \
-  -d '{"spreadMultiplier": 1.5, "sizeScalar": 200, "directionalSkew": 0.05}'
+  -d '{"spread_multiplier": 1.5, "size_scalar": 200, "directional_skew": 0.05}'
 
 # Insert underlying price
 curl -X POST http://localhost:8080/api/v1/prices \
