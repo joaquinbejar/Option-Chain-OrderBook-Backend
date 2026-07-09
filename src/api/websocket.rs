@@ -807,12 +807,12 @@ async fn handle_client_message(
                     }
                     "set_size" => {
                         if let Some(value) = cmd.value {
-                            // Wire contract carries size as a percentage; convert
-                            // to the engine scalar before validating against
-                            // [SIZE_SCALAR_MIN, SIZE_SCALAR_MAX].
+                            // `size_scalar` travels as the engine fraction
+                            // [0.0, 1.0], the same representation GET /controls
+                            // reports (issue #82).
                             match validate_control_value(
                                 "size_scalar",
-                                value / 100.0,
+                                value,
                                 SIZE_SCALAR_MIN,
                                 SIZE_SCALAR_MAX,
                             ) {

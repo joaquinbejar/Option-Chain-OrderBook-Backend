@@ -344,7 +344,8 @@ pub struct UpdateParametersRequest {
     /// Spread multiplier (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spread_multiplier: Option<f64>,
-    /// Size scalar (optional).
+    /// Size scalar (optional; fraction of the base quote size, 0.0-1.0 — the
+    /// same representation `GET /controls` reports).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_scalar: Option<f64>,
     /// Directional skew (optional).

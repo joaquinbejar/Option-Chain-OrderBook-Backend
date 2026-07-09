@@ -28,7 +28,7 @@ pub struct SystemControlResponse {
     pub master_enabled: bool,
     /// Global spread multiplier.
     pub spread_multiplier: f64,
-    /// Global size scalar.
+    /// Global size scalar (fraction of the base quote size, 0.0-1.0).
     pub size_scalar: f64,
     /// Global directional skew.
     pub directional_skew: f64,
@@ -52,7 +52,7 @@ pub struct UpdateParametersResponse {
     pub success: bool,
     /// Updated spread multiplier.
     pub spread_multiplier: f64,
-    /// Updated size scalar.
+    /// Updated size scalar (fraction of the base quote size, 0.0-1.0).
     pub size_scalar: f64,
     /// Updated directional skew.
     pub directional_skew: f64,
@@ -198,8 +198,9 @@ pub async fn enable_quoting(State(state): State<Arc<AppState>>) -> Json<KillSwit
 /// # Errors
 /// Returns [`ApiError::InvalidRequest`] (HTTP 400) when any provided field is
 /// non-finite (`NaN` / infinite) or outside its documented range:
-/// `spread_multiplier` ∈ [0.1, 10.0], `size_scalar` (the engine scalar, after
-/// the percentage conversion) ∈ [0.0, 1.0], `directional_skew` ∈ [-1.0, 1.0].
+/// `spread_multiplier` ∈ [0.1, 10.0], `size_scalar` (a fraction of the base
+/// quote size, the same representation `GET /controls` reports — issue #82)
+/// ∈ [0.0, 1.0], `directional_skew` ∈ [-1.0, 1.0].
 #[utoipa::path(
     post,
     path = "/api/v1/controls/parameters",
@@ -229,11 +230,13 @@ pub async fn update_parameters(
         .transpose()
         .map_err(ApiError::InvalidRequest)?;
 
-    // The REST/WS wire contract carries `size_scalar` as a percentage; convert to
-    // the engine scalar before validating against the documented [0.0, 1.0] range.
+    // `size_scalar` travels as the engine fraction [0.0, 1.0] on the wire —
+    // the SAME representation `GET /controls` reports, so a read value can be
+    // written back unchanged (issue #82: the old contract read fractions but
+    // wrote percentages, a silent 100x divergence).
     let size = body
         .size_scalar
-        .map(|v| validate_control_value("size_scalar", v / 100.0, SIZE_SCALAR_MIN, SIZE_SCALAR_MAX))
+        .map(|v| validate_control_value("size_scalar", v, SIZE_SCALAR_MIN, SIZE_SCALAR_MAX))
         .transpose()
         .map_err(ApiError::InvalidRequest)?;
 
@@ -267,7 +270,7 @@ pub async fn update_parameters(
     Ok(Json(UpdateParametersResponse {
         success: true,
         spread_multiplier: config.spread_multiplier,
-        size_scalar: config.size_scalar * 100.0, // Convert back to percentage
+        size_scalar: config.size_scalar,
         directional_skew: config.directional_skew,
     }))
 }

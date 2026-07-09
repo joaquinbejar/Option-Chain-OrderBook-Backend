@@ -55,7 +55,7 @@ async fn test_update_parameters() {
     let update_response = client
         .update_parameters(&UpdateParametersRequest {
             spread_multiplier: Some(1.5),
-            size_scalar: Some(75.0), // 75%
+            size_scalar: Some(0.75), // fraction of base size (issue #82)
             directional_skew: Some(0.1),
         })
         .await
@@ -63,14 +63,19 @@ async fn test_update_parameters() {
 
     assert!(update_response.success);
     assert!((update_response.spread_multiplier - 1.5).abs() < 0.01);
-    assert!((update_response.size_scalar - 75.0).abs() < 0.01);
+    assert!((update_response.size_scalar - 0.75).abs() < 0.01);
     assert!((update_response.directional_skew - 0.1).abs() < 0.01);
 
-    // Restore original parameters
+    // Issue #82 acceptance: the value GET reports can be POSTed back
+    // unchanged and round-trips to the same state.
+    let read_back = client.get_controls().await.expect("Failed to get controls");
+    assert!((read_back.size_scalar - 0.75).abs() < 0.01);
+
+    // Restore original parameters — unchanged representation, no conversion.
     client
         .update_parameters(&UpdateParametersRequest {
             spread_multiplier: Some(initial.spread_multiplier),
-            size_scalar: Some(initial.size_scalar * 100.0), // Convert back to percentage
+            size_scalar: Some(initial.size_scalar),
             directional_skew: Some(initial.directional_skew),
         })
         .await

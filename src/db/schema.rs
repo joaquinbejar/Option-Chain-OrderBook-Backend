@@ -135,7 +135,8 @@ pub struct InsertPriceRequest {
 pub struct UpdateParametersRequest {
     /// Spread multiplier (optional).
     pub spread_multiplier: Option<f64>,
-    /// Size scalar (optional).
+    /// Size scalar (optional; fraction of the base quote size, 0.0-1.0 — the
+    /// same representation `GET /controls` reports, issue #82).
     pub size_scalar: Option<f64>,
     /// Directional skew (optional).
     pub directional_skew: Option<f64>,
