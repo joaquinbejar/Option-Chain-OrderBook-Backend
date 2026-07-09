@@ -25,6 +25,7 @@ use axum::Json;
 use axum::extract::Query;
 use axum::extract::{Path, State};
 use option_chain_orderbook::orderbook::Quote;
+use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side, TimeInForce};
 use std::sync::Arc;
@@ -1132,7 +1133,16 @@ fn build_option_quote_data(
 /// Get the implied volatility surface for an underlying.
 ///
 /// Returns IV data across all strikes and expirations, enabling volatility
-/// surface visualization and analysis.
+/// surface visualization and analysis. Each IV is derived from the observed
+/// order-book mid price — or the lone bid/ask when only one side is quoted
+/// (two-sided enforcement is tracked in issue #125) — via
+/// `optionstratlib::volatility::calculate_iv`
+/// (European Black-Scholes, zero risk-free rate and dividend yield; a
+/// 0.1%-step grid search, so derivable IVs lie in `[0.001, 0.999)`). An IV is
+/// omitted (`null`) when there is no quote for that leg, no spot price, or the
+/// solver cannot produce a volatility for the observed mid (below intrinsic,
+/// above the no-volatility asymptote, or pinned to the grid ceiling) — no
+/// synthetic values are fabricated.
 #[utoipa::path(
     get,
     path = "/api/v1/underlyings/{underlying}/volatility-surface",
@@ -1140,7 +1150,7 @@ fn build_option_quote_data(
         ("underlying" = String, Path, description = "Underlying symbol")
     ),
     responses(
-        (status = 200, description = "Volatility surface data", body = VolatilitySurfaceResponse),
+        (status = 200, description = "Volatility surface data (IVs derived from order-book mids via optionstratlib; omitted where not derivable)", body = VolatilitySurfaceResponse),
         (status = 404, description = "Underlying not found")
     ),
     tag = "Volatility"
@@ -1162,12 +1172,12 @@ pub async fn get_volatility_surface(
         .as_ref()
         .and_then(|sim| sim.get_price(&underlying));
 
-    // Collect all expirations
+    // Phase 1 (cheap, on the async thread): walk the books and collect the
+    // observed mids per (expiration, strike) plus the ATM strike per
+    // expiration. No IV math happens here.
     let expirations_map = underlying_book.expirations();
-    let mut expirations: Vec<String> = Vec::new();
     let mut all_strikes: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    let mut surface: HashMap<String, HashMap<u64, StrikeIV>> = HashMap::new();
-    let mut atm_term_structure: Vec<ATMTermStructurePoint> = Vec::new();
+    let mut collected: Vec<SurfaceExpirationInputs> = Vec::new();
 
     let now = chrono::Utc::now();
 
@@ -1190,12 +1200,12 @@ pub async fn get_volatility_surface(
         };
 
         let strikes = exp_book.strike_prices();
-        let mut exp_surface: HashMap<u64, StrikeIV> = HashMap::new();
 
         // Find ATM strike for this expiration
         let atm_strike =
             spot_price.and_then(|spot| strikes.iter().min_by_key(|&&s| s.abs_diff(spot)).copied());
 
+        let mut rows: Vec<SurfaceStrikeMids> = Vec::with_capacity(strikes.len());
         for strike in &strikes {
             all_strikes.insert(*strike);
 
@@ -1204,40 +1214,95 @@ pub async fn get_volatility_surface(
                 Err(_) => continue,
             };
 
-            // Get call and put quotes
-            let call_quote = strike_book.call_quote();
-            let put_quote = strike_book.put_quote();
-
-            // Calculate mid-price for IV estimation
-            let call_mid = calculate_mid_price(&call_quote);
-            let put_mid = calculate_mid_price(&put_quote);
-
-            // For now, use a simple IV estimation based on moneyness
-            // In production, this would use optionstratlib::volatility::calculate_iv
-            let call_iv = call_mid.map(|_| estimate_iv(spot_price, *strike, days_to_expiry, true));
-            let put_iv = put_mid.map(|_| estimate_iv(spot_price, *strike, days_to_expiry, false));
-
-            exp_surface.insert(*strike, StrikeIV { call_iv, put_iv });
-        }
-
-        // Add ATM IV to term structure
-        if let Some(atm) = atm_strike
-            && let Some(strike_iv) = exp_surface.get(&atm)
-        {
-            let atm_iv = strike_iv.call_iv.or(strike_iv.put_iv).unwrap_or(0.30);
-            atm_term_structure.push(ATMTermStructurePoint {
-                expiration: exp_str.clone(),
-                days: days_to_expiry,
-                iv: atm_iv,
+            rows.push(SurfaceStrikeMids {
+                strike: *strike,
+                call_mid: calculate_mid_price(&strike_book.call_quote()),
+                put_mid: calculate_mid_price(&strike_book.put_quote()),
             });
         }
 
-        expirations.push(exp_str.clone());
-        surface.insert(exp_str, exp_surface);
+        collected.push(SurfaceExpirationInputs {
+            exp_str,
+            days_to_expiry,
+            atm_strike,
+            rows,
+        });
     }
 
+    // Phase 2 (CPU-heavy, off the async thread): derive every IV from the
+    // observed mids. `calculate_iv` runs a parallel Black-Scholes grid search
+    // per point, so the whole sweep is offloaded via `spawn_blocking`.
+    let symbol_for_iv = underlying.clone();
+    let (surface, atm_term_structure, expirations) = tokio::task::spawn_blocking(move || {
+        let mut surface: HashMap<String, HashMap<u64, StrikeIV>> = HashMap::new();
+        let mut atm_term_structure: Vec<ATMTermStructurePoint> = Vec::new();
+        let mut expirations: Vec<String> = Vec::new();
+
+        for SurfaceExpirationInputs {
+            exp_str,
+            days_to_expiry,
+            atm_strike,
+            rows,
+        } in collected
+        {
+            let mut exp_surface: HashMap<u64, StrikeIV> = HashMap::new();
+
+            for SurfaceStrikeMids {
+                strike,
+                call_mid,
+                put_mid,
+            } in rows
+            {
+                let call_iv = call_mid.and_then(|mid| {
+                    derive_iv(
+                        mid,
+                        strike,
+                        spot_price,
+                        days_to_expiry,
+                        OptionStyle::Call,
+                        &symbol_for_iv,
+                    )
+                });
+                let put_iv = put_mid.and_then(|mid| {
+                    derive_iv(
+                        mid,
+                        strike,
+                        spot_price,
+                        days_to_expiry,
+                        OptionStyle::Put,
+                        &symbol_for_iv,
+                    )
+                });
+
+                exp_surface.insert(strike, StrikeIV { call_iv, put_iv });
+            }
+
+            // Add the ATM point only when an IV was actually derived — never
+            // fabricate a default.
+            if let Some(atm) = atm_strike
+                && let Some(strike_iv) = exp_surface.get(&atm)
+                && let Some(atm_iv) = strike_iv.call_iv.or(strike_iv.put_iv)
+            {
+                atm_term_structure.push(ATMTermStructurePoint {
+                    expiration: exp_str.clone(),
+                    days: days_to_expiry,
+                    iv: atm_iv,
+                });
+            }
+
+            expirations.push(exp_str.clone());
+            surface.insert(exp_str, exp_surface);
+        }
+
+        (surface, atm_term_structure, expirations)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("volatility surface computation failed: {e}")))?;
+
     // Sort expirations and term structure by days
+    let mut expirations = expirations;
     expirations.sort();
+    let mut atm_term_structure = atm_term_structure;
     atm_term_structure.sort_by_key(|p| p.days);
 
     let timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
@@ -1253,6 +1318,28 @@ pub async fn get_volatility_surface(
     }))
 }
 
+/// Observed order-book mids for one strike, collected before the IV sweep.
+struct SurfaceStrikeMids {
+    /// Strike price in cents.
+    strike: u64,
+    /// Call mid price in cents, when quoted.
+    call_mid: Option<u128>,
+    /// Put mid price in cents, when quoted.
+    put_mid: Option<u128>,
+}
+
+/// Per-expiration inputs collected from the books before the IV sweep.
+struct SurfaceExpirationInputs {
+    /// Expiration formatted as `YYYYMMDD`.
+    exp_str: String,
+    /// Days until expiration (minimum 1).
+    days_to_expiry: u64,
+    /// The strike closest to spot, when a spot price is known.
+    atm_strike: Option<u64>,
+    /// Observed mids per strike.
+    rows: Vec<SurfaceStrikeMids>,
+}
+
 /// Calculate mid-price from a quote.
 fn calculate_mid_price(quote: &Quote) -> Option<u128> {
     match (quote.bid_price(), quote.ask_price()) {
@@ -1263,26 +1350,100 @@ fn calculate_mid_price(quote: &Quote) -> Option<u128> {
     }
 }
 
-/// Estimate IV based on moneyness and time to expiry.
-/// This is a simplified estimation; in production, use optionstratlib::volatility::calculate_iv.
-fn estimate_iv(spot_price: Option<u64>, strike: u64, days_to_expiry: u64, is_call: bool) -> f64 {
-    let base_iv = 0.30; // 30% base volatility
+/// Upper bound of the IV solver's search grid (999/1000).
+///
+/// `optionstratlib::volatility::calculate_iv` evaluates 999 candidate
+/// volatilities in `{0.001, 0.002, …, 0.999}`. A result pinned to this
+/// ceiling means the observed mid is at or beyond what the highest candidate
+/// can price (e.g. a mid above the σ→∞ asymptote, or a true IV ≥ 99.9%), so
+/// it is not a real reading and is omitted.
+const IV_GRID_CEILING: f64 = 0.999;
 
-    // Adjust for moneyness (volatility smile)
-    let moneyness = spot_price.map(|s| strike as f64 / s as f64).unwrap_or(1.0);
-    let smile_adjustment = (moneyness - 1.0).abs() * 0.1;
+/// Derives an implied volatility from an observed option mid price via
+/// [`optionstratlib::volatility::calculate_iv`] (European Black-Scholes,
+/// zero risk-free rate and dividend yield).
+///
+/// All monetary legs are passed in cents; Black-Scholes is homogeneous of
+/// degree one in (spot, strike, price), so the derived IV is identical to a
+/// dollar-denominated computation. The solver is a 0.1%-step grid search, so
+/// the derivable range is `[0.001, 0.999)`. Returns `None` when the spot
+/// price is unknown or an input cannot form a `Positive`; market-level
+/// omissions — a mid at/above the no-volatility asymptote, a mid the solver
+/// cannot match (e.g. below intrinsic), or a result pinned to the grid
+/// ceiling — are additionally logged at DEBUG. Callers must omit the field
+/// rather than substitute a synthetic value.
+fn derive_iv(
+    mid_cents: u128,
+    strike_cents: u64,
+    spot_cents: Option<u64>,
+    days_to_expiry: u64,
+    style: OptionStyle,
+    symbol: &str,
+) -> Option<f64> {
+    let spot_cents = spot_cents?;
 
-    // Adjust for time (term structure - typically upward sloping)
-    let term_adjustment = (days_to_expiry as f64 / 365.0).sqrt() * 0.02;
-
-    // Slight skew for puts (typically higher IV for OTM puts)
-    let skew = if !is_call && moneyness < 1.0 {
-        0.02
-    } else {
-        0.0
+    // A mid above the σ→∞ Black-Scholes asymptote (call → spot, put → strike
+    // with r = 0) cannot be matched by any volatility; skip the grid search
+    // and omit instead of surfacing a ceiling-pinned value.
+    let asymptote_cents = match style {
+        OptionStyle::Call => spot_cents as u128,
+        OptionStyle::Put => strike_cents as u128,
     };
+    if mid_cents >= asymptote_cents {
+        tracing::debug!(
+            symbol = %symbol,
+            strike_cents,
+            spot_cents,
+            mid_cents,
+            style = ?style,
+            "observed mid at or above the no-volatility asymptote; omitting IV"
+        );
+        return None;
+    }
 
-    base_iv + smile_adjustment + term_adjustment + skew
+    let option_price = Positive::new(mid_cents as f64).ok()?;
+    let strike = Positive::new(strike_cents as f64).ok()?;
+    let spot = Positive::new(spot_cents as f64).ok()?;
+    let days = Positive::new(days_to_expiry as f64).ok()?;
+
+    match optionstratlib::volatility::calculate_iv(
+        option_price,
+        strike,
+        style,
+        spot,
+        days,
+        symbol.to_string(),
+    ) {
+        Ok(iv) => {
+            let iv = iv.to_f64();
+            if iv >= IV_GRID_CEILING {
+                tracing::debug!(
+                    symbol = %symbol,
+                    strike_cents,
+                    spot_cents,
+                    mid_cents,
+                    days_to_expiry,
+                    style = ?style,
+                    "implied volatility pinned to the solver grid ceiling; omitting"
+                );
+                return None;
+            }
+            Some(iv)
+        }
+        Err(e) => {
+            tracing::debug!(
+                symbol = %symbol,
+                strike_cents,
+                spot_cents,
+                mid_cents,
+                days_to_expiry,
+                style = ?style,
+                error = %e,
+                "implied volatility not derivable from observed mid; omitting"
+            );
+            None
+        }
+    }
 }
 
 /// Create or get a strike.
@@ -7823,6 +7984,96 @@ mod tests {
         assert!(!json_partial.contains("\"put_iv\""));
     }
 
+    /// `derive_iv` must recover the volatility a Black-Scholes price was
+    /// generated with (issue #56): price an option at a known IV via
+    /// optionstratlib, round the price to whole cents like a real book mid,
+    /// and assert the derived IV matches the reference within the solver's
+    /// grid tolerance.
+    #[test]
+    fn test_derive_iv_recovers_black_scholes_volatility() {
+        use optionstratlib::model::option::Options;
+        use optionstratlib::prelude::{OptionType, Positive, Side};
+        use rust_decimal::Decimal;
+        use rust_decimal::prelude::ToPrimitive;
+
+        let spot_cents = 10_000u64; // $100.00
+        let days = 30u64;
+        let known_iv = 0.25;
+
+        for (strike_cents, style) in [
+            (10_000u64, OptionStyle::Call), // ATM call
+            (10_000u64, OptionStyle::Put),  // ATM put
+            (9_500u64, OptionStyle::Call),  // ITM call
+            (10_500u64, OptionStyle::Put),  // ITM put
+        ] {
+            let option = Options::new(
+                OptionType::European,
+                Side::Long,
+                "TEST".to_string(),
+                Positive::new(strike_cents as f64).expect("valid strike"),
+                ExpirationDate::Days(Positive::new(days as f64).expect("valid days")),
+                Positive::new(known_iv).expect("valid iv"),
+                Positive::ONE,
+                Positive::new(spot_cents as f64).expect("valid spot"),
+                Decimal::ZERO,
+                style,
+                Positive::ZERO,
+                None,
+            );
+            let price_cents = option
+                .calculate_price_black_scholes()
+                .expect("reference Black-Scholes price")
+                .to_f64()
+                .expect("price fits f64")
+                .round() as u128;
+
+            let derived = derive_iv(
+                price_cents,
+                strike_cents,
+                Some(spot_cents),
+                days,
+                style,
+                "TEST",
+            )
+            .expect("IV derivable from a Black-Scholes-generated mid");
+
+            assert!(
+                (derived - known_iv).abs() < 0.01,
+                "derived IV {derived} must match reference {known_iv} (strike {strike_cents}, {style:?})"
+            );
+        }
+    }
+
+    /// Without a spot price (or with an unsolvable mid) `derive_iv` must
+    /// return `None` — the surface omits the field instead of fabricating a
+    /// value (issue #56).
+    #[test]
+    fn test_derive_iv_returns_none_when_not_derivable() {
+        assert!(
+            derive_iv(287, 10_000, None, 30, OptionStyle::Call, "TEST").is_none(),
+            "no spot price -> no IV"
+        );
+        // A zero-priced option pins the solver to its lower grid boundary
+        // (IvNotFound); the omission comes from the solver, not from the
+        // Positive conversion (Positive::new(0.0) is valid without the
+        // upstream `non-zero` feature).
+        assert!(
+            derive_iv(0, 10_000, Some(10_000), 30, OptionStyle::Call, "TEST").is_none(),
+            "a zero mid is unsolvable -> no IV"
+        );
+        // A mid at/above the σ→∞ asymptote (call mid >= spot with r = 0) can
+        // never be matched by any volatility: omitted, never a ceiling-pinned
+        // 0.999 reading.
+        assert!(
+            derive_iv(10_001, 10_000, Some(10_000), 30, OptionStyle::Call, "TEST").is_none(),
+            "super-asymptote call mid -> no IV"
+        );
+        assert!(
+            derive_iv(10_001, 10_000, Some(20_000), 30, OptionStyle::Put, "TEST").is_none(),
+            "super-asymptote put mid (mid >= strike) -> no IV"
+        );
+    }
+
     #[test]
     fn test_atm_term_structure_point_serialization() {
         use crate::models::ATMTermStructurePoint;
@@ -7927,25 +8178,6 @@ mod tests {
         assert_eq!(response.strikes.len(), 3);
         // Surface should have data for the expiration
         assert_eq!(response.surface.len(), 1);
-    }
-
-    #[test]
-    fn test_estimate_iv() {
-        // Test ATM option
-        let iv_atm = estimate_iv(Some(15000), 15000, 30, true);
-        assert!((0.30..=0.35).contains(&iv_atm));
-
-        // Test OTM call
-        let iv_otm_call = estimate_iv(Some(15000), 16000, 30, true);
-        assert!(iv_otm_call > iv_atm); // Should have smile adjustment
-
-        // Test OTM put (should have skew)
-        let iv_otm_put = estimate_iv(Some(15000), 14000, 30, false);
-        assert!(iv_otm_put > iv_atm); // Should have smile + skew
-
-        // Test without spot price
-        let iv_no_spot = estimate_iv(None, 15000, 30, true);
-        assert!(iv_no_spot >= 0.30);
     }
 
     #[test]
