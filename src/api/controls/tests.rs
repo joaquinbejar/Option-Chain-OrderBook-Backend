@@ -74,14 +74,14 @@ fn test_update_parameters_response_serialization() {
     let response = UpdateParametersResponse {
         success: true,
         spread_multiplier: 1.5,
-        size_scalar: 200.0,
+        size_scalar: 0.5,
         directional_skew: 0.05,
     };
 
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("\"success\":true"));
     assert!(json.contains("\"spread_multiplier\":1.5"));
-    assert!(json.contains("\"size_scalar\":200.0"));
+    assert!(json.contains("\"size_scalar\":0.5"));
     assert!(json.contains("\"directional_skew\":0.05"));
 }
 
@@ -456,8 +456,8 @@ fn config_snapshot(state: &Arc<AppState>) -> (f64, f64, f64) {
 #[tokio::test]
 async fn test_update_parameters_valid_applied() {
     let state = Arc::new(AppState::new());
-    // size is a percentage on the wire: 50.0 -> 0.5 engine scalar.
-    let req = update_parameters_request(Some(2.0), Some(50.0), Some(0.25));
+    // size_scalar is the engine fraction on the wire (issue #82).
+    let req = update_parameters_request(Some(2.0), Some(0.5), Some(0.25));
 
     let resp = update_parameters(State(Arc::clone(&state)), Json(req))
         .await
@@ -465,13 +465,42 @@ async fn test_update_parameters_valid_applied() {
 
     assert!(resp.0.success);
     assert!((resp.0.spread_multiplier - 2.0).abs() < f64::EPSILON);
-    assert!((resp.0.size_scalar - 50.0).abs() < f64::EPSILON);
+    assert!((resp.0.size_scalar - 0.5).abs() < f64::EPSILON);
     assert!((resp.0.directional_skew - 0.25).abs() < f64::EPSILON);
 
     let (spread, size, skew) = config_snapshot(&state);
     assert!((spread - 2.0).abs() < f64::EPSILON);
     assert!((size - 0.5).abs() < f64::EPSILON);
     assert!((skew - 0.25).abs() < f64::EPSILON);
+}
+
+/// Issue #82 acceptance: the `size_scalar` reported by `GET /controls` can be
+/// sent unchanged to `POST /controls/parameters` and round-trips to the same
+/// internal value — one wire representation (the engine fraction) on both.
+#[tokio::test]
+async fn test_size_scalar_round_trips_between_get_and_post() {
+    let state = Arc::new(AppState::new());
+
+    // Set a distinctive value through the POST path.
+    let req = update_parameters_request(None, Some(0.42), None);
+    let resp = update_parameters(State(Arc::clone(&state)), Json(req))
+        .await
+        .expect("valid size_scalar should succeed");
+    assert!((resp.0.size_scalar - 0.42).abs() < f64::EPSILON);
+
+    // GET reports the identical representation...
+    let controls = get_controls(State(Arc::clone(&state))).await;
+    assert!((controls.0.size_scalar - 0.42).abs() < f64::EPSILON);
+
+    // ...and feeding the GET value back through POST leaves the internal
+    // state unchanged (no 100x drift).
+    let req = update_parameters_request(None, Some(controls.0.size_scalar), None);
+    let resp = update_parameters(State(Arc::clone(&state)), Json(req))
+        .await
+        .expect("round-tripped size_scalar should succeed");
+    assert!((resp.0.size_scalar - 0.42).abs() < f64::EPSILON);
+    let (_, size, _) = config_snapshot(&state);
+    assert!((size - 0.42).abs() < f64::EPSILON);
 }
 
 #[tokio::test]
@@ -528,8 +557,8 @@ async fn test_update_parameters_out_of_range_spread_rejected_no_change() {
 async fn test_update_parameters_out_of_range_size_rejected_no_change() {
     let state = Arc::new(AppState::new());
     let before = config_snapshot(&state);
-    // 150% -> 1.5 engine scalar, above the documented [0.0, 1.0] range.
-    let req = update_parameters_request(None, Some(150.0), None);
+    // 1.5 is above the documented [0.0, 1.0] fraction range.
+    let req = update_parameters_request(None, Some(1.5), None);
 
     let result = update_parameters(State(Arc::clone(&state)), Json(req)).await;
 
