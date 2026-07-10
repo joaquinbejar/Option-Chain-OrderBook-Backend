@@ -360,6 +360,9 @@ async fn main() -> anyhow::Result<()> {
     // drives every loop to break so its `JoinHandle` can be awaited. Using `watch`
     // avoids adding `tokio-util` / `CancellationToken` as a new dependency.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Thread the signal into live WebSocket connections (issue #118) so an
+    // idle client cannot keep graceful shutdown waiting.
+    state.set_shutdown_signal(shutdown_rx.clone());
     // Keep one receiver alive so shutdown_tx.send(true) below is always infallible
     // (tasks use clones); do not delete this binding as "unused".
     // Retained handles for all background tasks so none is left detached: each is
