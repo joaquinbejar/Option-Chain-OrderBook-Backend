@@ -126,6 +126,13 @@ pub struct RateLimitDecision {
     pub reset_secs: u64,
 }
 
+/// Number of candidate buckets examined when the tracked-key cap is hit and
+/// nothing is expired: the most idle bucket of the sample is evicted (issue
+/// #92, approximate-LRU in the style of sampled eviction). Bounded work per
+/// admission — never a full scan of the (up to 100k-entry) map on the
+/// request path.
+const LRU_SAMPLE_SIZE: usize = 8;
+
 /// Rate limiter using a sliding-window algorithm, keyed by an arbitrary string
 /// (the JWT `sub`, or a synthetic IP-based key for the unauthenticated token
 /// endpoint).
@@ -133,6 +140,13 @@ pub struct RateLimitDecision {
 pub struct RateLimiter {
     /// Request timestamps (ms) per key.
     windows: DashMap<String, VecDeque<u64>>,
+    /// Tracked-key count, maintained atomically so the [`MAX_TRACKED_KEYS`]
+    /// cap holds under concurrent admissions (issue #92: the previous
+    /// `len()`-then-`entry()` check was a TOCTOU that could overshoot by
+    /// roughly the worker count). A concurrent sweep resync may transiently
+    /// miss in-flight admissions — bounded by the in-flight count and
+    /// self-healed at the next sweep, never unbounded drift.
+    tracked: std::sync::atomic::AtomicUsize,
 }
 
 impl RateLimiter {
@@ -141,6 +155,7 @@ impl RateLimiter {
     pub fn new() -> Self {
         Self {
             windows: DashMap::new(),
+            tracked: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -162,6 +177,8 @@ impl RateLimiter {
     /// fully-expired entries is attempted first, and if the map is still full the
     /// request is rejected so the map can never grow without bound.
     pub fn check_and_record_status(&self, key: &str, limit: u32) -> RateLimitDecision {
+        use std::sync::atomic::Ordering;
+
         let now = now_millis();
         // `now` is Unix time in milliseconds, so it is structurally far greater
         // than `RATE_LIMIT_WINDOW_MS` (60_000) at any real wall-clock time; the
@@ -176,27 +193,114 @@ impl RateLimiter {
             return Self::prune_and_record(entry.value_mut(), now, window_start, limit);
         }
 
-        // New key: enforce the cap before allocating a bucket.
-        if self.windows.len() >= MAX_TRACKED_KEYS {
-            let evicted = self.sweep_expired();
-            if self.windows.len() >= MAX_TRACKED_KEYS {
-                tracing::warn!(
-                    tracked = self.windows.len(),
-                    evicted,
-                    "rate-limit window map at capacity; rejecting request for a new key"
-                );
-                // No bucket exists for this key; the soonest anything can
-                // change is one full window from now.
-                return RateLimitDecision {
-                    allowed: false,
-                    remaining: 0,
-                    reset_secs: now.saturating_add(RATE_LIMIT_WINDOW_MS).div_ceil(1000),
-                };
+        // New key: win an admission slot against the atomic counter so the
+        // cap holds under concurrency (issue #92; the count may transiently
+        // drift by the number of in-flight admissions during a concurrent
+        // sweep resync — bounded and self-healing, never unbounded growth).
+        // `fetch_update` retries internally on CAS contention, so losing a
+        // race NEVER consumes a reclaim attempt and a request is only
+        // rejected when the map is genuinely at capacity after the bounded
+        // reclaim attempts. When full: sweep fully-expired buckets first; if
+        // everything is live, shed the least-valuable bucket of a bounded
+        // sample (approximate LRU) so a sustained distinct-key flood cannot
+        // lock out new legitimate subjects.
+        let mut admitted = false;
+        for _ in 0..3 {
+            if self
+                .tracked
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current < MAX_TRACKED_KEYS).then_some(current + 1)
+                })
+                .is_ok()
+            {
+                admitted = true;
+                break;
+            }
+            // At capacity: reclaim space, then retry the admission.
+            let swept = self.sweep_expired();
+            if swept == 0 {
+                self.evict_idlest_of_sample(key);
             }
         }
 
-        let mut entry = self.windows.entry(key.to_string()).or_default();
-        Self::prune_and_record(entry.value_mut(), now, window_start, limit)
+        if !admitted {
+            tracing::warn!(
+                tracked = self.tracked.load(Ordering::Acquire),
+                "rate-limit window map at capacity; rejecting request for a new key"
+            );
+            // No bucket exists for this key; the soonest anything can change
+            // is one full window from now.
+            return RateLimitDecision {
+                allowed: false,
+                remaining: 0,
+                reset_secs: now.saturating_add(RATE_LIMIT_WINDOW_MS).div_ceil(1000),
+            };
+        }
+
+        // The slot is won; materialize the bucket. If another thread created
+        // the same key in the meantime, refund the slot (the entry already
+        // counts) and record into the existing bucket.
+        match self.windows.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                self.tracked.fetch_sub(1, Ordering::AcqRel);
+                Self::prune_and_record(entry.get_mut(), now, window_start, limit)
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let mut window = VecDeque::new();
+                let decision = Self::prune_and_record(&mut window, now, window_start, limit);
+                entry.insert(window);
+                decision
+            }
+        }
+    }
+
+    /// Evicts the least-valuable bucket among a bounded sample of entries
+    /// (approximate LRU, issue #92). Victim preference order: (1) buckets
+    /// whose newest request already fell out of the sliding window
+    /// (effectively expired — evicting them destroys no live history), then
+    /// (2) fewest in-window requests (least rate-limit history reset), then
+    /// (3) the idlest by newest timestamp. `exclude` (the key being
+    /// admitted) is never the victim. Bounded to [`LRU_SAMPLE_SIZE`]
+    /// examined entries — never a full-map scan on the request path.
+    ///
+    /// TRADE-OFF (documented per the #92 security review): evicting a LIVE
+    /// bucket resets that subject's window, so a sustained distinct-key
+    /// flood at cap can erode other subjects' rate-limit history instead of
+    /// locking out new subjects (the previous fail-closed behavior). The
+    /// victim weighting above minimizes destroyed history, and the sample is
+    /// not attacker-selectable (randomized hasher), but the flip side is
+    /// deliberate: admitting legitimate new subjects is preferred over
+    /// preserving every existing window under an active flood.
+    fn evict_idlest_of_sample(&self, exclude: &str) {
+        let window_start = now_millis().saturating_sub(RATE_LIMIT_WINDOW_MS);
+        let victim = self
+            .windows
+            .iter()
+            .filter(|entry| entry.key() != exclude)
+            .take(LRU_SAMPLE_SIZE)
+            .min_by_key(|entry| {
+                let newest = entry.value().back().copied().unwrap_or(0);
+                // An empty or fully-aged bucket is the ideal victim (`false`
+                // sorts before `true`); among live buckets prefer the one
+                // with the least in-window history, then the idlest.
+                let live = newest >= window_start;
+                let in_window = entry
+                    .value()
+                    .iter()
+                    .rev()
+                    .take_while(|&&ts| ts >= window_start)
+                    .count();
+                (live, in_window, newest)
+            })
+            .map(|entry| entry.key().clone());
+
+        if let Some(key) = victim
+            && self.windows.remove(&key).is_some()
+        {
+            self.tracked
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            tracing::debug!(evicted = %key, "rate-limit cap reached; evicted the idlest sampled bucket");
+        }
     }
 
     /// Drops timestamps older than `window_start` from `window`, records `now`
@@ -264,7 +368,13 @@ impl RateLimiter {
             }
             !window.is_empty()
         });
-        before.saturating_sub(self.windows.len())
+        let removed = before.saturating_sub(self.windows.len());
+        // Resync the atomic admission counter after the bulk removal (issue
+        // #92). Using the authoritative post-sweep map size self-heals any
+        // transient drift from concurrent admissions/evictions.
+        self.tracked
+            .store(self.windows.len(), std::sync::atomic::Ordering::Release);
+        removed
     }
 
     /// Returns the number of keys currently tracked (for tests / observability).
@@ -663,6 +773,85 @@ mod tests {
         // from now, not a full window.
         let expected = old.saturating_add(RATE_LIMIT_WINDOW_MS).div_ceil(1000);
         assert_eq!(decision.reset_secs, expected);
+    }
+
+    /// Issue #92 acceptance: under a sustained flood of DISTINCT LIVE keys
+    /// (nothing expired, map at cap), a new legitimate subject is still
+    /// admitted — the sampled-LRU eviction sheds an idle bucket instead of
+    /// fail-closed rejecting every newcomer.
+    #[test]
+    fn test_new_key_admitted_at_cap_via_lru_eviction() {
+        let limiter = RateLimiter::new();
+        for i in 0..MAX_TRACKED_KEYS {
+            assert!(limiter.check_and_record("k-flood", 1) || i > 0);
+            // Insert distinct live keys directly for speed.
+            limiter
+                .windows
+                .entry(format!("flood-{i}"))
+                .or_default()
+                .push_back(now_millis());
+        }
+        // Resync the counter to the directly-inserted state.
+        limiter
+            .tracked
+            .store(limiter.windows.len(), std::sync::atomic::Ordering::Release);
+        let at_cap = limiter.tracked_keys();
+        assert!(at_cap >= MAX_TRACKED_KEYS);
+
+        let decision = limiter.check_and_record_status("legit-newcomer", 10);
+        assert!(
+            decision.allowed,
+            "a new subject must be admitted at cap by shedding an idle bucket"
+        );
+        assert!(
+            limiter.windows.contains_key("legit-newcomer"),
+            "the newcomer's bucket exists"
+        );
+        assert!(
+            limiter.tracked_keys() <= at_cap,
+            "the map did not grow past the cap"
+        );
+    }
+
+    /// Issue #92 acceptance: the cap holds exactly under concurrent
+    /// admissions of brand-new keys (the old len()+entry() TOCTOU could
+    /// overshoot by ~worker count).
+    #[test]
+    fn test_cap_holds_exactly_under_concurrent_inserts() {
+        use std::sync::Arc;
+
+        let limiter = Arc::new(RateLimiter::new());
+        // Fill to just under the cap so the contended admissions straddle it.
+        let prefill = MAX_TRACKED_KEYS - 4;
+        for i in 0..prefill {
+            limiter
+                .windows
+                .entry(format!("pre-{i}"))
+                .or_default()
+                .push_back(now_millis());
+        }
+        limiter
+            .tracked
+            .store(limiter.windows.len(), std::sync::atomic::Ordering::Release);
+
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let limiter = Arc::clone(&limiter);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..16 {
+                    let _ = limiter.check_and_record(&format!("conc-{t}-{i}"), 10);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker thread completes");
+        }
+
+        assert!(
+            limiter.windows.len() <= MAX_TRACKED_KEYS,
+            "cap must hold exactly: len = {}",
+            limiter.windows.len()
+        );
     }
 
     #[test]

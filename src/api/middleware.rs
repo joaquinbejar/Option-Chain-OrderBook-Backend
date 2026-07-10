@@ -65,7 +65,10 @@ pub async fn auth_middleware(
     // Token issuance is unauthenticated but rate-limited by the trusted peer
     // address (never a spoofable client header unless a proxy is trusted).
     if method == Method::POST && path == TOKEN_PATH {
-        let key = token_rate_limit_key(&request, state.trust_proxy);
+        let key = match token_rate_limit_key(&request, state.trust_proxy) {
+            Ok(key) => key,
+            Err(err) => return err.into_response(),
+        };
         let decision = state
             .auth
             .check_rate_limit_status(&key, TOKEN_ISSUE_RATE_LIMIT);
@@ -202,23 +205,29 @@ fn add_rate_limit_headers(response: &mut Response, limit: u32, decision: RateLim
 /// `trust_proxy` is enabled (the operator asserts a trusted reverse proxy
 /// terminates the connection). The constant `"unknown"` shared bucket is never
 /// used as a catch-all under normal operation.
-fn token_rate_limit_key(request: &Request<Body>, trust_proxy: bool) -> String {
+fn token_rate_limit_key(request: &Request<Body>, trust_proxy: bool) -> Result<String, ApiError> {
     if trust_proxy && let Some(ip) = forwarded_ip(request) {
-        return format!("token_issue:fwd:{ip}");
+        return Ok(format!("token_issue:fwd:{ip}"));
     }
 
     match request.extensions().get::<ConnectInfo<SocketAddr>>() {
-        Some(ConnectInfo(addr)) => format!("token_issue:peer:{}", addr.ip()),
+        Some(ConnectInfo(addr)) => Ok(format!("token_issue:peer:{}", addr.ip())),
         None => {
-            // ConnectInfo is always injected in production (see `main.rs`); its
-            // absence means the service was built without connect-info wiring.
-            // Apply the limit under a single fallback bucket and warn so the
-            // misconfiguration is visible rather than silently un-limited.
-            tracing::warn!(
+            // ConnectInfo is wired statically in `main.rs`
+            // (`into_make_service_with_connect_info`); its absence means the
+            // service was rebuilt without connect-info — a code regression.
+            // Fail the request loudly (opaque 500 + ERROR log) instead of
+            // funneling every caller into one shared fallback bucket (issue
+            // #92): the shared bucket silently degraded per-IP limiting, and
+            // the loud failure surfaces the regression on the first request
+            // (the auth integration suite catches it immediately).
+            tracing::error!(
                 "token-endpoint rate limit could not resolve a peer address; \
-                 using a fallback bucket (check into_make_service_with_connect_info)"
+                 the service was built without into_make_service_with_connect_info"
             );
-            "token_issue:peer:unresolved".to_string()
+            Err(ApiError::Internal(
+                "token endpoint peer address unavailable".to_string(),
+            ))
         }
     }
 }
@@ -309,7 +318,7 @@ mod tests {
             .headers_mut()
             .insert("X-Forwarded-For", "1.2.3.4".parse().expect("header value"));
         assert_eq!(
-            token_rate_limit_key(&request, false),
+            token_rate_limit_key(&request, false).expect("key resolves"),
             "token_issue:peer:203.0.113.7"
         );
     }
@@ -325,8 +334,8 @@ mod tests {
         b.headers_mut()
             .insert("X-Forwarded-For", "8.8.8.8".parse().expect("header value"));
         assert_eq!(
-            token_rate_limit_key(&a, false),
-            token_rate_limit_key(&b, false)
+            token_rate_limit_key(&a, false).expect("key resolves"),
+            token_rate_limit_key(&b, false).expect("key resolves")
         );
     }
 
@@ -335,8 +344,8 @@ mod tests {
         let a = req_with_peer(Method::POST, TOKEN_PATH, "203.0.113.7:1111");
         let b = req_with_peer(Method::POST, TOKEN_PATH, "198.51.100.2:1111");
         assert_ne!(
-            token_rate_limit_key(&a, false),
-            token_rate_limit_key(&b, false)
+            token_rate_limit_key(&a, false).expect("key resolves"),
+            token_rate_limit_key(&b, false).expect("key resolves")
         );
     }
 
@@ -348,7 +357,7 @@ mod tests {
             .headers_mut()
             .insert("X-Forwarded-For", "1.2.3.4".parse().expect("header value"));
         assert_eq!(
-            token_rate_limit_key(&request, true),
+            token_rate_limit_key(&request, true).expect("key resolves"),
             "token_issue:fwd:1.2.3.4"
         );
     }
@@ -358,20 +367,20 @@ mod tests {
         // trust_proxy on but no forwarding header present: fall back to the peer.
         let request = req_with_peer(Method::POST, TOKEN_PATH, "203.0.113.7:54321");
         assert_eq!(
-            token_rate_limit_key(&request, true),
+            token_rate_limit_key(&request, true).expect("key resolves"),
             "token_issue:peer:203.0.113.7"
         );
     }
 
     #[test]
-    fn test_token_key_without_connect_info_uses_fallback_bucket() {
-        // No ConnectInfo extension (e.g. service built without connect-info): a
-        // single fallback bucket is used rather than a constant "unknown".
+    fn test_token_key_without_connect_info_is_a_loud_failure() {
+        // No ConnectInfo extension (service built without connect-info wiring)
+        // is a code regression: the request fails with a typed error instead
+        // of degrading into a single shared fallback bucket (issue #92).
         let request = req(Method::POST, TOKEN_PATH);
-        assert_eq!(
-            token_rate_limit_key(&request, false),
-            "token_issue:peer:unresolved"
-        );
+        let err = token_rate_limit_key(&request, false)
+            .expect_err("missing ConnectInfo must be a loud failure");
+        assert!(matches!(err, ApiError::Internal(_)));
     }
 
     #[test]
