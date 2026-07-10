@@ -1,5 +1,6 @@
 //! API request handlers.
 
+use crate::api::websocket::{OrderbookDeltaEvent, PriceLevelChange, TradeEvent};
 use crate::error::{ApiError, ErrorResponse, RateLimitErrorResponse};
 use crate::models::{
     ATMTermStructurePoint, AddOrderRequest, AddOrderResponse, ApiTimeInForce, BulkCancelRequest,
@@ -24,7 +25,7 @@ use crate::state::{AppState, StoredSnapshot};
 use axum::Json;
 use axum::extract::Query;
 use axum::extract::{Path, State};
-use option_chain_orderbook::orderbook::Quote;
+use option_chain_orderbook::orderbook::{OptionOrderBook, Quote};
 use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side, TimeInForce};
@@ -1783,6 +1784,22 @@ pub async fn add_order(
         record_fills(&state, &record_symbol, &underlying, body.side, &executed);
     }
 
+    // Publish orderbook deltas so WS `orderbook` subscribers observe this
+    // mutation (issue #129): a crossing portion consumes maker levels on the
+    // opposite side, and any resting remainder updates this order's own side.
+    if filled_quantity > 0 {
+        let consumed: Vec<u128> = match_result
+            .trades()
+            .as_vec()
+            .iter()
+            .map(|t| t.price().as_u128())
+            .collect();
+        publish_consumed_maker_deltas(&state, option_book, side, &consumed);
+    }
+    if remaining_quantity > 0 {
+        publish_level_delta(&state, option_book, side, body.price);
+    }
+
     tracing::debug!(
         order_id = %order_id,
         underlying = %underlying,
@@ -1866,6 +1883,15 @@ pub async fn cancel_order(
         .parse()
         .map_err(|_| ApiError::InvalidRequest(format!("Invalid order ID: {}", order_id_str)))?;
 
+    // Capture the resting order's side/price BEFORE cancelling so an orderbook
+    // delta can be published for the affected level afterward (issue #129). This
+    // works for untracked orders too (e.g. market-maker quotes), since it reads
+    // the book rather than `state.orders`.
+    let resting_level = option_book
+        .inner()
+        .get_order(order_id)
+        .map(|o| (o.side(), o.price().as_u128()));
+
     let success = option_book
         .cancel_order(order_id)
         .map_err(|e| ApiError::OrderBook(e.to_string()))?;
@@ -1882,6 +1908,12 @@ pub async fn cancel_order(
         entry.remaining_quantity = 0;
         entry.status = OrderStatus::Filled;
         entry.updated_at_ms = chrono::Utc::now().timestamp_millis() as u64;
+    }
+
+    // A confirmed cancel removed the order's resting quantity; publish the
+    // resulting level total (0 if the level is now empty) to subscribers (#129).
+    if success && let Some((side, price)) = resting_level {
+        publish_level_delta(&state, option_book, side, price);
     }
 
     tracing::debug!(
@@ -2024,6 +2056,11 @@ pub async fn modify_order(
     // `Active` entry behind.
     state.orders.remove(&order_id_str);
 
+    // Publish the delta for the OLD level (its quantity dropped by the cancelled
+    // order) to WS `orderbook` subscribers (issue #129). The NEW level is
+    // published after the replacement is placed below.
+    publish_level_delta(&state, option_book, side, current_price.as_u128());
+
     // Create a new order with the updated parameters
     let new_order_id = OrderId::new();
 
@@ -2068,6 +2105,13 @@ pub async fn modify_order(
                 fills: vec![],
             };
             state.orders.insert(new_order_id.to_string(), order_info);
+
+            // Publish the delta for the NEW level the replacement rests on
+            // (issue #129). Cancel-and-replace keeps the same side; a replacement
+            // that crosses and consumes opposite-side maker levels does NOT emit
+            // those deltas here (modify uses the non-fill-capturing add path and
+            // likewise does not record such fills) — a documented limitation.
+            publish_level_delta(&state, option_book, side, new_price);
 
             tracing::debug!(
                 old_order_id = %order_id_str,
@@ -2674,6 +2718,18 @@ pub async fn submit_market_order(
                     });
                 }
                 record_fills(&state, &symbol, &underlying, body.side, &executed);
+
+                // Publish orderbook deltas for the maker levels this market order
+                // consumed (issue #129). A market order never rests, so there is
+                // no own-side resting delta — only the opposite-side maker levels
+                // it drained.
+                let consumed: Vec<u128> = match_result
+                    .trades()
+                    .as_vec()
+                    .iter()
+                    .map(|t| t.price().as_u128())
+                    .collect();
+                publish_consumed_maker_deltas(&state, option_book, side, &consumed);
             }
 
             Ok(Json(MarketOrderResponse {
@@ -3062,6 +3118,22 @@ fn submit_single_order(
         record_fills(state, &symbol, &item.underlying, order_side, &executed);
     }
 
+    // Publish orderbook deltas so WS `orderbook` subscribers observe this bulk
+    // order's book mutation (issue #129), mirroring the single add_order path: a
+    // crossing portion consumes opposite-side maker levels, any remainder rests.
+    if filled_quantity > 0 {
+        let consumed: Vec<u128> = match_result
+            .trades()
+            .as_vec()
+            .iter()
+            .map(|t| t.price().as_u128())
+            .collect();
+        publish_consumed_maker_deltas(state, option_book, side, &consumed);
+    }
+    if remaining_quantity > 0 {
+        publish_level_delta(state, option_book, side, item.price);
+    }
+
     // Track order in AppState with the REAL fill/remaining state.
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let order_info = OrderInfo {
@@ -3130,9 +3202,23 @@ fn cancel_bulk_item_order(
 
     let option_book = strike_book.get(option_style);
 
-    option_book
+    let canceled = option_book
         .cancel_order(order_id)
-        .map_err(|e| format!("cancel failed: {}", e))
+        .map_err(|e| format!("cancel failed: {}", e))?;
+
+    // If the rollback actually removed the resting order/remainder, publish the
+    // affected level's resulting total (issue #129) so the delta emitted when the
+    // order was placed in `submit_single_order` is balanced by its removal.
+    if canceled {
+        publish_level_delta(
+            state,
+            option_book,
+            order_side_to_side(item.side),
+            item.price,
+        );
+    }
+
+    Ok(canceled)
 }
 
 /// The fate of one previously-accepted order during an atomic rollback.
@@ -3519,9 +3605,14 @@ pub async fn bulk_cancel_orders(
                     let option_book = strike_book.get(option_style);
                     match option_book.cancel_order(order_id) {
                         Ok(true) => {
+                            // Capture the affected level before dropping the
+                            // tracked info so a delta can be published (#129).
+                            let side = order_side_to_side(order_info.side);
+                            let price = order_info.price;
                             // Remove from tracking
                             drop(order_info);
                             state.orders.remove(order_id_str);
+                            publish_level_delta(&state, option_book, side, price);
                             results.push(BulkCancelResultItem {
                                 order_id: order_id_str.clone(),
                                 canceled: true,
@@ -3706,6 +3797,15 @@ pub async fn cancel_all_orders(
                 match option_book.cancel_order(order_id) {
                     Ok(true) => {
                         state.orders.remove(&order_id_str);
+                        // Publish the affected level's resulting total to WS
+                        // `orderbook` subscribers (issue #129). `order_info` is an
+                        // owned clone here, so no tracking guard is held.
+                        publish_level_delta(
+                            &state,
+                            option_book,
+                            order_side_to_side(order_info.side),
+                            order_info.price,
+                        );
                         canceled_count += 1;
                         continue;
                     }
@@ -3992,6 +4092,108 @@ struct ExecutedFill {
     maker_order_id: String,
 }
 
+/// Maps a resting order's [`Side`] to the orderbook-delta side string used on the
+/// wire: `"bid"` for buy (bid-side) orders, `"ask"` for sell (ask-side) orders.
+///
+/// This matches the bid/ask convention of the WebSocket orderbook *snapshot*, so
+/// a client can reconcile a snapshot with the deltas that follow it.
+#[must_use]
+fn resting_side_str(side: Side) -> &'static str {
+    match side {
+        Side::Buy => "bid",
+        Side::Sell => "ask",
+    }
+}
+
+/// Reads back the current *visible* total quantity resting at `price` on `side`
+/// of `option_book`, matching the level quantity the orderbook snapshot reports.
+///
+/// Returns `0` when the level no longer exists (the delta contract's "removed"
+/// sentinel). This touches only the single mutated price level — an O(1) map
+/// lookup plus a walk of just that level's resting orders — rather than scanning
+/// the whole book, so it is safe to call per mutated price on the request path.
+#[must_use]
+fn level_visible_quantity(option_book: &OptionOrderBook, side: Side, price: u128) -> u64 {
+    option_book
+        .inner()
+        .get_orders_at_price(price, side)
+        .iter()
+        .map(|order| order.visible_quantity().as_u64())
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Builds an [`OrderbookDeltaEvent`] for a single `(side, price)` level change
+/// carrying `new_quantity` (the resulting total at the level; `0` means removed)
+/// under `sequence`. Pure: no book or state access, so it is unit-testable.
+#[must_use]
+fn build_level_delta(
+    symbol: &str,
+    side: Side,
+    price: u128,
+    new_quantity: u64,
+    sequence: u64,
+) -> OrderbookDeltaEvent {
+    OrderbookDeltaEvent {
+        symbol: symbol.to_string(),
+        sequence,
+        change: PriceLevelChange {
+            side: resting_side_str(side).to_string(),
+            price,
+            quantity: new_quantity,
+        },
+    }
+}
+
+/// Reads back the resulting level quantity and broadcasts one orderbook delta for
+/// the `(side, price)` level of `option_book` to WS `orderbook` subscribers
+/// (issue #129).
+///
+/// The delta's symbol is the book's own canonical
+/// `UNDERLYING-YYYYMMDD-STRIKE-STYLE` string ([`OptionOrderBook::symbol`]), which
+/// is byte-identical to the symbol a client subscribes with, so the send-task
+/// filter matches. A fresh per-symbol sequence number orders the event.
+fn publish_level_delta(state: &AppState, option_book: &OptionOrderBook, side: Side, price: u128) {
+    let symbol = option_book.symbol();
+    let new_quantity = level_visible_quantity(option_book, side, price);
+    let sequence = state.orderbook_subscriptions.next_sequence(symbol);
+    state
+        .orderbook_subscriptions
+        .broadcast_delta(build_level_delta(
+            symbol,
+            side,
+            price,
+            new_quantity,
+            sequence,
+        ));
+}
+
+/// Publishes one orderbook delta per distinct maker price consumed by a crossing
+/// limit order or a market order (issue #129).
+///
+/// `taker_side` is the incoming aggressor's side; the consumed maker levels are
+/// on the opposite side. Duplicate prices (several maker orders filled at one
+/// level) are collapsed so a single delta reports each affected level's resulting
+/// quantity.
+fn publish_consumed_maker_deltas(
+    state: &AppState,
+    option_book: &OptionOrderBook,
+    taker_side: Side,
+    prices: &[u128],
+) {
+    let maker_side = match taker_side {
+        Side::Buy => Side::Sell,
+        Side::Sell => Side::Buy,
+    };
+    let mut seen: Vec<u128> = Vec::new();
+    for &price in prices {
+        if seen.contains(&price) {
+            continue;
+        }
+        seen.push(price);
+        publish_level_delta(state, option_book, maker_side, price);
+    }
+}
+
 /// Records the executed `fills` of a successful match into the four live
 /// market-data stores so the REST surface reflects real trades.
 ///
@@ -4102,6 +4304,22 @@ fn record_fills(
                 .market_maker
                 .on_order_filled(maker_id, fill.price, fill.quantity);
         }
+
+        // Trade stream (issue #129): broadcast the execution to WS `trades`
+        // subscribers of this `symbol`. Every field is at hand from the fill;
+        // `symbol` is the canonical UNDERLYING-YYYYMMDD-STRIKE-STYLE key, which
+        // matches what a client subscribes with. Delivery is subscription-gated
+        // and best-effort (a lagging client may drop) — REST `/executions` and
+        // `/last-trade` remain authoritative.
+        state.orderbook_subscriptions.broadcast_trade(TradeEvent {
+            trade_id: fill.trade_id.clone(),
+            symbol: symbol.to_string(),
+            price: fill.price,
+            quantity: fill.quantity,
+            timestamp_ms: fill.timestamp_ms,
+            maker_order_id: fill.maker_order_id.clone(),
+            taker_order_id: fill.taker_order_id.clone(),
+        });
 
         tracing::debug!(
             symbol = %symbol,
@@ -4519,6 +4737,151 @@ mod tests {
 
         assert_eq!(response.status, LimitOrderStatus::Accepted);
         assert!(response.message.contains("GTC"));
+    }
+
+    // ------------------------------------------------------------------------
+    // Issue #129: user-driven book mutations publish orderbook deltas, and
+    // record_fills publishes trade events, into the WS subscription manager.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_resting_side_str_maps_bid_and_ask() {
+        // Buy orders rest on the bid side, sell orders on the ask side — the
+        // convention the orderbook snapshot uses.
+        assert_eq!(resting_side_str(Side::Buy), "bid");
+        assert_eq!(resting_side_str(Side::Sell), "ask");
+    }
+
+    #[test]
+    fn test_build_level_delta_shapes_change() {
+        let event = build_level_delta("TEST-20251231-100-C", Side::Sell, 150, 6, 7);
+        assert_eq!(event.symbol, "TEST-20251231-100-C");
+        assert_eq!(event.sequence, 7);
+        assert_eq!(event.change.side, "ask");
+        assert_eq!(event.change.price, 150);
+        assert_eq!(event.change.quantity, 6);
+
+        // A removed level carries quantity 0 on the correct side.
+        let removed = build_level_delta("TEST-20251231-100-C", Side::Buy, 100, 0, 1);
+        assert_eq!(removed.change.side, "bid");
+        assert_eq!(removed.change.price, 100);
+        assert_eq!(removed.change.quantity, 0);
+    }
+
+    #[tokio::test]
+    async fn test_add_order_publishes_resting_delta() {
+        let state = create_test_state();
+        // Subscribe BEFORE the mutation so the resting delta is captured.
+        let mut delta_rx = state.orderbook_subscriptions.subscribe_deltas();
+
+        let _ = add_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Json(AddOrderRequest {
+                side: OrderSide::Buy,
+                price: 100,
+                quantity: 10,
+                time_in_force: Some(ApiTimeInForce::Gtc),
+                expire_at: None,
+            }),
+        )
+        .await
+        .expect("resting buy accepted");
+
+        let deltas: Vec<_> = std::iter::from_fn(|| delta_rx.try_recv().ok()).collect();
+        assert_eq!(deltas.len(), 1, "one resting delta for the new bid level");
+        let delta = &deltas[0];
+        assert_eq!(delta.symbol, "TEST-20251231-100-C");
+        assert_eq!(delta.change.side, "bid");
+        assert_eq!(delta.change.price, 100);
+        assert_eq!(delta.change.quantity, 10);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order_publishes_removal_delta() {
+        let state = create_test_state();
+        let (order_id, exp) = submit_tracked_gtc_order(&state).await;
+
+        // Subscribe AFTER the resting order so only the cancel delta is captured.
+        let mut delta_rx = state.orderbook_subscriptions.subscribe_deltas();
+
+        let _ = cancel_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                exp,
+                100u64,
+                "call".to_string(),
+                order_id,
+            )),
+        )
+        .await
+        .expect("cancel ok");
+
+        let deltas: Vec<_> = std::iter::from_fn(|| delta_rx.try_recv().ok()).collect();
+        assert_eq!(deltas.len(), 1, "one delta for the emptied bid level");
+        let delta = &deltas[0];
+        assert_eq!(delta.symbol, "TEST-20251231-100-C");
+        assert_eq!(delta.change.side, "bid");
+        assert_eq!(delta.change.price, 100);
+        assert_eq!(delta.change.quantity, 0, "level removed after cancel");
+    }
+
+    #[tokio::test]
+    async fn test_market_order_publishes_maker_delta_and_trade() {
+        let state = create_test_state();
+
+        // Seed a resting sell (ask) of 10 @ 150.
+        let underlying_book = state.manager.get_or_create("TEST");
+        let expiration = parse_expiration("20251231").expect("valid expiration");
+        let exp_book = underlying_book.get_or_create_expiration(expiration);
+        let strike_book = exp_book.get_or_create_strike(100);
+        let option_book = strike_book.get(OptionStyle::Call);
+        option_book
+            .add_limit_order(OrderId::new(), Side::Sell, 150, 10)
+            .expect("resting ask placed");
+
+        // Subscribe AFTER seeding so only the market order's events are captured.
+        let mut delta_rx = state.orderbook_subscriptions.subscribe_deltas();
+        let mut trade_rx = state.orderbook_subscriptions.subscribe_trades();
+
+        let _ = submit_market_order(
+            State(state.clone()),
+            Path((
+                "TEST".to_string(),
+                "20251231".to_string(),
+                100u64,
+                "call".to_string(),
+            )),
+            Json(MarketOrderRequest {
+                side: OrderSide::Buy,
+                quantity: 4,
+            }),
+        )
+        .await
+        .expect("market buy filled");
+
+        // One maker-level delta: the ask at 150 dropped from 10 to 6.
+        let deltas: Vec<_> = std::iter::from_fn(|| delta_rx.try_recv().ok()).collect();
+        assert_eq!(deltas.len(), 1, "one delta for the consumed ask level");
+        let delta = &deltas[0];
+        assert_eq!(delta.symbol, "TEST-20251231-100-C");
+        assert_eq!(delta.change.side, "ask");
+        assert_eq!(delta.change.price, 150);
+        assert_eq!(delta.change.quantity, 6, "10 resting minus 4 consumed");
+
+        // One trade event carrying the exact execution price/quantity.
+        let trades: Vec<_> = std::iter::from_fn(|| trade_rx.try_recv().ok()).collect();
+        assert_eq!(trades.len(), 1, "one trade for the single fill");
+        let trade = &trades[0];
+        assert_eq!(trade.symbol, "TEST-20251231-100-C");
+        assert_eq!(trade.price, 150);
+        assert_eq!(trade.quantity, 4);
     }
 
     // ------------------------------------------------------------------------

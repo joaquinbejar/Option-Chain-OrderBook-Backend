@@ -34,4 +34,7 @@ mod websocket;
 pub use client::{ClientConfig, OrderbookClient};
 pub use error::Error;
 pub use types::*;
-pub use websocket::{ClientCommand, WsClient, WsMessage};
+pub use websocket::{
+    ActiveSubscription, ChannelSubscription, ClientCommand, PriceLevelChange, PriceLevelData,
+    SubscriptionChannel, SubscriptionResult, WsClient, WsMessage,
+};
