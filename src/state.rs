@@ -86,6 +86,11 @@ pub struct AppState {
     pub executions: Arc<DashMap<String, ExecutionInfo>>,
     /// Storage for orderbook snapshots by snapshot ID.
     pub snapshots: Arc<DashMap<String, StoredSnapshot>>,
+    /// Graceful-shutdown signal (issue #118): set once by `main.rs` after the
+    /// watch channel exists; live WebSocket connections subscribe so they
+    /// close promptly on shutdown instead of keeping `serve()` alive until an
+    /// idle client disconnects.
+    shutdown_rx: std::sync::OnceLock<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl AppState {
@@ -111,6 +116,7 @@ impl AppState {
             trust_proxy: false,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
+            shutdown_rx: std::sync::OnceLock::new(),
         }
     }
 
@@ -139,6 +145,7 @@ impl AppState {
             trust_proxy: false,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
+            shutdown_rx: std::sync::OnceLock::new(),
         }
     }
 
@@ -191,6 +198,7 @@ impl AppState {
             trust_proxy: false,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
+            shutdown_rx: std::sync::OnceLock::new(),
         }
     }
 
@@ -345,6 +353,22 @@ impl AppState {
             self.snapshots.remove(&key);
         }
     }
+
+    /// Installs the graceful-shutdown signal (issue #118). Called once from
+    /// `main.rs` after the watch channel is created; subsequent calls are
+    /// no-ops (`OnceLock` semantics).
+    pub fn set_shutdown_signal(&self, rx: tokio::sync::watch::Receiver<bool>) {
+        let _ = self.shutdown_rx.set(rx);
+    }
+
+    /// Returns a fresh receiver of the graceful-shutdown signal, when wired.
+    ///
+    /// `None` in unit tests / states built without `main.rs` wiring — callers
+    /// must treat that as "never fires", not as "shut down now".
+    #[must_use]
+    pub fn shutdown_signal(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.shutdown_rx.get().cloned()
+    }
 }
 
 impl Default for AppState {
@@ -374,6 +398,32 @@ mod tests {
                 created_at,
             }],
         )
+    }
+
+    /// Issue #118: the shutdown signal is absent until wired, installs once,
+    /// and cloned receivers observe the sender's flip.
+    #[tokio::test]
+    async fn test_shutdown_signal_wiring() {
+        let state = AppState::new();
+        assert!(
+            state.shutdown_signal().is_none(),
+            "unwired state has no signal"
+        );
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        state.set_shutdown_signal(rx);
+        let mut sub = state.shutdown_signal().expect("signal wired");
+
+        // Second install is a no-op (OnceLock).
+        let (_tx2, rx2) = tokio::sync::watch::channel(false);
+        state.set_shutdown_signal(rx2);
+
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(std::time::Duration::from_secs(1), sub.changed())
+            .await
+            .expect("subscriber observes the flip within the deadline")
+            .expect("sender alive");
+        assert!(*sub.borrow());
     }
 
     #[test]

@@ -535,6 +535,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
     let sender_clone = Arc::clone(&sender);
     let subscribed_symbols_clone = Arc::clone(&subscribed_symbols);
     let subscribed_trades_clone = Arc::clone(&subscribed_trades);
+    // Graceful shutdown (issue #118): when `main.rs` wired the watch signal,
+    // the send task observes it and closes the connection promptly; without
+    // the wiring (unit tests) the branch never fires.
+    let mut shutdown_rx = state.shutdown_signal();
     let mut send_task = tokio::spawn(async move {
         // Construct the heartbeat ticker ONCE, outside the loop, so its cadence is
         // wall-clock fixed and independent of outbound event traffic. (Issue #65:
@@ -551,6 +555,27 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
         heartbeat.tick().await;
         loop {
             tokio::select! {
+                // Graceful shutdown (issue #118): close the connection so an
+                // idle client cannot keep `serve()` alive. When the signal is
+                // not wired the future stays pending forever.
+                () = async {
+                    match shutdown_rx.as_mut() {
+                        Some(rx) => {
+                            // An error means the sender is gone — treat as
+                            // shutdown as well.
+                            let _ = rx.changed().await;
+                        }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = sender_clone
+                        .lock()
+                        .await
+                        .send(Message::Close(None))
+                        .await;
+                    info!("closing WebSocket connection on shutdown signal");
+                    break;
+                }
                 // Handle market maker events
                 event = event_rx.recv() => {
                     match event {
