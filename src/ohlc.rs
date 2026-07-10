@@ -108,14 +108,14 @@ impl OhlcAggregator {
     ///
     /// # Limit semantics
     ///
-    /// When more than `limit` bars match the `[from, to]` range:
-    /// - **Open-ended** (`to` is `None`): the caller wants "the latest N", so the
-    ///   NEWEST `limit` bars are returned (issue #73). Without this a charting
-    ///   client polling recent data would receive the OLDEST `limit` bars once the
-    ///   history grew past `limit` — backwards from candlestick semantics.
-    /// - **Explicit `to`**: the result is anchored at `from` (the window start),
-    ///   so the OLDEST `limit` bars within `[from, to]` are returned (unchanged
-    ///   behavior).
+    /// When more than `limit` bars match the `[from, to]` range, the anchor
+    /// depends on which ends the caller pinned:
+    /// - **`from` unset** (open-ended, issue #73; or explicit `to` only, issue
+    ///   #115): the caller wants "the latest N (up to `to`)", so the NEWEST
+    ///   `limit` bars within the window are returned — a window ending at `to`,
+    ///   never ancient bars anchored at timestamp 0.
+    /// - **Both `from` and `to` set**: the window anchors at `from`, so the
+    ///   OLDEST `limit` bars within `[from, to]` are returned.
     ///
     /// # Returns
     ///
@@ -143,17 +143,22 @@ impl OhlcAggregator {
         // pre-size to that known upper bound to avoid reallocation while filling.
         let capacity = limit.min(bars_map.len());
 
-        if to.is_none() {
-            // Open-ended: take the newest `limit` bars from the end of the range,
-            // then restore ascending (oldest-first) order for the returned Vec.
+        if from.is_some() && to.is_some() {
+            // Fully explicit window `[from, to]`: keep the oldest `limit` bars
+            // within it — the caller pinned both ends, so the window anchors
+            // at `from`.
+            let mut bars: Vec<OhlcBar> = Vec::with_capacity(capacity);
+            bars.extend(range.take(limit).map(|(_, bar)| *bar));
+            bars
+        } else {
+            // Recent-end anchored (issue #73 for the open-ended case, issue
+            // #115 for explicit `to` with no `from`): a client asking "the
+            // latest N bars (up to `to`)" gets the `limit` bars ENDING at the
+            // window's end, not ancient bars from timestamp 0. Take from the
+            // end of the range, then restore ascending order.
             let mut bars: Vec<OhlcBar> = Vec::with_capacity(capacity);
             bars.extend(range.rev().take(limit).map(|(_, bar)| *bar));
             bars.reverse();
-            bars
-        } else {
-            // Explicit end: the window ends at `to`; keep the oldest `limit` bars.
-            let mut bars: Vec<OhlcBar> = Vec::with_capacity(capacity);
-            bars.extend(range.take(limit).map(|(_, bar)| *bar));
             bars
         }
     }
@@ -348,10 +353,38 @@ mod tests {
         );
     }
 
+    /// Issue #115: `to` set with `from` UNSET anchors at the recent end — the
+    /// `limit` bars ENDING at `to`, never the oldest-from-zero.
+    #[test]
+    fn test_get_bars_explicit_to_without_from_returns_newest_ending_at_to() {
+        let aggregator = OhlcAggregator::new();
+        let symbol = "AAPL_20251231_150_C";
+        let base_ts_ms: u64 = 1704067200000;
+
+        for i in 0..10u64 {
+            aggregator.record_trade(symbol, base_ts_ms + i * 60_000, 500, 100);
+        }
+
+        let base_secs = base_ts_ms / 1000;
+        // `to` = bar7; limit 3 -> bars 5, 6, 7 (ending AT `to`), ascending.
+        let to_ts = base_secs + 7 * 60;
+        let bars = aggregator.get_bars(symbol, OhlcInterval::OneMinute, None, Some(to_ts), 3);
+
+        assert_eq!(bars.len(), 3);
+        assert_eq!(
+            bars[0].timestamp,
+            base_secs + 5 * 60,
+            "window is the newest 3 ending at `to`, not oldest-from-zero"
+        );
+        assert_eq!(bars[2].timestamp, to_ts, "window ends exactly at `to`");
+        assert!(bars.windows(2).all(|w| w[0].timestamp < w[1].timestamp));
+    }
+
     #[test]
     fn test_get_bars_with_explicit_to_returns_oldest_limit_within_window() {
-        // Issue #73: when `to` is given the window is anchored at `to`, so the
-        // OLDEST `limit` within [from, to] are returned (unchanged semantics).
+        // With BOTH `from` and `to` pinned the window anchors at `from`, so the
+        // OLDEST `limit` within [from, to] are returned (unchanged semantics;
+        // the `to`-only case anchors at the recent end per issue #115).
         let aggregator = OhlcAggregator::new();
         let symbol = "AAPL_20251231_150_C";
         let base_ts_ms: u64 = 1704067200000;
