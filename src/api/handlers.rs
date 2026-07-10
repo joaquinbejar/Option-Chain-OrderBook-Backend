@@ -1645,6 +1645,16 @@ pub async fn add_order(
         ApiTimeInForce::Gtd => {
             // GTD orders require a valid future expire_at; reject missing/invalid
             // timestamps instead of falling back to an already-expired Gtd(0).
+            //
+            // UNIT CONTRACT (issue #98): the value passed to `TimeInForce::Gtd`
+            // is MILLISECONDS since the Unix epoch. The `pricelevel` doc claims
+            // seconds, but our engine — `orderbook-rs` `OrderBook::has_expired`
+            // (private.rs) — compares the stored expiry against
+            // `clock().now_millis()`, so milliseconds is the unit the consumer
+            // actually evaluates (verified against orderbook-rs 0.9 /
+            // pricelevel 0.8 sources). Passing seconds would make every GTD
+            // order expire immediately. Locked by
+            // `test_gtd_expiry_unit_is_milliseconds`.
             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
             let expire_ms = parse_gtd_expire_at(body.expire_at.as_deref(), now_ms)?;
             TimeInForce::Gtd(expire_ms)
@@ -4542,6 +4552,37 @@ mod tests {
         assert_eq!(multibyte.len(), 8, "fixture must be exactly 8 bytes");
         let err = parse_expiration(multibyte).expect_err("multibyte 8-byte input must be rejected");
         assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    /// Issue #98: the value handed to `TimeInForce::Gtd` must be MILLISECONDS.
+    /// Our engine (`orderbook-rs::OrderBook::has_expired`) evaluates expiry
+    /// against `clock().now_millis()`, so an order expiring one minute out
+    /// must carry `now_ms + 60_000` — and must still be un-expired when the
+    /// engine compares it against a now-milliseconds clock. If this test
+    /// breaks after an upstream bump, re-verify the consumer's unit before
+    /// touching the conversion (the pricelevel DOC claims seconds; the
+    /// orderbook-rs IMPL uses milliseconds).
+    #[test]
+    fn test_gtd_expiry_unit_is_milliseconds() {
+        use orderbook_rs::TimeInForce;
+
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let expire_at = chrono::DateTime::from_timestamp_millis((now_ms + 60_000) as i64)
+            .expect("valid timestamp")
+            .to_rfc3339();
+
+        let expire = parse_gtd_expire_at(Some(&expire_at), now_ms).expect("valid future expire_at");
+        // The parsed value is epoch milliseconds ~60s ahead of now_ms — i.e.
+        // the same magnitude as a milliseconds clock, NOT seconds (which
+        // would be ~1000x smaller and instantly expired vs now_millis).
+        assert!((59_000..=61_000).contains(&(expire - now_ms)));
+
+        let tif = TimeInForce::Gtd(expire);
+        // Un-expired against a milliseconds clock now; expired against a
+        // milliseconds clock past the deadline — the exact comparison the
+        // engine performs in has_expired.
+        assert!(!tif.is_expired(now_ms, None));
+        assert!(tif.is_expired(now_ms + 61_000, None));
     }
 
     #[test]
