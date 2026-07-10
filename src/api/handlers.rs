@@ -3534,6 +3534,16 @@ pub async fn bulk_submit_orders(
         ));
     }
 
+    // Issue #105: the upstream fill-capturing `add_limit_order_full` has
+    // PER-BOOK capture scope, so two concurrent bulk submits interleaving on
+    // the same book could mis-attribute captured fills and skew the atomic
+    // rollback accounting. Serialize bulk submits for the whole item loop
+    // (they are an infrequent path; the guard spans no external await other
+    // than this lock). A concurrent SINGLE-order submit on the same book
+    // remains subject to the upstream capture scope; a per-order fill return
+    // is tracked as an upstream improvement.
+    let _bulk_guard = state.bulk_submit_lock.lock().await;
+
     let mut results: Vec<BulkOrderResultItem> = Vec::with_capacity(body.orders.len());
     let mut success_count = 0;
     let mut failure_count = 0;
@@ -6094,6 +6104,51 @@ mod tests {
         assert_eq!(priced_resp.current_price, Some(100));
         assert_eq!(priced_resp.unrealized_pnl, Some(100));
         assert_eq!(priced_resp.notional_value, Some(1000));
+    }
+
+    /// Issue #105: two CONCURRENT bulk submits crossing the same book's
+    /// resting liquidity must attribute fills exactly — the global bulk lock
+    /// serializes them, so the combined captured fills equal the resting
+    /// size and nothing is double-attributed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_bulk_submits_attribute_fills_exactly() {
+        let state = create_test_state();
+        let underlying = "BULKCC";
+        let strike = 12000u64;
+        let exp = seed_book_with_strikes(&state, underlying, &[strike]);
+
+        // Resting SELL 20 @ 100 — exactly enough for both bulks combined.
+        place_resting_call(&state, underlying, &exp, strike, Side::Sell, 100, 20);
+
+        let mk_bulk = |qty: u64| BulkOrderRequest {
+            orders: vec![BulkOrderItem {
+                underlying: underlying.to_string(),
+                expiration: exp.clone(),
+                strike,
+                style: crate::models::OptionStyle::Call,
+                side: OrderSide::Buy,
+                price: 150,
+                quantity: qty,
+            }],
+            atomic: true,
+        };
+
+        let (a, b) = tokio::join!(
+            bulk_submit_orders(State(state.clone()), Json(mk_bulk(10))),
+            bulk_submit_orders(State(state.clone()), Json(mk_bulk(10)))
+        );
+        let a = a.expect("bulk A succeeds").0;
+        let b = b.expect("bulk B succeeds").0;
+        assert_eq!(a.success_count, 1);
+        assert_eq!(b.success_count, 1);
+
+        // Executions recorded across both bulks must total exactly the
+        // resting size — no double-attributed or lost fills.
+        let total_executed: u64 = state.executions.iter().map(|e| e.quantity).sum();
+        assert_eq!(
+            total_executed, 20,
+            "combined captured fills equal the resting liquidity exactly"
+        );
     }
 
     #[tokio::test]
