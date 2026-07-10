@@ -269,11 +269,14 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing. The default filter is plain `info` so request URIs are
     // not logged at debug — combined with `RedactingMakeSpan`, this prevents the
     // `?token=<jwt>` WebSocket query parameter from ever reaching the logs.
+    // Logs go to STDERR (issue #91): stdout is reserved for primary program
+    // output, so `TOKEN=$(... mint-token ...)` captures exactly the JWT with
+    // no interleaved log lines.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
     // CLI subcommand: `mint-token` signs a token offline and exits (no server).
