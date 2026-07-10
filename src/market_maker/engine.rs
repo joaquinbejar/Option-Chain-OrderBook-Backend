@@ -781,6 +781,12 @@ impl MarketMakerEngine {
                 warn!(expiration = %exp_str, "rejecting non-positive expiration days");
                 return Err(());
             }
+            // Issue #136: bound the day count so an absurd stored value can
+            // never overflow chrono's date arithmetic upstream (panic).
+            if days > crate::config::MAX_EXPIRATION_DAYS {
+                warn!(expiration = %exp_str, "rejecting out-of-range expiration days");
+                return Err(());
+            }
             let positive_days = Positive::new(days as f64).map_err(|_| {
                 warn!(expiration = %exp_str, "rejecting invalid expiration value");
             })?;

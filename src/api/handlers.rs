@@ -129,6 +129,15 @@ fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
                 "invalid expiration: {exp_str}. Expiration must be a positive number of days"
             )));
         }
+        // Bound the day count (issue #136): an absurd value such as
+        // "+574970603" parses as i32 but overflows chrono's date arithmetic
+        // inside the upstream conversion — a request-reachable panic.
+        if days > crate::config::MAX_EXPIRATION_DAYS {
+            return Err(ApiError::InvalidRequest(format!(
+                "invalid expiration: {exp_str}. Expiration must be at most {} days",
+                crate::config::MAX_EXPIRATION_DAYS
+            )));
+        }
         let positive_days = Positive::new(days as f64)
             .map_err(|_| ApiError::InvalidRequest(format!("invalid expiration: {exp_str}")))?;
         return Ok(ExpirationDate::Days(positive_days));
@@ -4279,6 +4288,19 @@ mod tests {
             let err = parse_expiration(bad).expect_err("invalid 8-digit date must be rejected");
             assert!(matches!(err, ApiError::InvalidRequest(_)), "{bad}");
         }
+    }
+
+    /// Issue #136: absurd day counts (including the "+574970603" legacy
+    /// shadow-book form, which parses as i32) must be a 400, never reach the
+    /// upstream date conversion that panics on chrono overflow.
+    #[test]
+    fn test_parse_expiration_rejects_out_of_range_days() {
+        for bad in ["36501", "574970603", "+574970603", "2000000000"] {
+            let err = parse_expiration(bad).expect_err("out-of-range days must be rejected");
+            assert!(matches!(err, ApiError::InvalidRequest(_)), "{bad}");
+        }
+        // The bound itself is accepted.
+        assert!(parse_expiration("36500").is_ok());
     }
 
     /// The days round-trip is preserved for short numerics: parse then
