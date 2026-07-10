@@ -1,5 +1,6 @@
 //! Position P&L and execution-report tests driven by the caller's own crossing
-//! fills (bug #110 makes filling against market-maker quotes impossible, so all
+//! fills (self-provided liquidity keeps the expected PnL values exact and
+//! independent of market-maker quotes, so all
 //! liquidity here is self-provided).
 //!
 //! Both tests create an underlying, so each uses the capture-then-assert pattern:

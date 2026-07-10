@@ -1,7 +1,8 @@
 //! Order lifecycle tests: status/list, modify, bulk submit/cancel, cancel-all.
 //!
 //! Placement uses [`TEST_EXPIRATION`]; modify / single-cancel / bulk-write / read
-//! paths use the server-formatted expiration (see the crate docs for bug #110).
+//! paths use the server-formatted expiration (identical to the sent value for
+//! date-form input since the #110 fix; see the crate docs).
 //!
 //! Every test creates an underlying, so each uses the capture-then-assert
 //! pattern: perform all requests capturing outcomes into plain variables, run
@@ -302,4 +303,40 @@ async fn test_cancel_all() {
     let response = response.expect("cancel all");
     assert_eq!(response.canceled_count, 2);
     assert_eq!(response.failed_count, 0);
+}
+
+/// Issue #110 acceptance: a `YYYYMMDD` expiration round-trips — the server
+/// stores the calendar-date expiration, `list_expirations` echoes the exact
+/// string that was sent, and the single-order cancel endpoint resolves the
+/// same book (no more shadow `Days(N)` expirations).
+#[tokio::test]
+async fn test_yyyymmdd_expiration_round_trips_and_single_cancel_resolves() {
+    let client = admin_client().await.expect("admin client");
+    let (underlying, formatted) = setup_underlying(&client, "RT110").await;
+
+    // Phase 1: the formatted (server-reported) expiration must equal the
+    // value that was sent; then place and cancel through the same string.
+    let path = OptionPath::call(&underlying, TEST_EXPIRATION, TEST_STRIKE);
+    let order_id = place_buy(&client, &underlying, 1400, 5).await;
+    let cancelled = match order_id.as_ref().ok() {
+        Some(id) => Some(client.cancel_order(&path, id).await),
+        None => None,
+    };
+
+    // Phase 2: cleanup.
+    cleanup_underlying(&client, &underlying).await;
+
+    // Phase 3: assert.
+    assert_eq!(
+        formatted, TEST_EXPIRATION,
+        "the YYYYMMDD value sent must be the canonical expiration key (issue #110)"
+    );
+    order_id.expect("add order");
+    let cancelled = cancelled
+        .expect("cancel should have run")
+        .expect("cancel order");
+    assert!(
+        cancelled.success,
+        "the single-order cancel endpoint must resolve the YYYYMMDD book"
+    );
 }
