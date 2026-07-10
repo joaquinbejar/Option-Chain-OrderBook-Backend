@@ -19,6 +19,16 @@ pub const MAX_INITIAL_PRICE: f64 = 1e12;
 /// Maximum accepted asset `volatility` (annualized, as a fraction).
 pub const MAX_VOLATILITY: f64 = 5.0;
 
+/// Maximum accepted relative expiration, in days (~100 years).
+///
+/// A day count beyond this is structurally absurd for an option expiration
+/// and, if allowed through, overflows chrono's date arithmetic inside the
+/// upstream `ExpirationDate → date` conversion — a request-reachable panic
+/// (issue #136: restore of a legacy shadow-book snapshot carried
+/// `"+574970603"`, which parses as an `i32` day count). Every
+/// `parse_expiration` site rejects day counts above this bound.
+pub const MAX_EXPIRATION_DAYS: i32 = 36_500;
+
 /// Converts a dollar amount to integer cents using the single, canonical
 /// rounding policy for the whole server.
 ///
