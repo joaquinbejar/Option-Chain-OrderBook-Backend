@@ -134,6 +134,21 @@ pub enum WsMessage {
         asks: Vec<PriceLevelData>,
     },
     /// Orderbook delta (incremental update).
+    ///
+    /// Published (issue #129) after every USER-DRIVEN book mutation on the REST
+    /// surface — `add_order`, `cancel_order`, `modify_order`, `submit_market_order`,
+    /// and the bulk submit/cancel/cancel-all paths — carrying the affected
+    /// level(s)' RESULTING total quantity (`0` means the level was removed). Each
+    /// change's `quantity` is read back from the book after the mutation and uses
+    /// the same visible-quantity measure as [`WsMessage::OrderbookSnapshot`], so a
+    /// client can reconcile a snapshot with the deltas that follow it. Delivery is
+    /// subscription-gated (exact symbol or `<underlying>:*` wildcard) and
+    /// best-effort; a lagging subscriber may drop deltas and should re-snapshot.
+    ///
+    /// The market-maker requote loop does NOT emit per-quote deltas here: its
+    /// quote updates are already broadcast as [`WsMessage::Quote`] and its fills as
+    /// [`WsMessage::Fill`]. Only user-driven mutations (and the maker levels their
+    /// fills consume) produce deltas — avoiding a per-requote delta storm.
     #[serde(rename = "orderbook_delta")]
     OrderbookDelta {
         /// Symbol identifier.
@@ -363,6 +378,11 @@ impl OrderbookSubscriptionManager {
     /// Gets the next sequence number for a symbol.
     #[must_use]
     pub fn next_sequence(&self, symbol: &str) -> u64 {
+        // Fast path: existing symbols take a read lookup with no String
+        // allocation (the publish path runs per order mutation).
+        if let Some(counter) = self.sequences.get(symbol) {
+            return counter.fetch_add(1, Ordering::SeqCst);
+        }
         self.sequences
             .entry(symbol.to_string())
             .or_insert_with(|| AtomicU64::new(0))
@@ -1787,6 +1807,32 @@ mod tests {
                 // This is acceptable for unit test
             }
         }
+    }
+
+    #[test]
+    fn test_subscription_manager_delta_broadcast() {
+        // Issue #129: a delta broadcast must reach an active delta receiver.
+        let manager = OrderbookSubscriptionManager::new();
+        let mut rx = manager.subscribe_deltas();
+
+        let event = OrderbookDeltaEvent {
+            symbol: "AAPL-20240329-150-C".to_string(),
+            sequence: manager.next_sequence("AAPL-20240329-150-C"),
+            change: PriceLevelChange {
+                side: "bid".to_string(),
+                price: 15000,
+                quantity: 150,
+            },
+        };
+
+        manager.broadcast_delta(event.clone());
+
+        let received = rx.try_recv().expect("delta must be delivered to receiver");
+        assert_eq!(received.symbol, "AAPL-20240329-150-C");
+        assert_eq!(received.sequence, 0);
+        assert_eq!(received.change.side, "bid");
+        assert_eq!(received.change.price, 15000);
+        assert_eq!(received.change.quantity, 150);
     }
 
     #[test]

@@ -228,8 +228,14 @@
 //! | `/ws` | WebSocket connection for real-time updates |
 //!
 //! WebSocket channels:
-//! - `orderbook:{symbol}` - Orderbook updates
-//! - `trades:{symbol}` - Trade executions
+//! - `orderbook:{symbol}` - Incremental `orderbook_delta` updates carrying each
+//!   affected level's resulting total quantity (0 = removed), published after
+//!   every user-driven book mutation (add / cancel / modify / market / bulk).
+//!   The market-maker requote loop does NOT emit per-quote deltas — its updates
+//!   arrive as `quote` messages and its fills as `fill` messages.
+//! - `trades:{symbol}` - Trade executions, one `trade` message per fill (from
+//!   both user crossings and market-maker fills); subscription-gated and
+//!   best-effort — REST `/executions` and `/last-trade` are authoritative
 //! - `quotes:{symbol}` - Quote updates
 //! - `fill` messages - market-maker fills with the captured per-contract
 //!   edge; broadcast to every connected client (not subscription-gated) and
