@@ -1558,17 +1558,37 @@ async fn get_orderbook_snapshot(
     Some((bids, asks))
 }
 
-/// Finds an expiration in the underlying book by matching the formatted date string.
+/// Finds an expiration in the underlying book by matching the formatted date
+/// string, falling back to a structural match for Days-form segments (issue
+/// #142: a Days(n) book formats as its computed calendar date, so the "n"
+/// string that created it never format-matches).
 fn find_expiration_by_str(
     underlying_book: &std::sync::Arc<option_chain_orderbook::orderbook::UnderlyingOrderBook>,
     exp_str: &str,
 ) -> Option<optionstratlib::ExpirationDate> {
+    let mut structural: Option<optionstratlib::ExpirationDate> = None;
+    // Days-form fallback key: only plain positive day counts (8-digit
+    // segments are always calendar dates per issue #110).
+    if !(exp_str.len() == 8 && exp_str.bytes().all(|b| b.is_ascii_digit()))
+        && let Ok(days) = exp_str.parse::<i32>()
+        && days > 0
+        && days <= crate::config::MAX_EXPIRATION_DAYS
+        && let Ok(positive) = optionstratlib::prelude::Positive::new(f64::from(days))
+    {
+        structural = Some(optionstratlib::ExpirationDate::Days(positive));
+    }
+
     for entry in underlying_book.expirations().iter() {
         let formatted = match entry.0.get_date() {
             Ok(date) => date.format("%Y%m%d").to_string(),
             Err(_) => entry.0.to_string(),
         };
         if formatted == exp_str {
+            return Some(entry.0);
+        }
+        if let Some(parsed) = structural
+            && entry.0 == parsed
+        {
             return Some(entry.0);
         }
     }

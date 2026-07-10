@@ -76,11 +76,29 @@ fn find_expiration_by_str(
     underlying_book: &std::sync::Arc<option_chain_orderbook::orderbook::UnderlyingOrderBook>,
     exp_str: &str,
 ) -> Option<ExpirationDate> {
-    underlying_book
+    // Primary: match the canonical formatted (%Y%m%d) key — the read contract
+    // for date-form expirations.
+    if let Some(exp) = underlying_book
         .expirations()
         .iter()
         .map(|(exp, _)| exp)
         .find(|&exp| format_expiration(&exp) == exp_str)
+    {
+        return Some(exp);
+    }
+
+    // Fallback (issue #142): a Days-form book is keyed structurally as
+    // Days(n) but FORMATS as its computed calendar date, so the day-count
+    // string that created it ("30") never format-matches. Parse the segment
+    // and match the structural key instead, so an order placed via
+    // `.../expirations/30/...` is readable/cancellable/modifiable through
+    // the same string.
+    let parsed = parse_expiration(exp_str).ok()?;
+    underlying_book
+        .expirations()
+        .iter()
+        .map(|(exp, _)| exp)
+        .find(|&exp| exp == parsed)
 }
 
 /// Parses expiration string to ExpirationDate.
@@ -4529,6 +4547,41 @@ mod tests {
     fn test_parse_expiration_accepts_positive_days() {
         let exp = parse_expiration("30").expect("positive day count is valid");
         assert!(matches!(exp, ExpirationDate::Days(_)));
+    }
+
+    /// Issue #142: a Days-form expiration round-trips through the SAME
+    /// day-count string that created it — reads (and therefore cancel/modify,
+    /// which share the resolver) no longer require the computed calendar date.
+    #[tokio::test]
+    async fn test_days_form_expiration_resolves_by_its_own_string() {
+        let state = create_test_state();
+        let underlying_book = state.manager.get_or_create("DAYSRT");
+        let exp = parse_expiration("45").expect("valid day count");
+        let exp_book = underlying_book.get_or_create_expiration(exp);
+        drop(exp_book.get_or_create_strike(10_000));
+
+        // The resolver finds the Days(45) book from the "45" segment...
+        let resolved = find_expiration_by_str(&underlying_book, "45")
+            .expect("day-count string resolves its own book (issue #142)");
+        assert_eq!(resolved, exp);
+
+        // ...and still finds it via the computed calendar date (the formatted
+        // key remains valid as the canonical read form).
+        let formatted = format_expiration(&exp);
+        assert!(find_expiration_by_str(&underlying_book, &formatted).is_some());
+
+        // A quote read through the day-count path succeeds end-to-end.
+        let quote = get_option_quote(
+            State(state.clone()),
+            Path((
+                "DAYSRT".to_string(),
+                "45".to_string(),
+                10_000,
+                "call".to_string(),
+            )),
+        )
+        .await;
+        assert!(quote.is_ok(), "quote resolves via the day-count segment");
     }
 
     /// Issue #110: an 8-digit numeric segment must resolve to the CALENDAR
