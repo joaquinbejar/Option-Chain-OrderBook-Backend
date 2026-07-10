@@ -1,7 +1,8 @@
 //! Orderbook CRUD operation tests.
 //!
 //! Placement uses [`TEST_EXPIRATION`]; reads/cancels use the server-formatted
-//! expiration returned by the setup helpers (see the crate docs for bug #110).
+//! expiration returned by the setup helpers (identical to the sent value for
+//! date-form input since the #110 fix; see the crate docs).
 //!
 //! Every test that creates an underlying uses the capture-then-assert pattern:
 //! perform all requests capturing outcomes into plain variables, run
@@ -54,7 +55,8 @@ async fn test_create_expiration_and_strike() {
         .expect("Failed to create underlying");
 
     // Phase 1: create expiration, list them, create strike, list strikes.
-    // create_expiration returns the server's canonical expiration form (bug #110
+    // create_expiration returns the server's canonical expiration form (since the
+    // #110 fix, identical to the YYYYMMDD value that was sent
     // formats the parsed Days value). list_expirations reports the URL-safe
     // formatted expiration used for reads; list_strikes resolves the book by it.
     let exp = client.create_expiration(&symbol, TEST_EXPIRATION).await;

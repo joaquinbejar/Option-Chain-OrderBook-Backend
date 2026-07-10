@@ -3,7 +3,7 @@
 //!
 //! Reads that resolve a book by expiration use the server-formatted expiration;
 //! the `last-trade` and `ohlc` stores are keyed by the raw request path, so those
-//! use [`TEST_EXPIRATION`] (see the crate docs for bug #110). Greeks require a
+//! use [`TEST_EXPIRATION`] (the canonical key since the #110 fix). Greeks require a
 //! priced underlying, so they run against the config-provisioned `BTC` book.
 //!
 //! Each test that creates an underlying uses the capture-then-assert pattern:

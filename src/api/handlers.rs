@@ -86,7 +86,39 @@ fn find_expiration_by_str(
 fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
     use optionstratlib::prelude::Positive;
 
-    // Try parsing as a number of days first.
+    // An 8-ASCII-digit segment is ALWAYS a YYYYMMDD calendar date. This branch
+    // must run BEFORE the numeric-days branch (issue #110): previously the
+    // days branch won, so "20251231" became Days(20251231) — a shadow
+    // expiration distinct from the config-seeded DateTime books, so user
+    // orders landed on books the market maker and the read/cancel/modify
+    // paths (which resolve by the formatted %Y%m%d key) never touched. Every
+    // byte being an ASCII digit also makes each byte a char boundary, so the
+    // slicing below cannot panic.
+    if exp_str.len() == 8 && exp_str.bytes().all(|b| b.is_ascii_digit()) {
+        use chrono::{NaiveDate, Utc};
+        if let (Ok(year), Ok(month), Ok(day)) = (
+            exp_str[0..4].parse::<i32>(),
+            exp_str[4..6].parse::<u32>(),
+            exp_str[6..8].parse::<u32>(),
+        ) && let Some(date) = NaiveDate::from_ymd_opt(year, month, day)
+        {
+            // 16:00:00 is a compile-time literal time-of-day that is always valid;
+            // surface the structurally-unreachable `None` as a typed error rather
+            // than an `.expect()`, so no panic path exists on inbound request data.
+            let datetime = date.and_hms_opt(16, 0, 0).ok_or_else(|| {
+                ApiError::Internal("failed to construct expiration time-of-day".to_string())
+            })?;
+            let utc_datetime = chrono::DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc);
+            return Ok(ExpirationDate::DateTime(utc_datetime));
+        }
+        // 8 digits that do not form a real calendar date (e.g. "20251399")
+        // are a client error — NEVER a relative-days fallback.
+        return Err(ApiError::InvalidRequest(format!(
+            "invalid expiration date: {exp_str}. An 8-digit expiration must be a valid YYYYMMDD calendar date"
+        )));
+    }
+
+    // Any other numeric segment is a relative number of days.
     if let Ok(days) = exp_str.parse::<i32>() {
         // An expiration must be a strictly positive number of days. Reject 0 and
         // negatives (e.g. `.../expirations/0` or `.../expirations/-5`) up front so
@@ -100,32 +132,6 @@ fn parse_expiration(exp_str: &str) -> Result<ExpirationDate, ApiError> {
         let positive_days = Positive::new(days as f64)
             .map_err(|_| ApiError::InvalidRequest(format!("invalid expiration: {exp_str}")))?;
         return Ok(ExpirationDate::Days(positive_days));
-    }
-
-    // Try parsing as YYYYMMDD format. `len()` is a byte length, so the
-    // `is_ascii()` guard ensures every byte is a char boundary before slicing —
-    // an 8-byte multibyte path segment (e.g. `"12345é7"`) maps to the normal
-    // invalid-expiration error below instead of panicking the request task on a
-    // non-char-boundary slice.
-    if exp_str.len() == 8
-        && exp_str.is_ascii()
-        && let (Ok(year), Ok(month), Ok(day)) = (
-            exp_str[0..4].parse::<i32>(),
-            exp_str[4..6].parse::<u32>(),
-            exp_str[6..8].parse::<u32>(),
-        )
-    {
-        use chrono::{NaiveDate, Utc};
-        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
-            // 16:00:00 is a compile-time literal time-of-day that is always valid;
-            // surface the structurally-unreachable `None` as a typed error rather
-            // than an `.expect()`, so no panic path exists on inbound request data.
-            let datetime = date.and_hms_opt(16, 0, 0).ok_or_else(|| {
-                ApiError::Internal("failed to construct expiration time-of-day".to_string())
-            })?;
-            let utc_datetime = chrono::DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc);
-            return Ok(ExpirationDate::DateTime(utc_datetime));
-        }
     }
 
     Err(ApiError::InvalidRequest(format!(
@@ -4249,19 +4255,49 @@ mod tests {
         assert!(matches!(exp, ExpirationDate::Days(_)));
     }
 
+    /// Issue #110: an 8-digit numeric segment must resolve to the CALENDAR
+    /// date (DateTime at 16:00 UTC), never to Days(20251231) — that shadow
+    /// interpretation split user orders away from the config-seeded books.
     #[test]
-    fn test_parse_expiration_accepts_yyyymmdd() {
-        // An 8-digit value is accepted without panicking. (It is consumed by the
-        // numeric "days" branch first, since every 8-digit value fits in i32.)
-        assert!(parse_expiration("20251231").is_ok());
+    fn test_parse_expiration_yyyymmdd_is_a_calendar_date() {
+        let exp = parse_expiration("20251231").expect("valid YYYYMMDD");
+        match exp {
+            ExpirationDate::DateTime(dt) => {
+                assert_eq!(dt.to_string(), "2025-12-31 16:00:00 UTC");
+            }
+            other => panic!("expected DateTime, got {other:?}"),
+        }
+        // The formatted key round-trips to the identical book address.
+        assert_eq!(format_expiration(&exp), "20251231");
+    }
+
+    /// Issue #110: 8 digits that are not a real date are a 400 — never a
+    /// relative-days fallback.
+    #[test]
+    fn test_parse_expiration_rejects_invalid_eight_digit_date() {
+        for bad in ["20251399", "20250230", "00000000", "99999999"] {
+            let err = parse_expiration(bad).expect_err("invalid 8-digit date must be rejected");
+            assert!(matches!(err, ApiError::InvalidRequest(_)), "{bad}");
+        }
+    }
+
+    /// The days round-trip is preserved for short numerics: parse then
+    /// format-by-date matches what find_expiration_by_str resolves against.
+    #[test]
+    fn test_parse_expiration_days_round_trip_by_formatted_key() {
+        let exp = parse_expiration("45").expect("valid day count");
+        assert!(matches!(exp, ExpirationDate::Days(_)));
+        let formatted = format_expiration(&exp);
+        assert_eq!(formatted.len(), 8, "days format to a YYYYMMDD key");
+        assert!(formatted.bytes().all(|b| b.is_ascii_digit()));
     }
 
     #[test]
     fn test_parse_expiration_rejects_multibyte_eight_bytes() {
-        // `"12345é7"` is 8 bytes ('é' is 2 bytes) but does not parse as i32, so it
-        // reaches the YYYYMMDD branch where byte slicing at indices 4/6 would land
-        // mid-char and panic. This is request-reachable via an inbound path
-        // segment, so the char-safe guard must map it to a 400, never a panic.
+        // `"12345é7"` is 8 bytes ('é' is 2 bytes). The all-ASCII-digit guard on
+        // the YYYYMMDD branch rejects it before any slicing, it does not parse
+        // as i32, and it therefore maps to a 400 — never a panic. This is
+        // request-reachable via an inbound path segment.
         let multibyte = "12345é7";
         assert_eq!(multibyte.len(), 8, "fixture must be exactly 8 bytes");
         let err = parse_expiration(multibyte).expect_err("multibyte 8-byte input must be rejected");

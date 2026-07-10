@@ -749,7 +749,30 @@ impl MarketMakerEngine {
         use optionstratlib::ExpirationDate;
         use optionstratlib::prelude::Positive;
 
-        // Try parsing as a number of days first.
+        // An 8-ASCII-digit string is ALWAYS a YYYYMMDD calendar date — this
+        // branch must run BEFORE the numeric-days branch (issue #110) so the
+        // engine resolves the same expiration key as the API handlers. Every
+        // byte being an ASCII digit also makes each byte a char boundary, so
+        // the slicing below cannot panic.
+        if exp_str.len() == 8 && exp_str.bytes().all(|b| b.is_ascii_digit()) {
+            if let (Ok(year), Ok(month), Ok(day)) = (
+                exp_str[0..4].parse::<i32>(),
+                exp_str[4..6].parse::<u32>(),
+                exp_str[6..8].parse::<u32>(),
+            ) && let Some(date) = NaiveDate::from_ymd_opt(year, month, day)
+                && let Some(time) = NaiveTime::from_hms_opt(16, 0, 0)
+            {
+                let datetime = NaiveDateTime::new(date, time);
+                let utc_datetime = Utc.from_utc_datetime(&datetime);
+                return Ok(ExpirationDate::DateTime(utc_datetime));
+            }
+            // 8 digits that are not a real calendar date: reject, never a
+            // relative-days fallback.
+            warn!(expiration = %exp_str, "rejecting invalid 8-digit expiration date");
+            return Err(());
+        }
+
+        // Any other numeric string is a relative number of days.
         if let Ok(days) = exp_str.parse::<i32>() {
             // An expiration must be a strictly positive number of days; a
             // non-positive or otherwise invalid value is logged and rejected
@@ -762,27 +785,6 @@ impl MarketMakerEngine {
                 warn!(expiration = %exp_str, "rejecting invalid expiration value");
             })?;
             return Ok(ExpirationDate::Days(positive_days));
-        }
-
-        // Try parsing as YYYYMMDD format. `len()` is a byte length, so the
-        // `is_ascii()` guard ensures every byte is a char boundary before
-        // slicing — an 8-byte multibyte string (e.g. `"12345é7"`) returns
-        // `Err(())` instead of panicking the requote loop on a non-boundary slice.
-        if exp_str.len() == 8
-            && exp_str.is_ascii()
-            && let (Ok(year), Ok(month), Ok(day)) = (
-                exp_str[0..4].parse::<i32>(),
-                exp_str[4..6].parse::<u32>(),
-                exp_str[6..8].parse::<u32>(),
-            )
-            && let Some(date) = NaiveDate::from_ymd_opt(year, month, day)
-        {
-            // 16:00:00 is a compile-time literal time-of-day that is always valid.
-            let time = NaiveTime::from_hms_opt(16, 0, 0)
-                .expect("16:00:00 is a valid time-of-day constant");
-            let datetime = NaiveDateTime::new(date, time);
-            let utc_datetime = Utc.from_utc_datetime(&datetime);
-            return Ok(ExpirationDate::DateTime(utc_datetime));
         }
 
         // Try parsing the `ExpirationDate` `Display` form

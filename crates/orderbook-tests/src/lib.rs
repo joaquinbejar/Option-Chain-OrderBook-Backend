@@ -12,17 +12,15 @@
 //! cached on disk (keyed by the permission set and the target server) and reused
 //! across every test binary in a `cargo test` run — see [`obtain_token`].
 //!
-//! # Expiration handling (server bug #110)
+//! # Expiration handling
 //!
-//! The server parses a numeric expiration path segment (e.g. `"20251231"`) as a
-//! *number of days* before it ever considers the `YYYYMMDD` form, so a
-//! user-created expiration is stored as `Days(N)` and its canonical string is the
-//! server-formatted date (e.g. `"+574720704"`), NOT the value that was sent.
-//! Order PLACEMENT (`add_order` / market orders) resolves the book with
-//! `get_or_create`, but the READ / modify / cancel / bulk paths resolve it by
-//! matching the *formatted* string. The working recipe these helpers implement:
-//! **write with [`TEST_EXPIRATION`], read/modify/cancel with the formatted
-//! expiration** returned by [`setup_underlying`] / [`formatted_expiration`].
+//! Since the #110 fix, an 8-digit `YYYYMMDD` segment always resolves to the
+//! calendar-date expiration on every path (placement, read, modify, cancel,
+//! bulk), so the value a test sends is also the value the server formats
+//! back. [`setup_underlying`] / [`formatted_expiration`] are retained as the
+//! canonical way to read the server-reported key (for `Days`-form
+//! expirations the formatted key is the computed date, not the day count),
+//! but for [`TEST_EXPIRATION`] the formatted value now equals the input.
 
 use orderbook_client::{ClientConfig, Error, OrderbookClient, Permission, TokenRequest};
 use std::sync::OnceLock;
@@ -311,9 +309,9 @@ pub fn unique_symbol(prefix: &str) -> String {
 /// `(underlying, formatted_expiration)`.
 ///
 /// The `client` must carry `Trade` (creating the expiration/strike is a mutation).
-/// Placement (`add_order`, market orders) uses [`TEST_EXPIRATION`]; every READ /
-/// modify / cancel / bulk-write path must use the returned formatted expiration
-/// (see the module docs for bug #110).
+/// Since the #110 fix the returned formatted expiration equals
+/// [`TEST_EXPIRATION`] for date-form input; it remains the canonical read key
+/// (see the module docs).
 ///
 /// # Panics
 /// Panics if any setup request fails or the underlying reports no expiration.

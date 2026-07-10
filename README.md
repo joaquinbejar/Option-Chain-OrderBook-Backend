@@ -271,7 +271,9 @@ cargo build --release
 # Create an underlying
 curl -X POST http://localhost:8080/api/v1/underlyings/BTC
 
-# Create an expiration (YYYYMMDD format)
+# Create an expiration. An 8-digit segment is ALWAYS a YYYYMMDD calendar
+# date (there is no 8-digit relative-days form); shorter numerics such as
+# "30" are a relative number of days.
 curl -X POST http://localhost:8080/api/v1/underlyings/BTC/expirations/20240329
 
 # Create a strike

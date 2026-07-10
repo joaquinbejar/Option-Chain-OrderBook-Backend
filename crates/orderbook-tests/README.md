@@ -54,13 +54,11 @@ docker compose --profile test up
   *entire* suite several times within the same 60-second window can still trip
   the server's per-subject limiter — this is the server protection working as
   intended; allow the window to lapse (or run a subset) between rapid re-runs.
-- **Expiration handling (server bug #110).** A numeric expiration segment such as
-  `20251231` is parsed as a *number of days*, so a user-created expiration is
-  stored under a server-formatted canonical string (e.g. `+574720704`). Order
-  **placement** resolves the book by parsing the sent value, while the **read /
-  modify / cancel / bulk** paths resolve it by the formatted string. The
-  `setup_underlying` helper returns that formatted expiration; tests place with
-  `TEST_EXPIRATION` and read/modify/cancel with the formatted value.
+- **Expiration handling.** Since the #110 fix an 8-digit `YYYYMMDD` segment
+  resolves to the same calendar-date expiration on every path, so the sent
+  value round-trips. `setup_underlying` still returns the server-formatted
+  expiration (identical to `TEST_EXPIRATION` for date-form input; the computed
+  date for `Days`-form input) and tests keep using it as the read key.
 - **Global controls.** Tests that mutate global market-maker parameters or the
   kill switch restore the initial values before returning; the config-provisioned
   `BTC`/`ETH`/`GOLD` books' controls are never left mutated. See
