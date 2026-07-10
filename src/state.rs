@@ -49,6 +49,16 @@ impl StoredSnapshot {
     }
 }
 
+/// A cached volatility surface: the spot it was computed against plus the
+/// full response (issue #125).
+#[derive(Debug, Clone)]
+pub struct CachedSurface {
+    /// Spot price (cents) the surface was computed against.
+    pub spot: Option<u64>,
+    /// The computed response, including its `timestamp_ms`.
+    pub response: crate::models::VolatilitySurfaceResponse,
+}
+
 /// Application state shared across all handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -86,6 +96,11 @@ pub struct AppState {
     pub executions: Arc<DashMap<String, ExecutionInfo>>,
     /// Storage for orderbook snapshots by snapshot ID.
     pub snapshots: Arc<DashMap<String, StoredSnapshot>>,
+    /// Cached volatility surfaces by underlying (issue #125): the IV sweep is
+    /// a ~1000-candidate Black-Scholes grid search per leg, so concurrent and
+    /// rapid repeat requests reuse the last computed surface while the spot
+    /// is unchanged and the entry is fresh (see the handler's TTL).
+    pub surface_cache: Arc<DashMap<String, CachedSurface>>,
     /// Graceful-shutdown signal (issue #118): set once by `main.rs` after the
     /// watch channel exists; live WebSocket connections subscribe so they
     /// close promptly on shutdown instead of keeping `serve()` alive until an
@@ -116,6 +131,7 @@ impl AppState {
             trust_proxy: false,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
+            surface_cache: Arc::new(DashMap::new()),
             shutdown_rx: std::sync::OnceLock::new(),
         }
     }
@@ -145,6 +161,7 @@ impl AppState {
             trust_proxy: false,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
+            surface_cache: Arc::new(DashMap::new()),
             shutdown_rx: std::sync::OnceLock::new(),
         }
     }
@@ -198,6 +215,7 @@ impl AppState {
             trust_proxy: false,
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
+            surface_cache: Arc::new(DashMap::new()),
             shutdown_rx: std::sync::OnceLock::new(),
         }
     }

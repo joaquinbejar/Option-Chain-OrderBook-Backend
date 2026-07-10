@@ -1492,7 +1492,7 @@ pub struct ATMTermStructurePoint {
 }
 
 /// Response for volatility surface endpoint.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct VolatilitySurfaceResponse {
     /// Underlying symbol.
     pub underlying: String,
