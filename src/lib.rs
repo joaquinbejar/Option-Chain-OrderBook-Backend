@@ -150,9 +150,11 @@
 //! |--------|----------|-------------|
 //! | GET | `/api/v1/underlyings/{underlying}/volatility-surface` | Get IV surface |
 //!
-//! IVs are derived from the observed order-book mid prices (the lone bid or
-//! ask when only one side is quoted) via
-//! `optionstratlib` (European Black-Scholes, zero rate/dividend). The solver
+//! IVs are derived from the observed TWO-SIDED order-book mid prices (a
+//! one-sided book omits the leg) via
+//! `optionstratlib` (European Black-Scholes, zero rate/dividend). Computed
+//! surfaces are cached per underlying while the spot is unchanged (2s
+//! freshness bound). The solver
 //! is a 0.1%-step grid search, so derivable IVs lie in `[0.001, 0.999)`; a
 //! value is omitted when no quote or spot price exists, the mid cannot be
 //! matched by any volatility (e.g. below intrinsic or above the no-volatility

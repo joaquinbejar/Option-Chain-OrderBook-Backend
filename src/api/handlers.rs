@@ -1155,9 +1155,8 @@ fn build_option_quote_data(
 ///
 /// Returns IV data across all strikes and expirations, enabling volatility
 /// surface visualization and analysis. Each IV is derived from the observed
-/// order-book mid price — or the lone bid/ask when only one side is quoted
-/// (two-sided enforcement is tracked in issue #125) — via
-/// `optionstratlib::volatility::calculate_iv`
+/// TWO-SIDED order-book mid price (a one-sided book omits the leg, issue
+/// #125) via `optionstratlib::volatility::calculate_iv`
 /// (European Black-Scholes, zero risk-free rate and dividend yield; a
 /// 0.1%-step grid search, so derivable IVs lie in `[0.001, 0.999)`). An IV is
 /// omitted (`null`) when there is no quote for that leg, no spot price, or the
@@ -1192,6 +1191,18 @@ pub async fn get_volatility_surface(
         .price_simulator
         .as_ref()
         .and_then(|sim| sim.get_price(&underlying));
+
+    // Cache (issue #125): the IV sweep is ~1000 Black-Scholes evaluations per
+    // leg, so reuse the last computed surface while the spot is unchanged and
+    // the entry is fresh. The cached response keeps its original compute
+    // timestamp, so clients see honestly when it was built.
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    if let Some(cached) = state.surface_cache.get(&underlying)
+        && cached.spot == spot_price
+        && now_ms.saturating_sub(cached.response.timestamp_ms) < SURFACE_CACHE_TTL_MS
+    {
+        return Ok(Json(cached.response.clone()));
+    }
 
     // Phase 1 (cheap, on the async thread): walk the books and collect the
     // observed mids per (expiration, strike) plus the ATM strike per
@@ -1328,7 +1339,7 @@ pub async fn get_volatility_surface(
 
     let timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
 
-    Ok(Json(VolatilitySurfaceResponse {
+    let response = VolatilitySurfaceResponse {
         underlying: underlying.clone(),
         spot_price,
         timestamp_ms,
@@ -1336,7 +1347,16 @@ pub async fn get_volatility_surface(
         strikes: all_strikes.into_iter().collect(),
         surface,
         atm_term_structure,
-    }))
+    };
+    state.surface_cache.insert(
+        underlying,
+        crate::state::CachedSurface {
+            spot: spot_price,
+            response: response.clone(),
+        },
+    );
+
+    Ok(Json(response))
 }
 
 /// Observed order-book mids for one strike, collected before the IV sweep.
@@ -1361,15 +1381,24 @@ struct SurfaceExpirationInputs {
     rows: Vec<SurfaceStrikeMids>,
 }
 
-/// Calculate mid-price from a quote.
+/// Calculates the two-sided mid price of a quote for IV derivation.
+///
+/// Requires BOTH sides (issue #125): a lone resting bid or ask is not a mid —
+/// deriving an implied volatility from it puts an unreliable node on the
+/// surface (a single wide or stale quote skews it), so one-sided books yield
+/// `None` and the surface omits the leg.
 fn calculate_mid_price(quote: &Quote) -> Option<u128> {
     match (quote.bid_price(), quote.ask_price()) {
         (Some(bid), Some(ask)) => Some((bid.as_u128() + ask.as_u128()) / 2),
-        (Some(bid), None) => Some(bid.as_u128()),
-        (None, Some(ask)) => Some(ask.as_u128()),
-        (None, None) => None,
+        _ => None,
     }
 }
+
+/// Freshness bound for a cached volatility surface, in milliseconds (issue
+/// #125). A cached entry is reused while the underlying's spot is unchanged
+/// AND the entry is younger than this — the TTL bounds staleness from book
+/// mutations that do not move the spot.
+const SURFACE_CACHE_TTL_MS: u64 = 2_000;
 
 /// Upper bound of the IV solver's search grid (999/1000).
 ///
@@ -8610,6 +8639,50 @@ mod tests {
         assert!(!json_partial.contains("\"put_iv\""));
     }
 
+    /// Issue #125: repeat requests with an unchanged spot reuse the cached
+    /// surface (identical compute timestamp); a spot change invalidates it.
+    #[tokio::test]
+    async fn test_volatility_surface_cache_reuses_until_spot_changes() {
+        use crate::simulation::PriceSimulator;
+
+        let mut state = AppState::new();
+        let simulator = std::sync::Arc::new(PriceSimulator::new(
+            Vec::new(),
+            crate::config::SimulationConfig::default(),
+        ));
+        simulator.set_price("CACHE", 10_000);
+        state.price_simulator = Some(simulator.clone());
+        let state = Arc::new(state);
+        state.manager.get_or_create("CACHE");
+
+        let first = get_volatility_surface(State(Arc::clone(&state)), Path("CACHE".to_string()))
+            .await
+            .expect("first compute");
+        let second = get_volatility_surface(State(Arc::clone(&state)), Path("CACHE".to_string()))
+            .await
+            .expect("cached read");
+        assert_eq!(
+            first.0.timestamp_ms, second.0.timestamp_ms,
+            "unchanged spot within the TTL reuses the cached surface"
+        );
+
+        // A spot move invalidates the cache: the surface is recomputed.
+        simulator.set_price("CACHE", 10_100);
+        let third = get_volatility_surface(State(Arc::clone(&state)), Path("CACHE".to_string()))
+            .await
+            .expect("recompute after spot change");
+        assert_eq!(third.0.spot_price, Some(10_100));
+        assert!(
+            third.0.timestamp_ms >= first.0.timestamp_ms,
+            "recomputed surface is fresh"
+        );
+        assert_ne!(
+            (third.0.spot_price, third.0.timestamp_ms),
+            (first.0.spot_price, first.0.timestamp_ms),
+            "spot change must not serve the stale cached surface"
+        );
+    }
+
     /// `derive_iv` must recover the volatility a Black-Scholes price was
     /// generated with (issue #56): price an option at a known IV via
     /// optionstratlib, round the price to whole cents like a real book mid,
@@ -8829,7 +8902,8 @@ mod tests {
             Quantity::new(0),
             TimestampMs::new(0),
         );
-        assert_eq!(calculate_mid_price(&quote2), Some(100));
+        // Issue #125: one-sided books are not mids — omitted from the surface.
+        assert_eq!(calculate_mid_price(&quote2), None);
 
         // Only ask
         let quote3 = Quote::new(
@@ -8839,7 +8913,7 @@ mod tests {
             Quantity::new(10),
             TimestampMs::new(0),
         );
-        assert_eq!(calculate_mid_price(&quote3), Some(110));
+        assert_eq!(calculate_mid_price(&quote3), None);
 
         // Neither
         let quote4 = Quote::new(
