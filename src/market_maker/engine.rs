@@ -2,8 +2,10 @@
 
 use crate::db::DatabasePool;
 use crate::market_maker::{OptionPricer, QuoteInput, Quoter};
+use chrono::{DateTime, Utc};
 use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
-use optionstratlib::OptionStyle;
+use optionstratlib::prelude::Positive;
+use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -150,8 +152,16 @@ pub enum MarketMakerEvent {
 struct ActiveOrderInfo {
     /// Underlying symbol.
     symbol: String,
-    /// Expiration string (the book key, as used for book lookup on cancel).
-    expiration: String,
+    /// Structural expiration (the original book key), used for book lookup on
+    /// cancel and as the source for the reverse-index key.
+    ///
+    /// Stored as the [`ExpirationDate`] itself (which is `Copy`) rather than its
+    /// `Display` string: the `Days` variant's `Display` resolves `Utc::now() +
+    /// n days` to the second, so a string key would drift between requote ticks
+    /// and would not even round-trip back to the correct book key (`Days` vs
+    /// `DateTime`). Keeping the structural value makes cancel and stale-lookup
+    /// clock-independent (issue #107 P2-03).
+    expiration: ExpirationDate,
     /// Canonical `UNDERLYING-YYYYMMDD-STRIKE-STYLE` identifier as used across
     /// the REST surface, carried on fill events.
     instrument: String,
@@ -165,6 +175,109 @@ struct ActiveOrderInfo {
     theo_cents: u64,
     /// Remaining resting quantity.
     quantity: u64,
+}
+
+/// Structural, clock-independent projection of an [`ExpirationDate`] suitable as
+/// a hash-map key.
+///
+/// `ExpirationDate`'s own `Eq`/`Hash` are wall-clock-relative (comparisons route
+/// through `get_days()` against `Utc::now()`), and its `Display` for the `Days`
+/// variant resolves `Utc::now() + n days` to the second — so neither can key a
+/// resting order across requote ticks without drifting (issue #107 P2-03).
+/// `ExpKey` mirrors the two `ExpirationDate` representations structurally: the
+/// relative day count (`Positive`, `NaN`-free by construction) or the absolute
+/// UTC instant. Both are `Eq + Hash` and never touch the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ExpKey {
+    /// Relative expiration measured in fractional days.
+    Days(Positive),
+    /// Absolute expiration instant in UTC.
+    DateTime(DateTime<Utc>),
+}
+
+impl From<&ExpirationDate> for ExpKey {
+    /// Builds the structural, clock-independent key for an [`ExpirationDate`].
+    #[inline]
+    fn from(expiration: &ExpirationDate) -> Self {
+        match expiration {
+            ExpirationDate::Days(days) => Self::Days(*days),
+            ExpirationDate::DateTime(dt) => Self::DateTime(*dt),
+        }
+    }
+}
+
+/// Structural identity of a quotable instrument, used as the key of the reverse
+/// index that turns stale-order lookup on requote from an O(total_orders) scan
+/// into an O(1) probe (issue #107 P2-01).
+///
+/// Clock-independent by construction (see [`ExpKey`]), so a `Days`-variant
+/// expiration keys the same on every tick.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InstrumentKey {
+    /// Underlying symbol.
+    symbol: String,
+    /// Structural expiration key.
+    expiration: ExpKey,
+    /// Strike price in cents.
+    strike: u64,
+    /// Call or Put.
+    style: OptionStyle,
+}
+
+impl InstrumentKey {
+    /// Builds the structural key for an instrument leg.
+    #[inline]
+    fn new(symbol: &str, expiration: &ExpirationDate, strike: u64, style: OptionStyle) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            expiration: ExpKey::from(expiration),
+            strike,
+            style,
+        }
+    }
+
+    /// Rebuilds the key from a tracked order's metadata, for index cleanup on
+    /// cancel and fill.
+    #[inline]
+    fn from_order(order: &ActiveOrderInfo) -> Self {
+        Self {
+            symbol: order.symbol.clone(),
+            expiration: ExpKey::from(&order.expiration),
+            strike: order.strike,
+            style: order.style,
+        }
+    }
+}
+
+/// Loop-invariant context for [`MarketMakerEngine::update_quote`], built once per
+/// expiration in `requote_symbol` and shared across every strike/style so the
+/// hot inner loop borrows rather than re-derives it.
+struct RequoteContext<'a> {
+    /// Underlying symbol.
+    symbol: &'a str,
+    /// Structural book key (clock-independent), used for the book lookup and the
+    /// reverse-index key.
+    expiration: &'a ExpirationDate,
+    /// Pre-built `Display` string of `expiration`, needed only for the broadcast
+    /// event (hoisted once per expiration; issue #107 P2-02).
+    exp_display: &'a str,
+    /// Pre-built canonical `%Y%m%d` segment of `expiration` for the instrument
+    /// identifier (hoisted once per expiration; falls back to `exp_display`
+    /// when the expiration carries no calendar date).
+    exp_canonical: &'a str,
+    /// Current underlying price in cents.
+    spot_cents: u64,
+    /// Market-maker configuration snapshot for this requote pass.
+    config: &'a MarketMakerConfig,
+}
+
+/// Maps `is_buy` to its reverse-index slot: the bid leg occupies slot 0, the ask
+/// leg slot 1.
+#[inline]
+const fn leg_slot(is_buy: bool) -> usize {
+    // is_buy == true  -> bid -> 0
+    // is_buy == false -> ask -> 1
+    !is_buy as usize
 }
 
 /// The market maker engine coordinates all quoting activity.
@@ -183,8 +296,28 @@ pub struct MarketMakerEngine {
     config: Arc<RwLock<MarketMakerConfig>>,
     /// Latest underlying prices (symbol -> price in cents).
     prices: Arc<RwLock<HashMap<String, u64>>>,
-    /// Active orders (order_id -> order info).
+    /// Active orders (order_id -> order info). The source of truth for order
+    /// metadata.
     active_orders: Arc<RwLock<HashMap<OrderId, ActiveOrderInfo>>>,
+    /// Reverse index from an instrument's structural identity to its ≤2 resting
+    /// maker order ids — slot 0 the bid leg, slot 1 the ask leg. A pure lookup
+    /// accelerator over `active_orders`: it turns the per-requote stale-order
+    /// lookup from an O(total_orders) scan into an O(1) probe (issue #107 P2-01).
+    ///
+    /// Invariant: every tracked order's leg is recorded here, and every id
+    /// recorded here is present in `active_orders` — or is a transiently
+    /// dangling id that a concurrent full fill removed between the two
+    /// (sequential, never-nested) updates; such an id is benign because
+    /// `OrderId`s are globally unique (its cancel matches nothing) and the
+    /// next requote discards it. Both maps are updated together on insert /
+    /// cancel / fill / eviction.
+    ///
+    /// Lock ordering: `active_orders` and `instrument_orders` are always locked
+    /// **sequentially, never nested** — a critical section releases one before
+    /// acquiring the other, and neither guard is ever held across a book call or
+    /// a broadcast send. Should a future change ever need both at once, acquire
+    /// `active_orders` before `instrument_orders`.
+    instrument_orders: Arc<RwLock<HashMap<InstrumentKey, [Option<OrderId>; 2]>>>,
     /// Event broadcaster.
     event_tx: broadcast::Sender<MarketMakerEvent>,
 }
@@ -207,7 +340,21 @@ impl MarketMakerEngine {
             config: Arc::new(RwLock::new(MarketMakerConfig::default())),
             prices: Arc::new(RwLock::new(HashMap::new())),
             active_orders: Arc::new(RwLock::new(HashMap::new())),
+            instrument_orders: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
+        }
+    }
+
+    /// Clears one leg (`is_buy` selects the bid or ask slot) from the
+    /// reverse-index entry for `key`, dropping the whole entry once both legs
+    /// are gone. Acquires only the `instrument_orders` lock, briefly.
+    fn clear_instrument_slot(&self, key: &InstrumentKey, is_buy: bool) {
+        let mut index = self.instrument_orders.write();
+        if let Some(slots) = index.get_mut(key) {
+            slots[leg_slot(is_buy)] = None;
+            if slots[0].is_none() && slots[1].is_none() {
+                index.remove(key);
+            }
         }
     }
 
@@ -369,6 +516,10 @@ impl MarketMakerEngine {
             self.cancel_order(order_id);
         }
 
+        // Every `cancel_order` already cleared its own reverse-index slot, but
+        // clear the whole index so the kill switch leaves no dangling entry.
+        self.instrument_orders.write().clear();
+
         info!("Cancelled all orders");
     }
 
@@ -393,12 +544,16 @@ impl MarketMakerEngine {
     fn cancel_order(&self, order_id: OrderId) {
         let order_info = self.active_orders.write().remove(&order_id);
 
-        if let Some(order) = order_info
-            && let Ok(underlying_book) = self.manager.get(&order.symbol)
-        {
-            // Parse expiration and cancel order
-            if let Ok(expiration) = self.parse_expiration(&order.expiration)
-                && let Ok(exp_book) = underlying_book.get_expiration(&expiration)
+        if let Some(order) = order_info {
+            // Drop this leg from the reverse index (sequential with the
+            // `active_orders` lock above — the two maps are never held at once).
+            self.clear_instrument_slot(&InstrumentKey::from_order(&order), order.is_buy);
+
+            // Cancel on the book using the stored structural expiration (no
+            // string reparse), so the lookup keys the same book that placed the
+            // order for both `DateTime` and `Days` variants (issue #107).
+            if let Ok(underlying_book) = self.manager.get(&order.symbol)
+                && let Ok(exp_book) = underlying_book.get_expiration(&order.expiration)
                 && let Ok(strike_book) = exp_book.get_strike(order.strike)
             {
                 let option_book = strike_book.get(order.style);
@@ -434,7 +589,7 @@ impl MarketMakerEngine {
         // clone); a partial fill clones and keeps the decremented remainder.
         // The reported quantity is clamped to the tracked resting size so an
         // upstream over-fill can never inflate the event.
-        let (order, reported_qty) = {
+        let (order, reported_qty, fully_filled) = {
             let mut orders = self.active_orders.write();
             let Some(remaining) = orders.get(&order_id).map(|o| o.quantity) else {
                 return;
@@ -442,7 +597,7 @@ impl MarketMakerEngine {
             let reported = quantity.min(remaining);
             if quantity >= remaining {
                 match orders.remove(&order_id) {
-                    Some(order) => (order, reported),
+                    Some(order) => (order, reported, true),
                     None => return,
                 }
             } else {
@@ -450,12 +605,20 @@ impl MarketMakerEngine {
                     Some(order) => {
                         // Guarded: quantity < remaining here.
                         order.quantity -= quantity;
-                        (order.clone(), reported)
+                        (order.clone(), reported, false)
                     }
                     None => return,
                 }
             }
         };
+
+        // A fully-filled leg leaves the book, so drop it from the reverse index
+        // too; a partial fill keeps the order resting, so its slot stays. Done
+        // after releasing the `active_orders` lock — the two maps are never held
+        // at once.
+        if fully_filled {
+            self.clear_instrument_slot(&InstrumentKey::from_order(&order), order.is_buy);
+        }
 
         // The market-data DTOs carry prices as u64 cents; a fill price beyond
         // that range is structurally impossible — log and skip rather than
@@ -496,20 +659,29 @@ impl MarketMakerEngine {
         theo_cents: u64,
         quantity: u64,
     ) -> OrderId {
+        use chrono::TimeZone;
         let id = OrderId::new();
-        self.active_orders.write().insert(
-            id,
-            ActiveOrderInfo {
-                symbol: "BTC".to_string(),
-                expiration: "20351231".to_string(),
-                instrument: "BTC-20351231-100000-C".to_string(),
-                strike: 100_000,
-                style: OptionStyle::Call,
-                is_buy,
-                theo_cents,
-                quantity,
-            },
+        let expiration = ExpirationDate::DateTime(
+            Utc.with_ymd_and_hms(2035, 12, 31, 16, 0, 0)
+                .single()
+                .expect("valid fixture datetime"),
         );
+        let info = ActiveOrderInfo {
+            symbol: "BTC".to_string(),
+            expiration,
+            instrument: "BTC-20351231-100000-C".to_string(),
+            strike: 100_000,
+            style: OptionStyle::Call,
+            is_buy,
+            theo_cents,
+            quantity,
+        };
+        let key = InstrumentKey::from_order(&info);
+        self.active_orders.write().insert(id, info);
+        self.instrument_orders
+            .write()
+            .entry(key)
+            .or_insert([None, None])[leg_slot(is_buy)] = Some(id);
         id
     }
 
@@ -527,17 +699,28 @@ impl MarketMakerEngine {
 
         if let Ok(underlying_book) = self.manager.get(symbol) {
             for (expiration, exp_book) in underlying_book.expirations().iter() {
+                // Hoisted out of the strike/style loops: the `Display` string is
+                // only needed for the broadcast event, so build it once per
+                // expiration instead of re-formatting per strike*style
+                // (issue #107 P2-02). The book lookup and the reverse-index key
+                // use the structural `ExpirationDate` directly, never this string.
+                let exp_display = expiration.to_string();
+                let exp_canonical = expiration
+                    .get_date()
+                    .map(|d| d.format("%Y%m%d").to_string())
+                    .unwrap_or_else(|_| exp_display.clone());
+                let ctx = RequoteContext {
+                    symbol,
+                    expiration: &expiration,
+                    exp_display: &exp_display,
+                    exp_canonical: &exp_canonical,
+                    spot_cents: price_cents,
+                    config: &config,
+                };
                 for strike in exp_book.strike_prices() {
-                    if let Ok(_strike_book) = exp_book.get_strike(strike) {
+                    if exp_book.get_strike(strike).is_ok() {
                         for style in [OptionStyle::Call, OptionStyle::Put] {
-                            self.update_quote(
-                                symbol,
-                                &expiration.to_string(),
-                                strike,
-                                style,
-                                price_cents,
-                                &config,
-                            );
+                            self.update_quote(&ctx, strike, style);
                         }
                     }
                 }
@@ -554,29 +737,21 @@ impl MarketMakerEngine {
         }
     }
 
-    /// Updates quotes for a specific option.
-    fn update_quote(
-        &self,
-        symbol: &str,
-        exp_str: &str,
-        strike: u64,
-        style: OptionStyle,
-        spot_cents: u64,
-        config: &MarketMakerConfig,
-    ) {
-        let expiration = match self.parse_expiration(exp_str) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
+    /// Updates quotes for a specific option `strike`/`style`.
+    ///
+    /// The loop-invariant inputs (symbol, structural expiration, its pre-built
+    /// `Display` string, spot, config) are carried in `ctx` so the hot inner
+    /// loop borrows them. `ctx.expiration` is the structural book key (used for
+    /// the book lookup and the reverse-index key, both clock-independent);
+    /// `ctx.exp_display` is needed only for the broadcast event (issue #107).
+    fn update_quote(&self, ctx: &RequoteContext<'_>, strike: u64, style: OptionStyle) {
+        let symbol = ctx.symbol;
+        let expiration = ctx.expiration;
 
         // Canonical instrument identifier (UNDERLYING-YYYYMMDD-STRIKE-STYLE)
-        // as used across the REST surface, carried on fill events (issue #69).
-        // Falls back to the raw book key when the expiration carries no
-        // calendar date.
-        let exp_canonical = expiration
-            .get_date()
-            .map(|d| d.format("%Y%m%d").to_string())
-            .unwrap_or_else(|_| exp_str.to_string());
+        // as used across the REST surface, carried on fill events (issue #69);
+        // the date segment is pre-built once per expiration in the context.
+        let exp_canonical = ctx.exp_canonical;
         let style_char = match style {
             OptionStyle::Call => "C",
             OptionStyle::Put => "P",
@@ -584,13 +759,13 @@ impl MarketMakerEngine {
         let instrument = format!("{symbol}-{exp_canonical}-{strike}-{style_char}");
 
         let input = QuoteInput {
-            spot_cents,
+            spot_cents: ctx.spot_cents,
             strike_cents: strike,
-            expiration: &expiration,
+            expiration,
             style,
-            spread_multiplier: config.spread_multiplier,
-            size_scalar: config.size_scalar,
-            directional_skew: config.directional_skew,
+            spread_multiplier: ctx.config.spread_multiplier,
+            size_scalar: ctx.config.size_scalar,
+            directional_skew: ctx.config.directional_skew,
             iv: None,
         };
 
@@ -602,7 +777,7 @@ impl MarketMakerEngine {
             None => {
                 warn!(
                     symbol = %symbol,
-                    expiration = %exp_str,
+                    expiration = %ctx.exp_display,
                     strike,
                     style = ?style,
                     "skipping quote: non-finite theoretical value"
@@ -611,59 +786,60 @@ impl MarketMakerEngine {
             }
         };
 
-        // Cancel existing orders and place new ones
+        // Structural, clock-independent identity of this exact instrument, used
+        // for the O(1) reverse-index lookup below (issue #107 P2-01).
+        let instrument_key = InstrumentKey::new(symbol, expiration, strike, style);
+
+        // Cancel existing orders and place new ones.
         if let Ok(underlying_book) = self.manager.get(symbol)
-            && let Ok(exp_book) = underlying_book.get_expiration(&expiration)
+            && let Ok(exp_book) = underlying_book.get_expiration(expiration)
             && let Ok(strike_book) = exp_book.get_strike(strike)
         {
             let option_book = strike_book.get(style);
 
-            // Replace, don't accumulate: cancel this instrument's previously
-            // resting maker orders before placing the fresh quote. Without this
-            // every requote tick would add a new bid/ask pair while the prior
-            // pair kept resting, leaking stale quotes into the option book.
-            //
-            // Match the exact instrument (symbol, expiration, strike, style) so
-            // requoting a BTC 50000 Call never cancels its Put or another strike.
-            // Collect the stale ids under a short read lock, drop the lock, cancel
-            // each on the option book (never holding the lock across the cancel),
-            // then prune the tracking map under one short write lock.
-            let stale_ids: Vec<OrderId> = {
-                let orders = self.active_orders.read();
-                let mut ids = Vec::with_capacity(2);
-                for (id, order) in orders.iter() {
-                    if order.symbol == symbol
-                        && order.expiration == exp_str
-                        && order.strike == strike
-                        && order.style == style
-                    {
-                        ids.push(*id);
-                    }
-                }
-                ids
-            };
-            if !stale_ids.is_empty() {
-                for &stale_id in &stale_ids {
+            // Replace, don't accumulate: look up this exact instrument's ≤2
+            // previously-resting maker orders in O(1) via the reverse index
+            // (was an O(total_orders) scan over every tracked order; issue #107
+            // P2-01). Copy the fixed-size slot array out under a short read lock,
+            // drop the lock, cancel each id on the option book (never holding a
+            // lock across the cancel), then prune both maps.
+            let stale: [Option<OrderId>; 2] = self
+                .instrument_orders
+                .read()
+                .get(&instrument_key)
+                .copied()
+                .unwrap_or_default();
+            if stale.iter().any(Option::is_some) {
+                for stale_id in stale.into_iter().flatten() {
                     // Ok(true) = cancelled, Ok(false) = already filled/gone; both
                     // mean the order should leave tracking. Delegate the actual
                     // cancel to the upstream book.
                     let _ = option_book.cancel_order(stale_id);
                 }
-                let mut orders = self.active_orders.write();
-                for stale_id in &stale_ids {
-                    orders.remove(stale_id);
+                // Sequential locks (never nested): prune `active_orders`, release
+                // it, then remove the reverse-index entry.
+                {
+                    let mut orders = self.active_orders.write();
+                    for stale_id in stale.into_iter().flatten() {
+                        orders.remove(&stale_id);
+                    }
                 }
+                self.instrument_orders.write().remove(&instrument_key);
                 debug!(
                     symbol = %symbol,
-                    expiration = %exp_str,
+                    expiration = %ctx.exp_display,
                     strike,
                     style = ?style,
-                    cancelled = stale_ids.len(),
+                    cancelled = stale.iter().filter(|s| s.is_some()).count(),
                     "cancelled stale quote before requote"
                 );
             }
 
-            // Place bid order
+            // Place the fresh bid/ask, recording each leg's id for the reverse
+            // index (slot 0 = bid, slot 1 = ask). The instrument string is built
+            // once and moved into the ask leg (the bid clones it).
+            let mut placed: [Option<OrderId>; 2] = [None, None];
+
             let bid_id = OrderId::new();
             if option_book
                 .add_limit_order(
@@ -678,7 +854,7 @@ impl MarketMakerEngine {
                     bid_id,
                     ActiveOrderInfo {
                         symbol: symbol.to_string(),
-                        expiration: exp_str.to_string(),
+                        expiration: *expiration,
                         instrument: instrument.clone(),
                         strike,
                         style,
@@ -687,9 +863,9 @@ impl MarketMakerEngine {
                         quantity: quote_params.bid_size,
                     },
                 );
+                placed[leg_slot(true)] = Some(bid_id);
             }
 
-            // Place ask order
             let ask_id = OrderId::new();
             if option_book
                 .add_limit_order(
@@ -704,8 +880,8 @@ impl MarketMakerEngine {
                     ask_id,
                     ActiveOrderInfo {
                         symbol: symbol.to_string(),
-                        expiration: exp_str.to_string(),
-                        instrument: instrument.clone(),
+                        expiration: *expiration,
+                        instrument,
                         strike,
                         style,
                         is_buy: false,
@@ -713,12 +889,21 @@ impl MarketMakerEngine {
                         quantity: quote_params.ask_size,
                     },
                 );
+                placed[leg_slot(false)] = Some(ask_id);
             }
 
-            // Broadcast quote update
+            // Record both fresh legs in the reverse index under one write lock,
+            // moving the key in (no clone) when at least one leg rested.
+            if placed.iter().any(Option::is_some) {
+                self.instrument_orders
+                    .write()
+                    .insert(instrument_key, placed);
+            }
+
+            // Broadcast quote update.
             let _ = self.event_tx.send(MarketMakerEvent::QuoteUpdated {
                 symbol: symbol.to_string(),
-                expiration: exp_str.to_string(),
+                expiration: ctx.exp_display.to_string(),
                 strike,
                 style: match style {
                     OptionStyle::Call => "call".to_string(),
@@ -742,71 +927,6 @@ impl MarketMakerEngine {
             directional_skew: config.directional_skew,
         });
     }
-
-    /// Parses an expiration string.
-    fn parse_expiration(&self, exp_str: &str) -> Result<optionstratlib::ExpirationDate, ()> {
-        use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-        use optionstratlib::ExpirationDate;
-        use optionstratlib::prelude::Positive;
-
-        // An 8-ASCII-digit string is ALWAYS a YYYYMMDD calendar date — this
-        // branch must run BEFORE the numeric-days branch (issue #110) so the
-        // engine resolves the same expiration key as the API handlers. Every
-        // byte being an ASCII digit also makes each byte a char boundary, so
-        // the slicing below cannot panic.
-        if exp_str.len() == 8 && exp_str.bytes().all(|b| b.is_ascii_digit()) {
-            if let (Ok(year), Ok(month), Ok(day)) = (
-                exp_str[0..4].parse::<i32>(),
-                exp_str[4..6].parse::<u32>(),
-                exp_str[6..8].parse::<u32>(),
-            ) && let Some(date) = NaiveDate::from_ymd_opt(year, month, day)
-                && let Some(time) = NaiveTime::from_hms_opt(16, 0, 0)
-            {
-                let datetime = NaiveDateTime::new(date, time);
-                let utc_datetime = Utc.from_utc_datetime(&datetime);
-                return Ok(ExpirationDate::DateTime(utc_datetime));
-            }
-            // 8 digits that are not a real calendar date: reject, never a
-            // relative-days fallback.
-            warn!(expiration = %exp_str, "rejecting invalid 8-digit expiration date");
-            return Err(());
-        }
-
-        // Any other numeric string is a relative number of days.
-        if let Ok(days) = exp_str.parse::<i32>() {
-            // An expiration must be a strictly positive number of days; a
-            // non-positive or otherwise invalid value is logged and rejected
-            // rather than panicking the quoting loop on bad stored data.
-            if days <= 0 {
-                warn!(expiration = %exp_str, "rejecting non-positive expiration days");
-                return Err(());
-            }
-            // Issue #136: bound the day count so an absurd stored value can
-            // never overflow chrono's date arithmetic upstream (panic).
-            if days > crate::config::MAX_EXPIRATION_DAYS {
-                warn!(expiration = %exp_str, "rejecting out-of-range expiration days");
-                return Err(());
-            }
-            let positive_days = Positive::new(days as f64).map_err(|_| {
-                warn!(expiration = %exp_str, "rejecting invalid expiration value");
-            })?;
-            return Ok(ExpirationDate::Days(positive_days));
-        }
-
-        // Try parsing the `ExpirationDate` `Display` form
-        // (`%Y-%m-%d %H:%M:%S UTC`). The requote loop keys instruments by
-        // `expiration.to_string()` and feeds that same string back here (and into
-        // `cancel_order`); without this branch a `DateTime` expiration could never
-        // round-trip, so `update_quote` would early-return and never place — or
-        // later cancel — any maker order. Parsing as a naive UTC datetime keeps
-        // the reparsed `ExpirationKey` identical to the originally stored one.
-        if let Ok(naive) = NaiveDateTime::parse_from_str(exp_str, "%Y-%m-%d %H:%M:%S UTC") {
-            let utc_datetime = Utc.from_utc_datetime(&naive);
-            return Ok(ExpirationDate::DateTime(utc_datetime));
-        }
-
-        Err(())
-    }
 }
 
 #[cfg(test)]
@@ -817,9 +937,9 @@ mod tests {
         MarketMakerEngine::new(Arc::new(UnderlyingOrderBookManager::new()), None)
     }
 
-    /// A far-future absolute expiration whose `Display` form round-trips through
-    /// [`MarketMakerEngine::parse_expiration`] to the identical `ExpirationKey`,
-    /// so the requote loop can place (and later cancel) orders against it.
+    /// A far-future absolute (`DateTime`) expiration the requote loop can place
+    /// (and later cancel) orders against. Kept structurally by the engine, so the
+    /// book lookup and reverse-index key are stable across ticks.
     fn future_expiration() -> optionstratlib::ExpirationDate {
         use chrono::{TimeZone, Utc};
         let dt = Utc
@@ -827,6 +947,16 @@ mod tests {
             .single()
             .expect("valid fixture datetime");
         optionstratlib::ExpirationDate::DateTime(dt)
+    }
+
+    /// A relative `Days` expiration whose `Display` form is clock-dependent
+    /// (`Utc::now() + n days`, resolved to the second): the exact case issue
+    /// #107 (P2-03) flags for stale-order key drift across requote ticks.
+    fn days_expiration() -> optionstratlib::ExpirationDate {
+        use optionstratlib::prelude::Positive;
+        optionstratlib::ExpirationDate::Days(
+            Positive::new(45.0).expect("45 is a valid positive day count"),
+        )
     }
 
     /// Collects the engine's tracked order ids for one exact instrument.
@@ -963,26 +1093,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_expiration_round_trips_datetime_display() {
-        // The requote loop keys instruments by `expiration.to_string()` and feeds
-        // that string back through `parse_expiration`. A `DateTime` expiration must
-        // round-trip, otherwise `update_quote` early-returns and never quotes.
-        let engine = test_engine();
-        let exp = future_expiration();
-        let reparsed = engine
-            .parse_expiration(&exp.to_string())
-            .expect("display form must round-trip");
-        // Same calendar instant => same expiration key the manager indexes on.
-        match (exp, reparsed) {
-            (
-                optionstratlib::ExpirationDate::DateTime(a),
-                optionstratlib::ExpirationDate::DateTime(b),
-            ) => assert_eq!(a, b),
-            other => panic!("expected two DateTime expirations, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn test_requote_does_not_accumulate_orders() {
         // Acceptance criteria for issue #49: after N requotes for the same
         // instrument the resting order count stays ~2 per instrument, not N*2.
@@ -1040,6 +1150,106 @@ mod tests {
     }
 
     #[test]
+    fn test_requote_days_expiration_does_not_accumulate_orders() {
+        // Issue #107 (P2-03): a `Days`-variant expiration's `Display` string is
+        // clock-dependent (`Utc::now() + 45d`, to the second), so keying stale
+        // orders on that string drifts tick-to-tick and the requote loop would
+        // either never place (book-key mismatch) or accumulate. Keying on the
+        // structural expiration (clock-independent) must place exactly bid+ask
+        // per instrument and keep that bounded across ticks.
+        let engine = test_engine();
+        let expiration = days_expiration();
+        let underlying = engine.manager.get_or_create("BTC");
+        let exp_book = underlying.get_or_create_expiration(expiration);
+        let strike_book = exp_book.get_or_create_strike(5_000_000); // $50,000 strike
+        let call_book = strike_book.get(OptionStyle::Call);
+        let put_book = strike_book.get(OptionStyle::Put);
+
+        // First tick places a bid+ask for the call and the put.
+        engine.update_price("BTC", 5_000_000);
+        assert_eq!(
+            call_book.active_order_count(),
+            2,
+            "a Days expiration must be quoted: bid+ask for the call"
+        );
+        assert_eq!(
+            put_book.active_order_count(),
+            2,
+            "a Days expiration must be quoted: bid+ask for the put"
+        );
+
+        // Several more ticks: counts stay bounded, proving no per-tick leak even
+        // though the Days `Display` string differs between ticks.
+        for px in [5_050_000, 4_900_000, 5_100_000, 5_025_000, 4_950_000] {
+            engine.update_price("BTC", px);
+        }
+        assert!(
+            call_book.active_order_count() <= 2,
+            "Days requote must replace, not accumulate (call): {}",
+            call_book.active_order_count()
+        );
+        assert!(
+            put_book.active_order_count() <= 2,
+            "Days requote must replace, not accumulate (put): {}",
+            put_book.active_order_count()
+        );
+        assert_eq!(
+            engine.active_orders.read().len(),
+            4,
+            "tracking map must stay at two instruments * (bid+ask)"
+        );
+        // The reverse index tracks exactly the two instruments (call + put), one
+        // entry each — proving it does not leak entries across ticks either.
+        assert_eq!(
+            engine.instrument_orders.read().len(),
+            2,
+            "reverse index must hold one entry per quoted instrument"
+        );
+    }
+
+    #[test]
+    fn test_kill_switch_cancels_days_orders_from_book_and_index() {
+        // Issue #107: the cancel path (`cancel_order`, reached via the kill
+        // switch) must key the book by the stored structural expiration, so a
+        // `Days`-variant order is actually removed from the option book — the
+        // old string-reparse turned a `Days` key into a `DateTime` key and left
+        // the resting order behind.
+        let engine = test_engine();
+        let expiration = days_expiration();
+        let underlying = engine.manager.get_or_create("BTC");
+        let exp_book = underlying.get_or_create_expiration(expiration);
+        let strike_book = exp_book.get_or_create_strike(5_000_000);
+        let call_book = strike_book.get(OptionStyle::Call);
+        let put_book = strike_book.get(OptionStyle::Put);
+
+        engine.update_price("BTC", 5_000_000);
+        assert_eq!(call_book.active_order_count(), 2);
+        assert_eq!(put_book.active_order_count(), 2);
+
+        // Kill switch: cancel everything.
+        engine.set_enabled(false);
+
+        assert_eq!(
+            call_book.active_order_count(),
+            0,
+            "kill switch must cancel the Days call orders on the book"
+        );
+        assert_eq!(
+            put_book.active_order_count(),
+            0,
+            "kill switch must cancel the Days put orders on the book"
+        );
+        assert!(
+            engine.active_orders.read().is_empty(),
+            "no tracked orders after the kill switch"
+        );
+        assert!(
+            engine.instrument_orders.read().is_empty(),
+            "reverse index cleared by the kill switch"
+        );
+    }
+
+    #[test]
     fn test_requote_one_instrument_leaves_others_resting() {
         // Per-instrument matching: requoting one contract must cancel only that
         // contract's stale orders, never another strike's or the same strike's
@@ -1058,23 +1268,17 @@ mod tests {
         let b_call = strike_b.get(OptionStyle::Call);
 
         // Quote strike-A call, strike-A put, and strike-B call.
-        engine.update_quote(
-            "ETH",
-            &exp_str,
-            300_000,
-            OptionStyle::Call,
-            350_000,
-            &config,
-        );
-        engine.update_quote("ETH", &exp_str, 300_000, OptionStyle::Put, 350_000, &config);
-        engine.update_quote(
-            "ETH",
-            &exp_str,
-            400_000,
-            OptionStyle::Call,
-            350_000,
-            &config,
-        );
+        let ctx = RequoteContext {
+            symbol: "ETH",
+            expiration: &expiration,
+            exp_display: &exp_str,
+            exp_canonical: &exp_str,
+            spot_cents: 350_000,
+            config: &config,
+        };
+        engine.update_quote(&ctx, 300_000, OptionStyle::Call);
+        engine.update_quote(&ctx, 300_000, OptionStyle::Put);
+        engine.update_quote(&ctx, 400_000, OptionStyle::Call);
         assert_eq!(a_call.active_order_count(), 2);
         assert_eq!(a_put.active_order_count(), 2);
         assert_eq!(b_call.active_order_count(), 2);
@@ -1084,15 +1288,16 @@ mod tests {
         assert_eq!(a_put_before.len(), 2);
         assert_eq!(b_call_before.len(), 2);
 
-        // Requote ONLY the strike-A call.
-        engine.update_quote(
-            "ETH",
-            &exp_str,
-            300_000,
-            OptionStyle::Call,
-            351_000,
-            &config,
-        );
+        // Requote ONLY the strike-A call (new spot).
+        let requote_ctx = RequoteContext {
+            symbol: "ETH",
+            expiration: &expiration,
+            exp_display: &exp_str,
+            exp_canonical: &exp_str,
+            spot_cents: 351_000,
+            config: &config,
+        };
+        engine.update_quote(&requote_ctx, 300_000, OptionStyle::Call);
 
         // Strike-A call replaced (still 2); the others are untouched, same ids.
         assert_eq!(a_call.active_order_count(), 2, "strike-A call replaced");
@@ -1108,48 +1313,6 @@ mod tests {
             b_call_before,
             "requoting strike A must not disturb strike B"
         );
-    }
-
-    #[test]
-    fn test_parse_expiration_rejects_zero() {
-        let engine = test_engine();
-        assert!(engine.parse_expiration("0").is_err());
-    }
-
-    #[test]
-    fn test_parse_expiration_rejects_negative() {
-        let engine = test_engine();
-        assert!(engine.parse_expiration("-5").is_err());
-    }
-
-    #[test]
-    fn test_parse_expiration_rejects_garbage() {
-        let engine = test_engine();
-        assert!(engine.parse_expiration("not-a-date").is_err());
-    }
-
-    #[test]
-    fn test_parse_expiration_accepts_positive_days() {
-        let engine = test_engine();
-        assert!(engine.parse_expiration("30").is_ok());
-    }
-
-    #[test]
-    fn test_parse_expiration_accepts_yyyymmdd() {
-        let engine = test_engine();
-        assert!(engine.parse_expiration("20251231").is_ok());
-    }
-
-    #[test]
-    fn test_parse_expiration_rejects_multibyte_eight_bytes() {
-        // `"12345é7"` is 8 bytes ('é' is 2 bytes) but does not parse as i32, so it
-        // reaches the YYYYMMDD branch where byte slicing at indices 4/6 would land
-        // mid-char and panic the requote loop. The char-safe guard must return
-        // `Err(())` instead.
-        let engine = test_engine();
-        let multibyte = "12345é7";
-        assert_eq!(multibyte.len(), 8, "fixture must be exactly 8 bytes");
-        assert!(engine.parse_expiration(multibyte).is_err());
     }
 
     // ------------------------------------------------------------------------
