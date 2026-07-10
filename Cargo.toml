@@ -71,9 +71,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Option Chain OrderBook library
-option-chain-orderbook = "0.5"
+option-chain-orderbook = "0.6"
 optionstratlib = "0.17"
-orderbook-rs = { version = "0.9", features = ["special_orders"] }
+orderbook-rs = { version = "0.10", features = ["special_orders"] }
 
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
