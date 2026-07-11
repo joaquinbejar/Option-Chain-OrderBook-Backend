@@ -3552,15 +3552,12 @@ pub async fn bulk_submit_orders(
         ));
     }
 
-    // Issue #105: the upstream fill-capturing `add_limit_order_full` has
-    // PER-BOOK capture scope, so two concurrent bulk submits interleaving on
-    // the same book could mis-attribute captured fills and skew the atomic
-    // rollback accounting. Serialize bulk submits for the whole item loop
-    // (they are an infrequent path; the guard spans no external await other
-    // than this lock). A concurrent SINGLE-order submit on the same book
-    // remains subject to the upstream capture scope; a per-order fill return
-    // is tracked as an upstream improvement.
-    let _bulk_guard = state.bulk_submit_lock.lock().await;
+    // option-chain-orderbook 0.6.1 (#140): the `*_full` submit methods
+    // attribute fills per-call (engine-side stack-local result, no shared
+    // capture slot), so concurrent bulk submits — and concurrent single-order
+    // submits on the same book — can no longer cross-attribute or lose fills.
+    // The global bulk_submit_lock that serialized this path (issue #105) is
+    // gone.
 
     let mut results: Vec<BulkOrderResultItem> = Vec::with_capacity(body.orders.len());
     let mut success_count = 0;

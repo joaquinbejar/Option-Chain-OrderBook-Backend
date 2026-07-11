@@ -96,15 +96,6 @@ pub struct AppState {
     pub executions: Arc<DashMap<String, ExecutionInfo>>,
     /// Storage for orderbook snapshots by snapshot ID.
     pub snapshots: Arc<DashMap<String, StoredSnapshot>>,
-    /// Serializes atomic bulk submits (issue #105): the upstream fill-capturing
-    /// `add_limit_order_full` has PER-BOOK capture scope, so two concurrent
-    /// bulk submits interleaving on the same option book could mis-attribute a
-    /// captured fill and skew the rollback accounting. Bulk submits are an
-    /// infrequent path; serializing them globally is a bounded, simple
-    /// correctness guarantee. (A concurrent SINGLE-order submit on the same
-    /// book remains subject to the upstream capture scope — documented at the
-    /// bulk handler; a per-order fill return is an upstream ask.)
-    pub bulk_submit_lock: Arc<tokio::sync::Mutex<()>>,
     /// Cached volatility surfaces by underlying (issue #125): the IV sweep is
     /// a ~1000-candidate Black-Scholes grid search per leg, so concurrent and
     /// rapid repeat requests reuse the last computed surface while the spot
@@ -141,7 +132,6 @@ impl AppState {
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
             surface_cache: Arc::new(DashMap::new()),
-            bulk_submit_lock: Arc::new(tokio::sync::Mutex::new(())),
             shutdown_rx: std::sync::OnceLock::new(),
         }
     }
@@ -172,7 +162,6 @@ impl AppState {
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
             surface_cache: Arc::new(DashMap::new()),
-            bulk_submit_lock: Arc::new(tokio::sync::Mutex::new(())),
             shutdown_rx: std::sync::OnceLock::new(),
         }
     }
@@ -227,7 +216,6 @@ impl AppState {
             executions: Arc::new(DashMap::new()),
             snapshots: Arc::new(DashMap::new()),
             surface_cache: Arc::new(DashMap::new()),
-            bulk_submit_lock: Arc::new(tokio::sync::Mutex::new(())),
             shutdown_rx: std::sync::OnceLock::new(),
         }
     }
