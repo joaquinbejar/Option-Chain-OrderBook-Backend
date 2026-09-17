@@ -372,18 +372,18 @@
 //! ## Dependencies
 //!
 //! - **axum** (0.8): Async web framework
-//! - **tower-http** (0.6): HTTP middleware (CORS, tracing, compression)
-//! - **option-chain-orderbook** (0.3): Core orderbook library
-//! - **orderbook-rs** (0.5): Low-level orderbook implementation
-//! - **optionstratlib** (0.14): Options pricing and greeks
-//! - **utoipa** (5.4): OpenAPI documentation generation
+//! - **tower-http** (0.7): HTTP middleware (CORS, tracing, compression)
+//! - **option-chain-orderbook** (0.11): Core orderbook library
+//! - **orderbook-rs** (0.12): Low-level orderbook implementation
+//! - **optionstratlib** (0.21): Options pricing and greeks
+//! - **utoipa** (5.5): OpenAPI documentation generation
 //! - **utoipa-swagger-ui** (9.0): Swagger UI integration
-//! - **tokio** (1.49): Async runtime
-//! - **sqlx** (0.8): Database connectivity (PostgreSQL)
-//! - **dashmap** (6.1): Concurrent hash maps
+//! - **tokio** (1.53): Async runtime
+//! - **sqlx** (0.9): Database connectivity (PostgreSQL)
+//! - **dashmap** (6.2): Concurrent hash maps
 //! - **serde** (1.0): Serialization/deserialization
 //! - **tracing** (0.1): Structured logging
-//! - **jsonwebtoken** (10.4): JWT signing/verification (RS256, x509 PEM)
+//! - **jsonwebtoken** (11.1): JWT signing/verification (RS256, x509 PEM)
 
 pub mod api;
 pub mod auth;

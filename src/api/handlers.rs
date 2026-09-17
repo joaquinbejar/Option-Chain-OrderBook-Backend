@@ -3072,7 +3072,7 @@ struct AcceptedBulkOrder {
 
 /// Helper function to submit a single order from a bulk request.
 ///
-/// Uses the fill-capturing [`add_limit_order_full`] variant so the executed
+/// Uses the fill-capturing `add_limit_order_full` variant so the executed
 /// quantity is known at accept time and the tracked [`OrderInfo`] reflects the
 /// real fill/remaining state rather than assuming the order rested untouched.
 fn submit_single_order(

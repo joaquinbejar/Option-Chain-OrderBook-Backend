@@ -8,7 +8,7 @@ use thiserror::Error;
 /// Maximum accepted dollar price anywhere a dollar amount is converted to cents.
 ///
 /// This is the ONE canonical upper bound for the server's dollar→cents
-/// conversions (see [`dollars_to_cents`]): asset `initial_price` validation,
+/// conversions (see `dollars_to_cents`): asset `initial_price` validation,
 /// startup price seeding, strike generation, the price simulation, and the live
 /// `POST /api/v1/prices` insert all share it. Bounding the input keeps the cents
 /// result (`<= MAX_INITIAL_PRICE * 100`) well within `u64`/`u128`/`i64` range, so
