@@ -71,12 +71,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Option Chain OrderBook library
-option-chain-orderbook = "0.7"
-optionstratlib = "0.17"
-orderbook-rs = { version = "0.10", features = ["special_orders"] }
+option-chain-orderbook = "0.11"
+optionstratlib = "0.21"
+orderbook-rs = { version = "0.12", features = ["special_orders"] }
 
 # Async runtime
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 
 # Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
@@ -95,22 +95,22 @@ utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.23", features = ["v4", "serde"] }
+uuid = { version = "1.26", features = ["v4", "serde"] }
 futures = "0.3"
 parking_lot = "0.12"
 toml = "1.1"
-rust_decimal = "1.42"
+rust_decimal = "1.43"
 rust_decimal_macros = "1.40"
 dashmap = "6.2"
 futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
-tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 serde_urlencoded = "0.7"
 
 # Authentication (JWT signed with an x509 key pair).
 # Pure-Rust crypto backend (`rust_crypto`) avoids a C toolchain dependency;
 # `use_pem` enables loading keys/certs from PEM (incl. x509 CERTIFICATE blocks).
-jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "rust_crypto"] }
+jsonwebtoken = { version = "11.1", default-features = false, features = ["use_pem", "rust_crypto"] }
 
 [dev-dependencies]
 # `test-util` enables paused/virtual time (`tokio::time::pause`,

@@ -173,7 +173,7 @@ impl RateLimiter {
     /// accurate `X-RateLimit-*` headers (issue #62).
     ///
     /// Existing keys take a lock-free fast path. A brand-new key is admitted only
-    /// while the map is under [`MAX_TRACKED_KEYS`]; at the cap a sweep of
+    /// while the map is under `MAX_TRACKED_KEYS`; at the cap a sweep of
     /// fully-expired entries is attempted first, and if the map is still full the
     /// request is rejected so the map can never grow without bound.
     pub fn check_and_record_status(&self, key: &str, limit: u32) -> RateLimitDecision {
