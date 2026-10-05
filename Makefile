@@ -97,16 +97,16 @@ publish: readme
 .PHONY: coverage
 coverage:
 	export LOGLEVEL=WARN
-	cargo install cargo-tarpaulin
+	cargo install cargo-tarpaulin --locked --version '>=0.37.5'
 	mkdir -p coverage
-	cargo tarpaulin --verbose --all-features --timeout 0 --out Xml --output-dir coverage --packages option-chain-orderbook-backend --packages orderbook-client
+	cargo tarpaulin --verbose --all-features --timeout 600 --out Xml --output-dir coverage --packages option-chain-orderbook-backend --packages orderbook-client
 
 .PHONY: coverage-html
 coverage-html:
 	export LOGLEVEL=WARN
-	cargo install cargo-tarpaulin
+	cargo install cargo-tarpaulin --locked --version '>=0.37.5'
 	mkdir -p coverage
-	cargo tarpaulin --color Always --tests --all-targets --all-features --timeout 0 --out Html --output-dir coverage --packages option-chain-orderbook-backend --packages orderbook-client
+	cargo tarpaulin --color Always --tests --all-targets --all-features --timeout 600 --out Html --output-dir coverage --packages option-chain-orderbook-backend --packages orderbook-client
 
 .PHONY: open-coverage
 open-coverage:

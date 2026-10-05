@@ -208,7 +208,7 @@ impl RateLimiter {
         for _ in 0..3 {
             if self
                 .tracked
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     (current < MAX_TRACKED_KEYS).then_some(current + 1)
                 })
                 .is_ok()
