@@ -1,6 +1,6 @@
 [package]
 name = "option-chain-orderbook-backend"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "REST API backend for Option Chain OrderBook"
@@ -55,6 +55,7 @@ parking_lot = { workspace = true }
 toml = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
+ulid = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
 
@@ -71,9 +72,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Option Chain OrderBook library
-option-chain-orderbook = "0.12"
-optionstratlib = "0.21"
-orderbook-rs = { version = "0.13", features = ["special_orders"] }
+option-chain-orderbook = "0.13"
+optionstratlib = { version = "0.22", default-features = false, features = ["pricing", "simulation"] }
+orderbook-rs = { version = "0.15", features = ["special_orders"] }
 
 # Async runtime
 tokio = { version = "1.53", features = ["full"] }
@@ -90,8 +91,8 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # OpenAPI documentation
-utoipa = { version = "5.5", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+utoipa = { version = "6.0", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "10.0", features = ["axum"] }
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
@@ -101,6 +102,7 @@ parking_lot = "0.12"
 toml = "1.1"
 rust_decimal = "1.43"
 rust_decimal_macros = "1.40"
+ulid = "3.0"
 dashmap = "6.2"
 futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json"] }

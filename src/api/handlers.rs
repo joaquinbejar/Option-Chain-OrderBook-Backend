@@ -2,6 +2,7 @@
 
 use crate::api::websocket::{OrderbookDeltaEvent, PriceLevelChange, TradeEvent};
 use crate::error::{ApiError, ErrorResponse, RateLimitErrorResponse};
+use crate::ids::new_order_id;
 use crate::models::{
     ATMTermStructurePoint, AddOrderRequest, AddOrderResponse, ApiTimeInForce, BulkCancelRequest,
     BulkCancelResponse, BulkCancelResultItem, BulkOrderItem, BulkOrderRequest, BulkOrderResponse,
@@ -497,11 +498,26 @@ pub async fn create_snapshot(State(state): State<Arc<AppState>>) -> Json<CreateS
                             // Snapshot both call and put
                             for style in [OptionStyle::Call, OptionStyle::Put] {
                                 let option_book = strike_book.get(style);
-                                let snapshot = option_book.inner().create_snapshot(usize::MAX);
-
                                 let style_str = match style {
                                     OptionStyle::Call => "call",
                                     OptionStyle::Put => "put",
+                                };
+
+                                let snapshot = match option_book.inner().create_snapshot(usize::MAX)
+                                {
+                                    Ok(snapshot) => snapshot,
+                                    Err(e) => {
+                                        orderbooks_failed = orderbooks_failed.saturating_add(1);
+                                        tracing::warn!(
+                                            underlying = %underlying_symbol,
+                                            expiration = %exp_str,
+                                            strike,
+                                            style = style_str,
+                                            error = %e,
+                                            "skipping orderbook in snapshot: snapshot creation failed"
+                                        );
+                                        continue;
+                                    }
                                 };
 
                                 let order_count = snapshot
@@ -1108,12 +1124,12 @@ pub async fn get_option_chain(
     for strike in filtered_strikes {
         if let Ok(strike_book) = exp_book.get_strike(strike) {
             // Get call quote
-            let call_quote = strike_book.call_quote();
+            let call_quote = strike_book.call_quote()?;
             let call_data =
                 build_option_quote_data(&call_quote, &state, &underlying, &exp_str, strike, "C");
 
             // Get put quote
-            let put_quote = strike_book.put_quote();
+            let put_quote = strike_book.put_quote()?;
             let put_data =
                 build_option_quote_data(&put_quote, &state, &underlying, &exp_str, strike, "P");
 
@@ -1266,8 +1282,16 @@ pub async fn get_volatility_surface(
 
             rows.push(SurfaceStrikeMids {
                 strike: *strike,
-                call_mid: calculate_mid_price(&strike_book.call_quote()),
-                put_mid: calculate_mid_price(&strike_book.put_quote()),
+                // A quote the engine cannot read leaves that leg's mid out,
+                // like a one-sided book does.
+                call_mid: strike_book
+                    .call_quote()
+                    .ok()
+                    .and_then(|q| calculate_mid_price(&q)),
+                put_mid: strike_book
+                    .put_quote()
+                    .ok()
+                    .and_then(|q| calculate_mid_price(&q)),
             });
         }
 
@@ -1542,8 +1566,8 @@ pub async fn create_strike(
         strike: strike_book.strike(),
         call_order_count: strike_book.call().order_count(),
         put_order_count: strike_book.put().order_count(),
-        call_quote: quote_to_response(&strike_book.call_quote()),
-        put_quote: quote_to_response(&strike_book.put_quote()),
+        call_quote: quote_to_response(&strike_book.call_quote()?),
+        put_quote: quote_to_response(&strike_book.put_quote()?),
     }))
 }
 
@@ -1586,8 +1610,8 @@ pub async fn get_strike(
         strike: strike_book.strike(),
         call_order_count: strike_book.call().order_count(),
         put_order_count: strike_book.put().order_count(),
-        call_quote: quote_to_response(&strike_book.call_quote()),
-        put_quote: quote_to_response(&strike_book.put_quote()),
+        call_quote: quote_to_response(&strike_book.call_quote()?),
+        put_quote: quote_to_response(&strike_book.put_quote()?),
     }))
 }
 
@@ -1638,12 +1662,12 @@ pub async fn get_option_book(
         .map_err(|_| ApiError::StrikeNotFound(strike))?;
 
     let option_book = strike_book.get(option_style);
-    let quote = option_book.best_quote();
+    let quote = option_book.best_quote()?;
 
     Ok(Json(OrderBookSnapshotResponse {
         symbol: option_book.symbol().to_string(),
-        total_bid_depth: option_book.total_bid_depth(),
-        total_ask_depth: option_book.total_ask_depth(),
+        total_bid_depth: option_book.total_bid_depth()?,
+        total_ask_depth: option_book.total_ask_depth()?,
         bid_level_count: option_book.bid_level_count(),
         ask_level_count: option_book.ask_level_count(),
         order_count: option_book.order_count(),
@@ -1713,7 +1737,7 @@ pub async fn add_order(
     let strike_book = exp_book.get_or_create_strike(strike);
     let option_book = strike_book.get(option_style);
 
-    let order_id = OrderId::new();
+    let order_id = new_order_id();
 
     // Use the fill-capturing TIF variant so the tracked `OrderInfo` reflects the
     // real fill/remaining state (mirroring the bulk submit path in
@@ -2119,7 +2143,7 @@ pub async fn modify_order(
     publish_level_delta(&state, option_book, side, current_price.as_u128());
 
     // Create a new order with the updated parameters
-    let new_order_id = OrderId::new();
+    let new_order_id = new_order_id();
 
     match option_book.add_limit_order(new_order_id, side, new_price, new_quantity) {
         Ok(()) => {
@@ -2252,7 +2276,7 @@ pub async fn get_option_quote(
         .map_err(|_| ApiError::StrikeNotFound(strike))?;
 
     let option_book = strike_book.get(option_style);
-    let quote = option_book.best_quote();
+    let quote = option_book.best_quote()?;
 
     Ok(Json(quote_to_response(&quote)))
 }
@@ -2290,6 +2314,7 @@ pub async fn get_option_greeks(
     use optionstratlib::greeks::Greeks;
     use optionstratlib::model::option::Options;
     use optionstratlib::prelude::{OptionType, Positive};
+    use optionstratlib::pricing::OptionPricing;
 
     let option_style = parse_option_style(&style)?;
 
@@ -2481,7 +2506,10 @@ pub async fn get_option_snapshot(
     let option_book = strike_book.get(option_style);
 
     // Get enriched snapshot from the inner orderbook
-    let enriched = option_book.inner().enriched_snapshot(depth.to_usize());
+    let enriched = option_book
+        .inner()
+        .enriched_snapshot(depth.to_usize())
+        .map_err(|e| ApiError::OrderBook(e.to_string()))?;
 
     // Build symbol string
     let style_str = match option_style {
@@ -2589,7 +2617,10 @@ pub async fn get_orderbook_metrics(
     let option_book = strike_book.get(option_style);
 
     // Get enriched snapshot for base metrics (use depth 10 for calculations)
-    let enriched = option_book.inner().enriched_snapshot(10);
+    let enriched = option_book
+        .inner()
+        .enriched_snapshot(10)
+        .map_err(|e| ApiError::OrderBook(e.to_string()))?;
 
     // Build symbol string
     let style_str = match option_style {
@@ -2625,7 +2656,10 @@ pub async fn get_orderbook_metrics(
     };
 
     // Calculate price metrics
-    let micro_price = option_book.inner().micro_price();
+    let micro_price = option_book
+        .inner()
+        .micro_price()
+        .map_err(|e| ApiError::OrderBook(e.to_string()))?;
 
     let prices = PriceMetrics {
         mid_price: enriched.mid_price,
@@ -2643,14 +2677,16 @@ pub async fn get_orderbook_metrics(
         .inner()
         .market_impact(impact_quantity, Side::Sell);
 
+    // An impact the engine cannot compute is reported as unknown (`null`),
+    // the same as the fields' optional shape already allows.
     let buy_100 = ImpactMetrics {
-        avg_price: Some(buy_impact.avg_price),
-        slippage_bps: Some(buy_impact.slippage_bps),
+        avg_price: buy_impact.as_ref().ok().map(|i| i.avg_price),
+        slippage_bps: buy_impact.as_ref().ok().map(|i| i.slippage_bps),
     };
 
     let sell_100 = ImpactMetrics {
-        avg_price: Some(sell_impact.avg_price),
-        slippage_bps: Some(sell_impact.slippage_bps),
+        avg_price: sell_impact.as_ref().ok().map(|i| i.avg_price),
+        slippage_bps: sell_impact.as_ref().ok().map(|i| i.slippage_bps),
     };
 
     let market_impact = MarketImpactMetrics { buy_100, sell_100 };
@@ -2720,7 +2756,7 @@ pub async fn submit_market_order(
     let strike_book = exp_book.get_or_create_strike(strike);
     let option_book = strike_book.get(option_style);
 
-    let order_id = OrderId::new();
+    let order_id = new_order_id();
 
     match option_book
         .inner()
@@ -3111,7 +3147,7 @@ fn submit_single_order(
     // Generate order ID and submit, capturing the trade result so we know what
     // (if anything) filled immediately. The fill is the source of truth for an
     // atomic rollback — a marketable limit order can fill on submit.
-    let order_id = OrderId::new();
+    let order_id = new_order_id();
     let trade_result = option_book
         .add_limit_order_full(order_id, side, item.price, item.quantity)
         .map_err(|e| format!("Failed to add order: {}", e))?;
@@ -4120,7 +4156,7 @@ fn get_current_price_for_symbol(state: &AppState, symbol: &str) -> Option<u128> 
     let exp_book = underlying_book.get_expiration(&expiration).ok()?;
     let strike_book = exp_book.get_strike(strike).ok()?;
     let option_book = strike_book.get(style);
-    let quote = option_book.best_quote();
+    let quote = option_book.best_quote().ok()?;
 
     // Use mid price if available, otherwise best bid or ask
     match (quote.bid_price(), quote.ask_price()) {
@@ -4973,7 +5009,7 @@ mod tests {
         let strike_book = exp_book.get_or_create_strike(100);
         let option_book = strike_book.get(OptionStyle::Call);
         option_book
-            .add_limit_order(OrderId::new(), Side::Sell, 150, 10)
+            .add_limit_order(new_order_id(), Side::Sell, 150, 10)
             .expect("resting ask placed");
 
         // Subscribe AFTER seeding so only the market order's events are captured.
@@ -5376,7 +5412,7 @@ mod tests {
         let option_book = strike_book.get(OptionStyle::Call);
 
         // Add a sell order (ask) at price 150 with quantity 100
-        let sell_order_id = OrderId::new();
+        let sell_order_id = new_order_id();
         option_book
             .add_limit_order(sell_order_id, Side::Sell, 150, 100)
             .unwrap();
@@ -5423,7 +5459,7 @@ mod tests {
         let option_book = strike_book.get(OptionStyle::Call);
 
         // Add a sell order (ask) at price 150 with quantity 30
-        let sell_order_id = OrderId::new();
+        let sell_order_id = new_order_id();
         option_book
             .add_limit_order(sell_order_id, Side::Sell, 150, 30)
             .unwrap();
@@ -5557,7 +5593,7 @@ mod tests {
         let option_book = strike_book.get(OptionStyle::Put);
 
         // Add a buy order (bid) at price 120 with quantity 100
-        let buy_order_id = OrderId::new();
+        let buy_order_id = new_order_id();
         option_book
             .add_limit_order(buy_order_id, Side::Buy, 120, 100)
             .unwrap();
@@ -5600,17 +5636,17 @@ mod tests {
         let option_book = strike_book.get(OptionStyle::Call);
 
         // Add multiple sell orders at different prices
-        let sell_order_id1 = OrderId::new();
+        let sell_order_id1 = new_order_id();
         option_book
             .add_limit_order(sell_order_id1, Side::Sell, 150, 30)
             .unwrap();
 
-        let sell_order_id2 = OrderId::new();
+        let sell_order_id2 = new_order_id();
         option_book
             .add_limit_order(sell_order_id2, Side::Sell, 155, 40)
             .unwrap();
 
-        let sell_order_id3 = OrderId::new();
+        let sell_order_id3 = new_order_id();
         option_book
             .add_limit_order(sell_order_id3, Side::Sell, 160, 50)
             .unwrap();
@@ -5666,7 +5702,7 @@ mod tests {
         let strike_book = exp_book.get_or_create_strike(100);
         let option_book = strike_book.get(OptionStyle::Call);
         option_book
-            .add_limit_order(OrderId::new(), Side::Sell, 150, 100)
+            .add_limit_order(new_order_id(), Side::Sell, 150, 100)
             .expect("seed resting sell");
 
         // Submit a market BUY for 40; it lifts 40 @ 150 from the resting ask.
@@ -5781,7 +5817,7 @@ mod tests {
         let strike_book = exp_book.get_or_create_strike(100);
         let option_book = strike_book.get(OptionStyle::Call);
         option_book
-            .add_limit_order(OrderId::new(), Side::Sell, 150, 100)
+            .add_limit_order(new_order_id(), Side::Sell, 150, 100)
             .expect("seed resting sell");
 
         // Submit a crossing BUY limit (price 160 >= 150) for 30 via add_order;
@@ -6350,10 +6386,10 @@ mod tests {
 
         // Add bid and ask orders
         option_book
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 50)
+            .add_limit_order(new_order_id(), Side::Buy, 100, 50)
             .unwrap();
         option_book
-            .add_limit_order(OrderId::new(), Side::Sell, 110, 30)
+            .add_limit_order(new_order_id(), Side::Sell, 110, 30)
             .unwrap();
 
         // Use the formatted expiration string that matches what find_expiration_by_str expects
@@ -6406,21 +6442,21 @@ mod tests {
 
         // Add multiple bid levels
         option_book
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 50)
+            .add_limit_order(new_order_id(), Side::Buy, 100, 50)
             .unwrap();
         option_book
-            .add_limit_order(OrderId::new(), Side::Buy, 99, 40)
+            .add_limit_order(new_order_id(), Side::Buy, 99, 40)
             .unwrap();
         option_book
-            .add_limit_order(OrderId::new(), Side::Buy, 98, 30)
+            .add_limit_order(new_order_id(), Side::Buy, 98, 30)
             .unwrap();
 
         // Add multiple ask levels
         option_book
-            .add_limit_order(OrderId::new(), Side::Sell, 110, 25)
+            .add_limit_order(new_order_id(), Side::Sell, 110, 25)
             .unwrap();
         option_book
-            .add_limit_order(OrderId::new(), Side::Sell, 111, 35)
+            .add_limit_order(new_order_id(), Side::Sell, 111, 35)
             .unwrap();
 
         // Use the formatted expiration string that matches what find_expiration_by_str expects
@@ -8121,7 +8157,7 @@ mod tests {
             .expect("strike exists in fixture");
         strike_book
             .get(OptionStyle::Call)
-            .add_limit_order(OrderId::new(), side, price, quantity)
+            .add_limit_order(new_order_id(), side, price, quantity)
             .expect("resting order placed");
     }
 
@@ -8797,6 +8833,7 @@ mod tests {
     fn test_derive_iv_recovers_black_scholes_volatility() {
         use optionstratlib::model::option::Options;
         use optionstratlib::prelude::{OptionType, Positive, Side};
+        use optionstratlib::pricing::OptionPricing;
         use rust_decimal::Decimal;
         use rust_decimal::prelude::ToPrimitive;
 
@@ -9358,10 +9395,10 @@ mod tests {
 
         // Add some orders using the option_book API
         call_book
-            .add_limit_order(OrderId::new(), Side::Buy, 10000, 100) // bid at 100.00
+            .add_limit_order(new_order_id(), Side::Buy, 10000, 100) // bid at 100.00
             .unwrap();
         call_book
-            .add_limit_order(OrderId::new(), Side::Sell, 10100, 100) // ask at 101.00
+            .add_limit_order(new_order_id(), Side::Sell, 10100, 100) // ask at 101.00
             .unwrap();
 
         // Get the expiration string
