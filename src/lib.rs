@@ -373,11 +373,11 @@
 //!
 //! - **axum** (0.8): Async web framework
 //! - **tower-http** (0.7): HTTP middleware (CORS, tracing, compression)
-//! - **option-chain-orderbook** (0.12): Core orderbook library
-//! - **orderbook-rs** (0.13): Low-level orderbook implementation
-//! - **optionstratlib** (0.21): Options pricing and greeks
-//! - **utoipa** (5.5): OpenAPI documentation generation
-//! - **utoipa-swagger-ui** (9.0): Swagger UI integration
+//! - **option-chain-orderbook** (0.13): Core orderbook library
+//! - **orderbook-rs** (0.15): Low-level orderbook implementation
+//! - **optionstratlib** (0.22): Options pricing and greeks
+//! - **utoipa** (6.0): OpenAPI documentation generation
+//! - **utoipa-swagger-ui** (10.0): Swagger UI integration
 //! - **tokio** (1.53): Async runtime
 //! - **sqlx** (0.9): Database connectivity (PostgreSQL)
 //! - **dashmap** (6.2): Concurrent hash maps
@@ -390,6 +390,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod ids;
 pub mod market_maker;
 pub mod models;
 pub mod ohlc;

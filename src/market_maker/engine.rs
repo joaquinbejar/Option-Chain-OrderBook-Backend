@@ -1,6 +1,7 @@
 //! Market maker engine that coordinates quoting across all instruments.
 
 use crate::db::DatabasePool;
+use crate::ids::new_order_id;
 use crate::market_maker::{OptionPricer, QuoteInput, Quoter};
 use chrono::{DateTime, Utc};
 use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
@@ -660,7 +661,7 @@ impl MarketMakerEngine {
         quantity: u64,
     ) -> OrderId {
         use chrono::TimeZone;
-        let id = OrderId::new();
+        let id = new_order_id();
         let expiration = ExpirationDate::DateTime(
             Utc.with_ymd_and_hms(2035, 12, 31, 16, 0, 0)
                 .single()
@@ -840,7 +841,7 @@ impl MarketMakerEngine {
             // once and moved into the ask leg (the bid clones it).
             let mut placed: [Option<OrderId>; 2] = [None, None];
 
-            let bid_id = OrderId::new();
+            let bid_id = new_order_id();
             if option_book
                 .add_limit_order(
                     bid_id,
@@ -866,7 +867,7 @@ impl MarketMakerEngine {
                 placed[leg_slot(true)] = Some(bid_id);
             }
 
-            let ask_id = OrderId::new();
+            let ask_id = new_order_id();
             if option_book
                 .add_limit_order(
                     ask_id,
@@ -1059,7 +1060,7 @@ mod tests {
         let engine = test_engine();
         let mut events = engine.subscribe();
 
-        engine.on_order_filled(OrderId::new(), 100, 1);
+        engine.on_order_filled(new_order_id(), 100, 1);
 
         assert!(
             events.try_recv().is_err(),

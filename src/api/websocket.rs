@@ -1534,7 +1534,7 @@ async fn get_orderbook_snapshot(
     let option_book = strike_book.get(style);
 
     // Get snapshot from the inner orderbook
-    let snapshot = option_book.inner().create_snapshot(depth);
+    let snapshot = option_book.inner().create_snapshot(depth).ok()?;
 
     // Convert to our format
     let bids: Vec<PriceLevelData> = snapshot

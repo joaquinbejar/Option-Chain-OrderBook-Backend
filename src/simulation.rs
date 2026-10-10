@@ -5,9 +5,9 @@ use crate::market_maker::MarketMakerEngine;
 use optionstratlib::prelude::ExpirationDate;
 use optionstratlib::prelude::Positive;
 use optionstratlib::prelude::TimeFrame;
-use optionstratlib::prelude::convert_time_frame;
 use optionstratlib::prelude::{Step, Xstep, Ystep};
 use optionstratlib::prelude::{WalkParams, WalkType, WalkTypeAble};
+use optionstratlib::utils::time::convert_time_frame;
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -120,15 +120,20 @@ fn generate_price_path(
         Positive::new(volatility).map_err(|_| SimulationError::InvalidVolatility(volatility))?;
     let drift_dec = Decimal::try_from(drift).unwrap_or(dec!(0.0));
     let days = Positive::THIRTY;
+    let dt = convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day)
+        .map_err(|e| SimulationError::WalkGeneration {
+            walk_type: "time_step",
+            message: e.to_string(),
+        })?;
 
     let walk_type = match walk_type_config {
         WalkTypeConfig::GeometricBrownian => WalkType::GeometricBrownian {
-            dt: convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day),
+            dt,
             drift: drift_dec,
             volatility: vol,
         },
         WalkTypeConfig::MeanReverting => WalkType::MeanReverting {
-            dt: convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day),
+            dt,
             volatility: vol,
             // A compile-time literal that is always a valid Positive.
             speed: Positive::new(MEAN_REVERSION_SPEED)
@@ -136,7 +141,7 @@ fn generate_price_path(
             mean: initial,
         },
         WalkTypeConfig::JumpDiffusion => WalkType::JumpDiffusion {
-            dt: convert_time_frame(Positive::ONE / days, &TimeFrame::Minute, &TimeFrame::Day),
+            dt,
             drift: drift_dec,
             volatility: vol,
             // Compile-time literals that are always valid Positives.
@@ -156,6 +161,7 @@ fn generate_price_path(
         },
         walk_type,
         walker: Box::new(Walker::new()),
+        seed: None,
     };
 
     // Generate y-values using the walker. A walker error is propagated as a
