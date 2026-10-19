@@ -384,9 +384,9 @@ let snapshot = client.create_snapshot().await?;
 
 - **axum** (0.8): Async web framework
 - **tower-http** (0.7): HTTP middleware (CORS, tracing, compression)
-- **option-chain-orderbook** (0.13): Core orderbook library
+- **option-chain-orderbook** (0.14): Core orderbook library
 - **orderbook-rs** (0.15): Low-level orderbook implementation
-- **optionstratlib** (0.22): Options pricing and greeks
+- **optionstratlib** (0.23): Options pricing and greeks
 - **utoipa** (6.0): OpenAPI documentation generation
 - **utoipa-swagger-ui** (10.0): Swagger UI integration
 - **tokio** (1.53): Async runtime
