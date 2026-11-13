@@ -499,8 +499,8 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) · [crates.io](https://crates.io/crates/option-chain-orderbook) | Option chain order book system (underlying, expiration, strike) built on OrderBook-rs, PriceLevel and OptionStratLib. |
-| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) · [crates.io](https://crates.io/crates/optionstratlib) | Options pricing, Greeks, strategies and simulation library. |
-| [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) · [crates.io](https://crates.io/crates/orderbook-rs) | High-performance, lock-free limit order book and matching engine. |
+| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) | Option chain order book engine that the REST and WebSocket API exposes and drives. |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing and Greeks used for market making quotes and risk figures served by the API. |
+| [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) | Limit order book types used for order entry, matching results and depth snapshots. |
 
 <!-- related-projects:end -->
