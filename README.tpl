@@ -117,6 +117,5 @@ Repositories by the same author that this project depends on, and repositories t
 | [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) | Option chain order book engine that the REST and WebSocket API exposes and drives. |
 | [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing and Greeks used for market making quotes and risk figures served by the API. |
 | [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) | Limit order book types used for order entry, matching results and depth snapshots. |
-| [fauxchange](https://github.com/joaquinbejar/fauxchange) | Exchange simulator used as a market backend for realistic matching and replay. |
 
 <!-- related-projects:end -->
